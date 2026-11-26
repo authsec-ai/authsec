@@ -5,11 +5,14 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"math/big"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,8 +20,17 @@ import (
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
 
+	"github.com/authsec-ai/authsec/internal/delegation"
+	"github.com/authsec-ai/authsec/internal/spire/domain/repositories"
 	"github.com/authsec-ai/authsec/internal/spire/infrastructure/vault"
 )
+
+// errUnknownWorkspace: no active workspace with this id; no key exists or
+// is created for it.
+var errUnknownWorkspace = errors.New("unknown workspace")
+
+// ErrUnknownWorkspace reports whether err means the workspace does not exist.
+func ErrUnknownWorkspace(err error) bool { return errors.Is(err, errUnknownWorkspace) }
 
 // jwtKVMount is the Vault KV v2 mount used for JWT signing keys.
 // The actual Vault path becomes: kv/data/secret/spire/jwt-signing-keys/{workspace_id}
@@ -30,6 +42,13 @@ type JWTSVIDService struct {
 	logger      *logrus.Entry
 	keyCache    map[string]*rsa.PrivateKey
 	keyCacheMu  sync.RWMutex
+
+	// delegationDB holds delegation_tokens; a delegated JWT-SVID only
+	// validates while it is its agent's active token (AS-069).
+	delegationDB *sql.DB
+
+	// workspaceRepo, when set, limits keys to active workspaces.
+	workspaceRepo repositories.WorkspaceRepository
 }
 
 // NewJWTSVIDService creates a new JWT-SVID service
@@ -41,9 +60,39 @@ func NewJWTSVIDService(vaultClient *vault.Client, logger *logrus.Entry) *JWTSVID
 	}
 }
 
+// SetDelegationStore sets the database whose delegation_tokens decide
+// whether a delegated JWT-SVID is still valid.
+func (s *JWTSVIDService) SetDelegationStore(db *sql.DB) { s.delegationDB = db }
+
+// SetWorkspaceRepository sets the workspace registry. With it, signing keys
+// exist only for active workspaces: a token or bundle request naming any
+// other id is refused instead of minting (and persisting) a key for it.
+func (s *JWTSVIDService) SetWorkspaceRepository(repo repositories.WorkspaceRepository) {
+	s.workspaceRepo = repo
+}
+
+// WorkspaceOfJWTSVID returns the workspace a JWT-SVID claims to be issued by
+// (iss = spiffe://<workspace_id>), before verification. Callers verify the
+// token with that workspace's key (ValidateJWTSVID), which proves the claim.
+func WorkspaceOfJWTSVID(token string) (string, error) {
+	claims := jwt.MapClaims{}
+	if _, _, err := jwt.NewParser().ParseUnverified(token, claims); err != nil {
+		return "", fmt.Errorf("malformed token: %w", err)
+	}
+	iss, _ := claims["iss"].(string)
+	ws, ok := strings.CutPrefix(iss, "spiffe://")
+	if !ok {
+		return "", fmt.Errorf("token issuer is not a SPIFFE trust domain")
+	}
+	if _, err := uuid.Parse(ws); err != nil {
+		return "", fmt.Errorf("token issuer is not a workspace trust domain")
+	}
+	return ws, nil
+}
+
 // IssueJWTSVIDRequest is the request to issue a JWT-SVID
 type IssueJWTSVIDRequest struct {
-	WorkspaceID     string                 `json:"workspace_id"`
+	WorkspaceID  string                 `json:"workspace_id"`
 	SpiffeID     string                 `json:"spiffe_id"`
 	Audience     []string               `json:"audience"`
 	TTL          int                    `json:"ttl"` // seconds
@@ -60,8 +109,8 @@ type IssueJWTSVIDResponse struct {
 // ValidateJWTSVIDRequest is the request to validate a JWT-SVID
 type ValidateJWTSVIDRequest struct {
 	WorkspaceID string `json:"workspace_id"`
-	Token    string `json:"token"`
-	Audience string `json:"audience"`
+	Token       string `json:"token"`
+	Audience    string `json:"audience"`
 }
 
 // ValidateJWTSVIDResponse is the response from JWT validation
@@ -87,11 +136,12 @@ func (s *JWTSVIDService) IssueJWTSVID(
 		return nil, fmt.Errorf("audience is required")
 	}
 
-	// Default TTL: 1 hour
+	// Default TTL: 1 hour; never more than delegation.MaxTTL.
 	ttl := req.TTL
 	if ttl == 0 {
 		ttl = 3600
 	}
+	ttl = int(delegation.CapTTL(time.Duration(ttl) * time.Second).Seconds())
 
 	// Calculate expiration
 	now := time.Now()
@@ -117,12 +167,14 @@ func (s *JWTSVIDService) IssueJWTSVID(
 	for k, v := range req.CustomClaims {
 		// Protect standard claims from being overwritten
 		switch k {
-		case "iss", "sub", "aud", "exp", "nbf", "iat", "jti":
+		case "iss", "sub", "aud", "exp", "nbf", "iat", "jti", "workspace_id", "tenant_id":
 			continue
 		default:
 			mapClaims[k] = v
 		}
 	}
+	// The issuing workspace is authoritative, never a caller-supplied claim.
+	mapClaims["workspace_id"] = req.WorkspaceID
 
 	// Create and sign token
 	token := jwt.NewWithClaims(jwt.SigningMethodRS256, mapClaims)
@@ -144,8 +196,18 @@ func (s *JWTSVIDService) ValidateJWTSVID(
 	req *ValidateJWTSVIDRequest,
 ) (*ValidateJWTSVIDResponse, error) {
 	// Get public key for validation
-	publicKey, err := s.getPublicKey(ctx, req.WorkspaceID)
+	// The token names its workspace (iss = spiffe://<workspace_id>) and is
+	// verified with that workspace's key. A caller-supplied workspace may
+	// only repeat it.
+	issuerWorkspace, err := WorkspaceOfJWTSVID(req.Token)
+	if err != nil || (req.WorkspaceID != "" && req.WorkspaceID != issuerWorkspace) {
+		return &ValidateJWTSVIDResponse{Valid: false}, nil
+	}
+	publicKey, err := s.getPublicKey(ctx, issuerWorkspace)
 	if err != nil {
+		if errors.Is(err, errUnknownWorkspace) {
+			return &ValidateJWTSVIDResponse{Valid: false}, nil
+		}
 		return nil, fmt.Errorf("failed to get public key: %w", err)
 	}
 
@@ -159,6 +221,7 @@ func (s *JWTSVIDService) ValidateJWTSVID(
 			}
 			return publicKey, nil
 		},
+		jwt.WithExpirationRequired(),
 	)
 
 	if err != nil {
@@ -169,6 +232,14 @@ func (s *JWTSVIDService) ValidateJWTSVID(
 
 	claims, ok := token.Claims.(jwt.MapClaims)
 	if !ok || !token.Valid {
+		return &ValidateJWTSVIDResponse{
+			Valid: false,
+		}, nil
+	}
+
+	// A delegated token must still be its agent's active delegation token.
+	if err := delegation.Verify(ctx, s.delegationDB, claims, req.Token); err != nil {
+		s.logger.WithError(err).Info("delegated JWT-SVID refused")
 		return &ValidateJWTSVIDResponse{
 			Valid: false,
 		}, nil
@@ -266,6 +337,17 @@ func (s *JWTSVIDService) getOrCreateSigningKey(
 	}
 	s.keyCacheMu.RUnlock()
 
+	// Keys exist only for active workspaces: never read or mint one for an
+	// id a caller made up.
+	if _, err := uuid.Parse(workspaceID); err != nil {
+		return nil, errUnknownWorkspace
+	}
+	if s.workspaceRepo != nil {
+		if _, err := s.workspaceRepo.GetByID(ctx, workspaceID); err != nil {
+			return nil, errUnknownWorkspace
+		}
+	}
+
 	// Slow path: write lock
 	s.keyCacheMu.Lock()
 	defer s.keyCacheMu.Unlock()
@@ -279,14 +361,16 @@ func (s *JWTSVIDService) getOrCreateSigningKey(
 	vaultPath := fmt.Sprintf("secret/spire/jwt-signing-keys/%s", workspaceID)
 	data, err := s.vaultClient.ReadKVSecret(ctx, jwtKVMount, vaultPath)
 	if err != nil {
-		s.logger.WithField("workspace_id", workspaceID).WithError(err).Warn("Failed to read JWT signing key from Vault, will generate new key")
+		// A read error is not "no key": generating here would overwrite the
+		// stored key and invalidate every SVID it signed (AS-036).
+		return nil, fmt.Errorf("read JWT signing key from Vault: %w", err)
 	}
 
 	if data != nil {
 		if pemStr, ok := data["private_key_pem"].(string); ok && pemStr != "" {
 			key, parseErr := parseRSAPrivateKeyPEM(pemStr)
 			if parseErr != nil {
-				s.logger.WithField("workspace_id", workspaceID).WithError(parseErr).Warn("Failed to parse stored JWT signing key, will regenerate")
+				return nil, fmt.Errorf("stored JWT signing key is unparseable; refusing to overwrite it: %w", parseErr)
 			} else {
 				s.logger.WithField("workspace_id", workspaceID).Info("Loaded JWT signing key from Vault")
 				s.keyCache[workspaceID] = key

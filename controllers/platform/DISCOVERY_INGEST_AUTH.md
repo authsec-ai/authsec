@@ -10,10 +10,18 @@ the control plane:
 | mode | no token / unknown / revoked / expired token / token whose bound source was deleted / bound token used for another source | valid token for ANOTHER workspace |
 |---|---|---|
 | `off` | accepted, nothing checked | accepted, nothing checked |
-| `warn` (default) | **accepted**, logged and counted | **403** |
-| `enforce` | **401** `{"error":"ingest token required"}` | **403** |
+| `warn` (default outside production) | **accepted**, logged and counted | **403** |
+| `enforce` (default with `ENVIRONMENT=production`) | **401** `{"error":"ingest token required"}` | **403** |
 
-**`warn` is the default, and it does not protect the ingress.** It exists so
+Unset, the mode is `enforce` when `ENVIRONMENT=production` and `warn`
+elsewhere. In production `warn` is therefore only ever an explicit setting, and
+the startup banner says so with a `PRODUCTION` line: mint and roll out a token
+for every agent **before** deploying, or set `warn` explicitly for the rollout.
+In `off` and `warn`, a call without a valid token that names a workspace id
+that does not exist gets the same `401` as in `enforce`, so the ingress never
+tells an unauthenticated caller which workspace ids are real.
+
+**`warn` does not protect the ingress.** It exists so
 agents installed before tokens existed keep working while tokens are rolled
 out: in `warn` anyone who knows a workspace id can still write to that
 workspace's inventory and graph. Until the mode is `enforce` the control plane

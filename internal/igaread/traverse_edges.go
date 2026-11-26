@@ -63,14 +63,14 @@ import (
 // callers own, and the provider is one of two constants, never input.
 const graphProviderSlot = "{{provider}}"
 
-// graphRender renders a spec fragment for one provider (models.ProviderAWS or
-// models.ProviderK8s; anything else is a defect and panics rather than
-// reading another provider's rows).
+// graphRender renders a spec fragment for one provider (models.ProviderAWS,
+// models.ProviderK8s or models.ProviderAzure; anything else is a defect and
+// panics rather than reading another provider's rows).
 func graphRender(sql, provider string) string {
 	switch provider {
-	case models.ProviderAWS, models.ProviderK8s:
+	case models.ProviderAWS, models.ProviderK8s, models.ProviderAzure:
 	default:
-		panic("igaread: traversal provider " + provider + " is not aws or k8s")
+		panic("igaread: traversal provider " + provider + " is not aws, k8s or azure")
 	}
 	return strings.ReplaceAll(sql, graphProviderSlot, "'"+provider+"'")
 }
@@ -96,6 +96,10 @@ type graphEdgeSpec struct {
 	farKey string
 	// cols is the select list, in graphEdgeRow's columns.
 	cols string
+	// rows, when set, completes the rows a statement read before they are
+	// used: an Azure target to a scope names its node by the scope's path
+	// (traverse_azure.go). nil for every AWS and Kubernetes spec.
+	rows func([]graphEdgeRow)
 }
 
 func (s *graphEdgeSpec) claimRef(id uuid.UUID) Ref { return Ref{Type: s.claim, ID: id} }
@@ -296,6 +300,7 @@ var graphNodeTables = map[string]string{
 	RefExternalPrincipal: "iga_external_principal",
 	RefStatement:         "iga_entitlements",
 	RefResource:          "iga_resources",
+	RefRoleAssignment:    "iga_access_edges",
 }
 
 // predicates is the spec's WHERE after the workspace, for one provider: its
@@ -352,6 +357,9 @@ func (t *graphTraversal) queryEdges(lv *graphLevel, s *graphEdgeSpec, side strin
 	if err := tx.Raw(sql, args...).Scan(&rows).Error; err != nil {
 		return nil, err
 	}
+	if s.rows != nil {
+		s.rows(rows)
+	}
 	return rows, nil
 }
 
@@ -370,7 +378,7 @@ func (t *graphTraversal) countNeighbours(lv *graphLevel, dir, kind string, nodes
 		return out, nil
 	}
 	var sas []*GraphNode
-	for _, side := range []string{models.ProviderAWS, models.ProviderK8s} {
+	for _, side := range []string{models.ProviderAWS, models.ProviderK8s, models.ProviderAzure} {
 		var ns []*GraphNode
 		for _, n := range nodes {
 			if n == nil || n.side() != side {
@@ -385,7 +393,7 @@ func (t *graphTraversal) countNeighbours(lv *graphLevel, dir, kind string, nodes
 		if len(ns) == 0 {
 			continue
 		}
-		c, err := t.countSide(lv, s, side, ns)
+		c, err := t.countSide(lv, graphSpecForSide(dir, kind, side), side, ns)
 		if err != nil {
 			return nil, err
 		}

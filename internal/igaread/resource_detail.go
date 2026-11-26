@@ -93,7 +93,7 @@ type ResourceDetailMeta struct {
 // bare UUID or resource:<uuid> (D-5); anything else, another workspace's id, a
 // GitHub row, an AWS row no projection pass supports (D-6), and every id before
 // the first publication (D-4) are 404 not_found with no hint.
-func (r *Reader) ResourceDetail(ctx context.Context, ws uuid.UUID, rawID string, vals url.Values) (any, error) {
+func (r *Reader) ResourceDetail(ctx context.Context, rawID string, vals url.Values) (any, error) {
 	for name := range vals {
 		if name != "rev" {
 			return nil, InvalidParameter(name, name+" is not a parameter of this route")
@@ -109,7 +109,7 @@ func (r *Reader) ResourceDetail(ctx context.Context, ws uuid.UUID, rawID string,
 	}
 
 	var out Envelope
-	err := r.Read(ctx, ws, Pin{Rev: rev}, func(q *Query) error {
+	err := r.Read(ctx, Pin{Rev: rev}, func(q *Query) error {
 		if !q.Published() {
 			return NotFound()
 		}
@@ -362,7 +362,7 @@ func resourceCoverage(q *Query, accts *Accounts, resourceID uuid.UUID, identity 
 // at a rev at or below the current one (iga_publication is unique per run).
 // Keying on the first recorder alone would leave a policy first read by a run
 // that never published -- superseded, abandoned, or collected while
-// IGA_GRAPH_PROJECTION was off -- "not read" at every revision until its
+// the graph pipeline is unavailable -- "not read" at every revision until its
 // content changed, hiding its Deny for good.
 //
 // "The latest such observation" (D-19) is the one whose latest confirmation

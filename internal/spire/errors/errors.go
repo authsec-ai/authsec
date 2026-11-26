@@ -44,6 +44,10 @@ func NewInternalError(message string, err error) *AppError {
 	return &AppError{Code: "INTERNAL_ERROR", Message: message, Status: http.StatusInternalServerError, Err: err}
 }
 
+func NewServiceUnavailableError(message string, err error) *AppError {
+	return &AppError{Code: "SERVICE_UNAVAILABLE", Message: message, Status: http.StatusServiceUnavailable, Err: err}
+}
+
 func NewConflictError(message string, err error) *AppError {
 	return &AppError{Code: "CONFLICT", Message: message, Status: http.StatusConflict, Err: err}
 }

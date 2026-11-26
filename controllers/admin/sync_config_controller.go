@@ -5,9 +5,10 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
-	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/controllers/shared"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/utils"
@@ -51,12 +52,12 @@ func (scc *SyncConfigController) CreateSyncConfig(c *gin.Context) {
 		return
 	}
 
-	// Parse UUIDs
-	workspaceID, err := uuid.Parse(req.WorkspaceID)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid workspace_id format"})
+	// The workspace comes from the token, never the body.
+	tc, db, ok := shared.TenantScope(c)
+	if !ok {
 		return
 	}
+	workspaceID := tc.WorkspaceID
 	clientID, err := uuid.Parse(req.ClientID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid client_id format"})
@@ -84,6 +85,10 @@ func (scc *SyncConfigController) CreateSyncConfig(c *gin.Context) {
 
 	// Populate and encrypt AD config if applicable
 	if req.SyncType == "active_directory" && req.ADConfig != nil {
+		if err := shared.CheckADSkipVerify(req.ADConfig.UseSSL, req.ADConfig.SkipVerify); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
 		syncConfig.ADServer = req.ADConfig.Server
 		syncConfig.ADUsername = req.ADConfig.Username
 		syncConfig.ADBaseDN = req.ADConfig.BaseDN
@@ -103,7 +108,11 @@ func (scc *SyncConfigController) CreateSyncConfig(c *gin.Context) {
 
 	// Populate and encrypt Entra ID config if applicable
 	if req.SyncType == "entra_id" && req.EntraConfig != nil {
-		syncConfig.EntraWorkspaceID = req.EntraConfig.WorkspaceID
+		if strings.TrimSpace(req.EntraConfig.WorkspaceID) == "" || strings.TrimSpace(req.EntraConfig.ClientSecret) == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "entra_config.workspace_id (the directory tenant id) and entra_config.client_secret are required"})
+			return
+		}
+		syncConfig.EntraTenantID = req.EntraConfig.WorkspaceID
 		syncConfig.EntraClientID = req.EntraConfig.ClientID
 		syncConfig.EntraSkipVerify = req.EntraConfig.SkipVerify
 
@@ -124,9 +133,13 @@ func (scc *SyncConfigController) CreateSyncConfig(c *gin.Context) {
 	}
 
 	// Save to database
-	if err := config.DB.Create(&syncConfig).Error; err != nil {
+	if err := db.Create(&syncConfig).Error; err != nil {
 		log.Printf("Failed to create sync configuration: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save configuration", "details": err.Error()})
+		if strings.Contains(err.Error(), "23505") {
+			c.JSON(http.StatusConflict, gin.H{"error": "A sync configuration named \"" + req.ConfigName + "\" already exists"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save configuration"})
 		return
 	}
 
@@ -169,10 +182,9 @@ func (scc *SyncConfigController) ListSyncConfigs(c *gin.Context) {
 		return
 	}
 
-	// Parse UUIDs
-	workspaceID, err := uuid.Parse(req.WorkspaceID)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid workspace_id format"})
+	// The workspace comes from the token, never the body.
+	_, db, ok := shared.TenantScope(c)
+	if !ok {
 		return
 	}
 	clientID, err := uuid.Parse(req.ClientID)
@@ -182,7 +194,7 @@ func (scc *SyncConfigController) ListSyncConfigs(c *gin.Context) {
 	}
 
 	// Build query
-	query := config.DB.Where("workspace_id = ? AND client_id = ?", workspaceID, clientID)
+	query := db.Where("client_id = ?", clientID)
 
 	// Apply sync type filter if provided
 	if req.SyncType != nil && *req.SyncType != "" {
@@ -234,9 +246,9 @@ func (scc *SyncConfigController) UpdateSyncConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid id format"})
 		return
 	}
-	workspaceID, err := uuid.Parse(req.WorkspaceID)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid workspace_id format"})
+	// The workspace comes from the token, never the body.
+	_, db, ok := shared.TenantScope(c)
+	if !ok {
 		return
 	}
 	clientID, err := uuid.Parse(req.ClientID)
@@ -245,9 +257,9 @@ func (scc *SyncConfigController) UpdateSyncConfig(c *gin.Context) {
 		return
 	}
 
-	// Fetch existing configuration
+	// Fetch existing configuration; another workspace's is not found (404).
 	var syncConfig models.SyncConfiguration
-	if err := config.DB.Where("id = ? AND workspace_id = ? AND client_id = ?", configID, workspaceID, clientID).First(&syncConfig).Error; err != nil {
+	if err := db.Where("id = ? AND client_id = ?", configID, clientID).First(&syncConfig).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Sync configuration not found"})
 		return
 	}
@@ -265,6 +277,10 @@ func (scc *SyncConfigController) UpdateSyncConfig(c *gin.Context) {
 
 	// Update AD config if provided
 	if req.ADConfig != nil && syncConfig.SyncType == "active_directory" {
+		if err := shared.CheckADSkipVerify(req.ADConfig.UseSSL, req.ADConfig.SkipVerify); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
 		if req.ADConfig.Server != "" {
 			syncConfig.ADServer = req.ADConfig.Server
 		}
@@ -293,7 +309,7 @@ func (scc *SyncConfigController) UpdateSyncConfig(c *gin.Context) {
 	// Update Entra ID config if provided
 	if req.EntraConfig != nil && syncConfig.SyncType == "entra_id" {
 		if req.EntraConfig.WorkspaceID != "" {
-			syncConfig.EntraWorkspaceID = req.EntraConfig.WorkspaceID
+			syncConfig.EntraTenantID = req.EntraConfig.WorkspaceID
 		}
 		if req.EntraConfig.ClientID != "" {
 			syncConfig.EntraClientID = req.EntraConfig.ClientID
@@ -317,7 +333,7 @@ func (scc *SyncConfigController) UpdateSyncConfig(c *gin.Context) {
 	syncConfig.UpdatedAt = time.Now()
 
 	// Save updates
-	if err := config.DB.Save(&syncConfig).Error; err != nil {
+	if err := db.Save(&syncConfig).Error; err != nil {
 		log.Printf("Failed to update sync configuration: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update configuration"})
 		return
@@ -369,19 +385,20 @@ func (scc *SyncConfigController) DeleteSyncConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid id format"})
 		return
 	}
-	workspaceID, err := uuid.Parse(req.WorkspaceID)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid workspace_id format"})
+	// The workspace comes from the token, never the body.
+	tc, db, ok := shared.TenantScope(c)
+	if !ok {
 		return
 	}
+	workspaceID := tc.WorkspaceID
 	clientID, err := uuid.Parse(req.ClientID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid client_id format"})
 		return
 	}
 
-	// Delete configuration
-	result := config.DB.Where("id = ? AND workspace_id = ? AND client_id = ?", configID, workspaceID, clientID).Delete(&models.SyncConfiguration{})
+	// Delete configuration; another workspace's is not found (404).
+	result := db.Where("id = ? AND client_id = ?", configID, clientID).Delete(&models.SyncConfiguration{})
 	if result.Error != nil {
 		log.Printf("Failed to delete sync configuration: %v", result.Error)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete configuration"})
@@ -418,26 +435,20 @@ func (scc *SyncConfigController) ListSyncRuns(c *gin.Context) {
 		return
 	}
 
-	wsIDStr, exists := c.Get("workspace_id")
-	if !exists {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required"})
-		return
-	}
-	workspaceID, err := uuid.Parse(fmt.Sprintf("%v", wsIDStr))
-	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid workspace_id"})
+	_, db, ok := shared.TenantScope(c)
+	if !ok {
 		return
 	}
 
 	// Confirm the config belongs to this workspace before returning runs.
 	var cfg models.SyncConfiguration
-	if err := config.DB.Select("id").Where("id = ? AND workspace_id = ?", configID, workspaceID).First(&cfg).Error; err != nil {
+	if err := db.Select("id").Where("id = ?", configID).First(&cfg).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "sync configuration not found"})
 		return
 	}
 
 	var runs []models.SyncRun
-	if err := config.DB.
+	if err := db.
 		Where("sync_config_id = ?", configID).
 		Order("started_at DESC").
 		Limit(100).

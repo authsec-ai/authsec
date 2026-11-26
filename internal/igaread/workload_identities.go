@@ -266,7 +266,8 @@ func (s workloadSection) page(q *Query, states []string, after *workloadSectionK
 // WorkloadIdentities serves GET /api/iga/v1/workloads/:id/identities.
 // Parameters: rev, limit (1-200, default 100, per section), include_ended
 // (D-12), section and cursor (D-77; a cursor needs its section).
-func (r *Reader) WorkloadIdentities(ctx context.Context, ws uuid.UUID, rawID string, vals url.Values) (any, error) {
+func (r *Reader) WorkloadIdentities(ctx context.Context, rawID string, vals url.Values) (any, error) {
+	ws := workspaceIn(ctx)
 	if perr := RouteParams(vals, "rev", "limit", "include_ended", "section", "cursor"); perr != nil {
 		return nil, perr
 	}
@@ -318,7 +319,7 @@ func (r *Reader) WorkloadIdentities(ctx context.Context, ws uuid.UUID, rawID str
 	states := EdgeStates(includeEnded)
 
 	var out Envelope
-	err := r.Read(ctx, ws, pin, func(q *Query) error {
+	err := r.Read(ctx, pin, func(q *Query) error {
 		if !q.Published() {
 			return NotFound() // D-4
 		}

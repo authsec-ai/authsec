@@ -46,6 +46,16 @@ func ValidateSpiffeID(spiffeID string) error {
 	return nil
 }
 
+// TrustDomainOf returns the trust domain of a SPIFFE ID, or "".
+func TrustDomainOf(spiffeID string) string {
+	rest, ok := strings.CutPrefix(spiffeID, "spiffe://")
+	if !ok {
+		return ""
+	}
+	td, _, _ := strings.Cut(rest, "/")
+	return td
+}
+
 // ValidateSpiffeComponent validates a single component of a SPIFFE ID
 func ValidateSpiffeComponent(component, label string) error {
 	if component == "" {

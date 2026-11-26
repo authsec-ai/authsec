@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/internal/sessiontoken"
 	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
@@ -56,8 +57,9 @@ func IssueOIDCJWT(ctx context.Context, oidcToken string) (*sharedmodels.TokenRes
 		return nil, fmt.Errorf("failed to retrieve workspace information: %w", err)
 	}
 
-	// Phase 6: workspace_id is the only identity claim.
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+	// Phase 6: workspace_id is the only identity claim. Hosted (end-user)
+	// sign-in, so the end-user token class (AS-033).
+	tokenString, err := sessiontoken.Sign(sessiontoken.EndUser, jwt.MapClaims{
 		"workspace_id": workspaceID,
 		"client_id":    clientID,
 		"email_id":     emailID,
@@ -65,14 +67,11 @@ func IssueOIDCJWT(ctx context.Context, oidcToken string) (*sharedmodels.TokenRes
 		"provider_id":  providerID,
 		"user_id":      userID,
 		"token_type":   "oidc",
-		"aud":          "authsec-api",
 		"iat":          time.Now().Unix(),
 		"exp":          time.Now().Add(24 * time.Hour).Unix(),
 		"iss":          "authsec-ai/auth-manager",
 		"jti":          uuid.New().String(),
 	})
-
-	tokenString, err := token.SignedString([]byte(config.AppConfig.JWTDefSecret))
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate token: %w", err)
 	}

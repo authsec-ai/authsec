@@ -7,6 +7,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/authsec-ai/authsec/internal/igagov"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 )
 
@@ -31,7 +32,15 @@ type govDeploymentRolloutFacts struct{ db *gorm.DB }
 // workspace's deployment is T3.16's 404 GovError, passed through.
 func (f govDeploymentRolloutFacts) DeploymentGateFacts(ctx context.Context, db *gorm.DB, ws, deploymentID uuid.UUID) (*RolloutDeploymentGateFacts, error) {
 	if db == nil {
-		db = f.db
+		// No transaction handed in: read in one under row-level security
+		// for ws (the rollout always hands in its own).
+		var out *RolloutDeploymentGateFacts
+		err := tenancy.InWorkspaceRead(ctx, f.db, ws, func(tx *gorm.DB) error {
+			var err error
+			out, err = f.DeploymentGateFacts(ctx, tx, ws, deploymentID)
+			return err
+		})
+		return out, err
 	}
 	d, err := NewGovDeployments(db, nil).DeploymentGateFacts(ctx, ws, deploymentID)
 	if err != nil {
@@ -54,7 +63,8 @@ func (f govDeploymentRolloutFacts) DeploymentGateFacts(ctx context.Context, db *
 
 // startRemoveControl adapts T3.16's StartRemoveControlDeployments, which
 // takes the policy and version number, to the rollout's starter, which has
-// the version id.
+// the version id. db is the rollout's transaction under row-level security
+// for ws.
 func startRemoveControl(ctx context.Context, db *gorm.DB, ws, actor, versionID uuid.UUID) error {
 	var v models.IGAGovPolicyVersion
 	if err := db.WithContext(ctx).Where("workspace_id = ? AND id = ?", ws, versionID).Take(&v).Error; err != nil {

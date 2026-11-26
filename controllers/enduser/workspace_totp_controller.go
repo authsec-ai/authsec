@@ -1,6 +1,7 @@
 package enduser
 
 import (
+	"github.com/authsec-ai/authsec/middlewares"
 	"net/http"
 	"strings"
 
@@ -107,7 +108,7 @@ func (ttc *TenantTOTPController) RegisterTenantTOTPDevice(c *gin.Context) {
 		return
 	}
 
-	workspaceIDStr, exists := c.Get("workspace_id")
+	workspaceIDStr, exists := middlewares.WorkspaceValue(c)
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -182,7 +183,7 @@ func (ttc *TenantTOTPController) ConfirmTenantTOTPDevice(c *gin.Context) {
 		return
 	}
 
-	workspaceIDStr, exists := c.Get("workspace_id")
+	workspaceIDStr, exists := middlewares.WorkspaceValue(c)
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -233,7 +234,7 @@ func (ttc *TenantTOTPController) GetTenantTOTPDevices(c *gin.Context) {
 		return
 	}
 
-	workspaceIDStr, exists := c.Get("workspace_id")
+	workspaceIDStr, exists := middlewares.WorkspaceValue(c)
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -294,7 +295,7 @@ func (ttc *TenantTOTPController) DeleteTenantTOTPDevice(c *gin.Context) {
 		return
 	}
 
-	workspaceIDStr, exists := c.Get("workspace_id")
+	workspaceIDStr, exists := middlewares.WorkspaceValue(c)
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in token"})
 		return
@@ -359,7 +360,7 @@ func (ttc *TenantTOTPController) SetTenantPrimaryTOTPDevice(c *gin.Context) {
 		return
 	}
 
-	workspaceIDStr, exists := c.Get("workspace_id")
+	workspaceIDStr, exists := middlewares.WorkspaceValue(c)
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Tenant ID not found in token"})
 		return

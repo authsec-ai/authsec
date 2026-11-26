@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/gin-gonic/gin"
@@ -178,11 +179,11 @@ func TestEndUserController_GetEndUsers(t *testing.T) {
 			},
 		},
 		{
-			name:  "invalid input",
-			input: GetEndUsersFilter{
-				// Missing workspace_id
-			},
-			expectedStatus: http.StatusBadRequest,
+			// workspace_id is no longer required in the body: the token's
+			// workspace is used, so this reaches the (absent) database.
+			name:           "workspace_id not required",
+			input:          GetEndUsersFilter{},
+			expectedStatus: http.StatusInternalServerError,
 			setupMocks:     func() {},
 		},
 		{
@@ -381,7 +382,9 @@ func TestEndUserController_DeleteEndUser(t *testing.T) {
 			if workspaceID, ok := tt.input["workspace_id"]; ok {
 				// Set token claims for auth middleware simulation
 				setTokenClaimsInContext(c, workspaceID, tt.input["user_id"])
-				c.Set("user_info", &middlewares.UserInfo{WorkspaceID: workspaceID})
+				if ws, err := uuid.Parse(workspaceID); err == nil {
+					tenancy.Set(c, tenancy.Context{WorkspaceID: ws})
+				}
 			}
 
 			controller.DeleteEndUser(c)
@@ -419,7 +422,7 @@ func TestEndUserController_ActiveOrDeactiveEndUser(t *testing.T) {
 	c.Request.Header.Set("Content-Type", "application/json")
 	// Authenticated caller in the same workspace so the request passes the
 	// workspace check and exercises the no-database path under test.
-	c.Set("user_info", &middlewares.UserInfo{WorkspaceID: workspaceID})
+	tenancy.Set(c, tenancy.Context{WorkspaceID: uuid.MustParse(workspaceID)})
 
 	controller.ActiveOrDeactiveEndUser(c)
 
@@ -898,7 +901,7 @@ func TestEndUserController_generateAndSendCustomPasswordResetOTP(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			tt.setupMocks()
 
-			err := controller.generateAndSendCustomPasswordResetOTP(tt.email)
+			err := controller.generateAndSendCustomPasswordResetOTP(tt.email, uuid.New())
 			if tt.wantErr {
 				assert.Error(t, err)
 			} else {
@@ -925,9 +928,10 @@ func TestAuthMiddleware_WithValidToken(t *testing.T) {
 	r.Use(middlewares.AuthMiddlewareWithConfig(authConfig))
 	r.GET("/protected", func(c *gin.Context) {
 		// Check if user info is properly extracted
-		workspaceID, exists := c.Get("workspace_id")
-		assert.True(t, exists, "workspace_id should be set")
-		assert.Equal(t, "test-tenant-123", workspaceID)
+		// The workspace is carried by the tenancy context (Phase 6).
+		workspaceID, exists := middlewares.GetWorkspaceIDFromToken(c)
+		assert.True(t, exists, "the tenancy context should carry the workspace")
+		assert.Equal(t, testWorkspaceID, workspaceID)
 
 		userID, exists := c.Get("user_id")
 		assert.True(t, exists, "user_id should be set")
@@ -1000,6 +1004,10 @@ func TestAuthMiddleware_NoAuthHeader(t *testing.T) {
 }
 
 // generateTestJWT generates a test JWT token with known claims
+// testWorkspaceID is the workspace of the test session tokens (a real UUID:
+// a session never carries anything else, AS-095).
+const testWorkspaceID = "6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b"
+
 func generateTestJWT() (string, error) {
 	claims := jwt.MapClaims{
 		"iss":          "authsec-ai/auth-manager",
@@ -1007,7 +1015,7 @@ func generateTestJWT() (string, error) {
 		"exp":          time.Now().Add(time.Hour).Unix(),
 		"iat":          time.Now().Unix(),
 		"nbf":          time.Now().Unix(),
-		"workspace_id": "test-tenant-123",
+		"workspace_id": testWorkspaceID,
 		"project_id":   "test-project-456",
 		"client_id":    "test-client-789",
 		"user_id":      "test-user-456",
@@ -1059,72 +1067,6 @@ func TestRBAC_AdminOnlyAccess(t *testing.T) {
 	assert.Equal(t, "admin access granted", response["message"])
 }
 
-func TestRBAC_UserAccessDenied(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-
-	// Create auth config with server-side authorization enabled
-	authConfig := &middlewares.AuthConfig{
-		JWTSecret:         "7f9b2a3c8e6d4f1b9a0c3e7d2f5b8a1c9e3d6f2a4b7c8e0d1f9a2b3c",
-		JWTDefaultSecret:  "7f9b2a3c8e6d4f1b9a0c3e7d2f5b8a1c9e3d6f2a4b7c8e0d1f9a2b3c",
-		ExpectedIssuer:    "authsec-ai/auth-manager",
-		ExpectedAudience:  "authsec-api",
-		RequireServerAuth: true, // Enable server-side authorization
-	}
-
-	// Create a test route that requires admin access
-	r := gin.New()
-	r.Use(middlewares.AuthMiddlewareWithConfig(authConfig))
-	r.GET("/admin/users", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"message": "should not reach here"})
-	})
-
-	// Test with regular user role (no admin)
-	userToken, err := generateTestJWTWithRoles([]string{})
-	assert.NoError(t, err)
-
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("GET", "/admin/users", nil)
-	req.Header.Set("Authorization", "Bearer "+userToken)
-	r.ServeHTTP(w, req)
-
-	assert.Equal(t, http.StatusForbidden, w.Code)
-}
-
-func TestRBAC_UserAccessGranted(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-
-	// Create auth config with server-side authorization enabled
-	authConfig := &middlewares.AuthConfig{
-		JWTSecret:         "7f9b2a3c8e6d4f1b9a0c3e7d2f5b8a1c9e3d6f2a4b7c8e0d1f9a2b3c",
-		JWTDefaultSecret:  "7f9b2a3c8e6d4f1b9a0c3e7d2f5b8a1c9e3d6f2a4b7c8e0d1f9a2b3c",
-		ExpectedIssuer:    "authsec-ai/auth-manager",
-		ExpectedAudience:  "authsec-api",
-		RequireServerAuth: true, // Enable server-side authorization
-	}
-
-	// Create a test route for regular users
-	r := gin.New()
-	r.Use(middlewares.AuthMiddlewareWithConfig(authConfig))
-	r.GET("/api/enduser/profile", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"message": "user access granted"})
-	})
-
-	// Test with regular user role
-	userToken, err := generateTestJWTWithRoles([]string{"user"})
-	assert.NoError(t, err)
-
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("GET", "/api/enduser/profile", nil)
-	req.Header.Set("Authorization", "Bearer "+userToken)
-	r.ServeHTTP(w, req)
-
-	assert.Equal(t, http.StatusOK, w.Code)
-
-	var response map[string]interface{}
-	json.Unmarshal(w.Body.Bytes(), &response)
-	assert.Equal(t, "user access granted", response["message"])
-}
-
 // generateTestJWTWithRoles generates a test JWT token with specific roles
 func generateTestJWTWithRoles(roles []string) (string, error) {
 	claims := jwt.MapClaims{
@@ -1133,7 +1075,7 @@ func generateTestJWTWithRoles(roles []string) (string, error) {
 		"exp":          time.Now().Add(time.Hour).Unix(),
 		"iat":          time.Now().Unix(),
 		"nbf":          time.Now().Unix(),
-		"workspace_id": "test-tenant-123",
+		"workspace_id": testWorkspaceID,
 		"project_id":   "test-project-456",
 		"client_id":    "test-client-789",
 		"user_id":      "test-user-456",

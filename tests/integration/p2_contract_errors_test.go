@@ -208,8 +208,8 @@ func TestP2ContractErrorEnvelopes(t *testing.T) {
 		gate   *services.GraphProjectionGate
 		reason contractShape
 	}{
-		{"off", services.NewGraphProjectionGate(false, ""), contractNull},
-		{"misconfigured", services.NewGraphProjectionGate(true, "schema head 035, want 036"), contractConst("schema head 035, want 036")},
+		{"off", services.NewGraphProjectionGate(false), contractNull},
+		{"misconfigured", misconfiguredGraphGate(t), contractNonEmpty},
 	} {
 		g := g
 		t.Run("503 "+g.mode, func(t *testing.T) {

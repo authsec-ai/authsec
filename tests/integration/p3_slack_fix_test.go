@@ -26,6 +26,7 @@ import (
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/internal/slackapp"
 	"github.com/authsec-ai/authsec/internal/slackapp/slacktest"
+	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/services"
 )
 
@@ -106,11 +107,16 @@ func (x *p3sxApproval) confirm(m p3aMember, token string) (int, map[string]any) 
 
 // p3sxSameEmailMember adds an active member whose account email is email
 // (another users row: users are unique per home workspace and email, and
-// this one has no home workspace), holding governance:<perm>.
+// this one's home is a workspace of its own; every user has one, 105's
+// ck_users_tenancy_ws_nn), holding governance:<perm>.
 func p3sxSameEmailMember(t *testing.T, l *p3aLab, email, perm string) p3aMember {
 	t.Helper()
 	m := p3aMember{user: uuid.New(), membership: uuid.New(), role: uuid.New()}
-	p3exec(t, l.db, `INSERT INTO users (id, email, name, workspace_id) VALUES (?, ?, 'same-mailbox', NULL)`, m.user, email)
+	home := uuid.New()
+	p3exec(t, l.db, `INSERT INTO workspaces (id,name,slug,owner_user_id,workspace_type,workspace_domain,email,status,created_at,updated_at)
+		VALUES (?,?,NULL,?,'team',?,?,'active',NOW(),NOW())`, home, "p3sx-home-"+home.String()[:8], home, home.String()+".test", home.String()+"@test.local")
+	t.Cleanup(func() { _ = l.db.Exec(`DELETE FROM workspaces WHERE id = ?`, home).Error })
+	p3exec(t, l.db, `INSERT INTO users (id, email, name, workspace_id) VALUES (?, ?, 'same-mailbox', ?)`, m.user, email, home)
 	p3exec(t, l.db, `INSERT INTO roles (id, name, workspace_id) VALUES (?, ?, ?)`, m.role, "p3sx-"+m.role.String()[:8], l.ws)
 	p3exec(t, l.db, `INSERT INTO workspace_memberships (id, workspace_id, user_id, role_id, status) VALUES (?, ?, ?, ?, 'active')`,
 		m.membership, l.ws, m.user, m.role)
@@ -250,6 +256,10 @@ type p3sxBlockingHealth struct {
 	release chan struct{}
 	mu      sync.Mutex
 	got     []services.GovHealthReport
+}
+
+func (h *p3sxBlockingHealth) AuthorizeHealthReport(context.Context, services.GovHealthReport) error {
+	return nil
 }
 
 func (h *p3sxBlockingHealth) ReportHealth(_ context.Context, r services.GovHealthReport) (any, error) {
@@ -634,5 +644,66 @@ func TestP3FixSlack057RevokesUnprovenLinks(t *testing.T) {
 	if err := tx.Exec(`INSERT INTO slack_user_link (workspace_id, slack_user_id, user_id, linked_via) VALUES (?, 'UV1B', ?, 'verified_email')`, ws, users[0]).Error; err == nil ||
 		!strings.Contains(err.Error(), "uq_slack_user_link_member") {
 		t.Fatalf("second link of a member after 057: %v", err)
+	}
+}
+
+// P2 Slack (a, health): the production health reporter authorizes a
+// deployment notice's click (an owner of a consumer, or governance:author:
+// the console route's rule) BEFORE the action_ts is claimed. A linked member
+// who is neither is refused 403 not_consumer_owner with no side effect: no
+// action_ts burned, no slack.action_received event, no report. A reporter
+// that does not authorize cannot be installed (GovHealthReporter requires
+// AuthorizeHealthReport).
+func TestP3FixSlackHealthClickAuthorizedBeforeClaim(t *testing.T) {
+	db := igaDB(t)
+	g := p3NewGov(t, db, "p3-fix-slack-health-claim")
+	app := newP3sApp(t, db, p3sGate(t, db))
+	const team = "TFIXHC"
+	app.connectDirect(g.ws, team, "CFIXHC", g.author)
+	lane := g.lane()
+	dep := g.deployment(lane, "applied_unverified")
+	owner, _ := g.member("hc-owner@p3sx.test", "Hana Owner", "active")
+	stranger, _ := g.member("hc-stranger@p3sx.test", "Sam Stranger", "active")
+	p3Manual(t, db, g, models.GovObjectIdentityAccount, lane.identity, owner, models.GovOwnerAccountable)
+	app.link(g.ws, "UHCOWNER", owner)
+	app.link(g.ws, "UHCSTRANGER", stranger)
+	t.Cleanup(services.InstallGovHealthReporter(db))
+
+	notice := func(user uuid.UUID, ts string) (uuid.UUID, string) {
+		n := uuid.New()
+		p3exec(t, db, `INSERT INTO iga_gov_notification (id, workspace_id, subject_kind, subject_id, channel, recipient, state, sent_at, slack_ts)
+			VALUES (?, ?, 'deployment', ?, 'slack', ?, 'sent', now(), ?)`, n, g.ws, dep, "user:"+user.String(), ts)
+		return n, slackapp.ButtonValue{Notification: n.String()}.Encode()
+	}
+	received := func() int64 {
+		return p3sCount(t, db, `SELECT count(*) FROM iga_gov_event WHERE workspace_id = ? AND event = ?`, g.ws, services.GovEventSlackActionReceived)
+	}
+	reports := func() int64 {
+		return p3sCount(t, db, `SELECT count(*) FROM iga_gov_health_report WHERE workspace_id = ? AND deployment_id = ?`, g.ws, dep)
+	}
+	lastTS := func(n uuid.UUID) string {
+		var s string
+		db.Raw(`SELECT last_action_ts FROM iga_gov_notification WHERE id = ?`, n).Row().Scan(&s)
+		return s
+	}
+
+	// The stranger's click carries the newest action_ts there is.
+	ns, vs := notice(stranger, "1700000000.444444")
+	code, out := app.click(p3sClick{team: team, user: "UHCSTRANGER", messageTS: "1700000000.444444", action: slackapp.ActionReportProblem,
+		value: vs, actionTS: fmt.Sprintf("%d.000001", time.Now().Unix()+3600), state: p3sNote("refunds time out")})
+	if code != http.StatusForbidden || p3eErr(out) != services.GovCodeNotConsumerOwner {
+		t.Fatalf("stranger: %d %v, want 403 %s", code, out, services.GovCodeNotConsumerOwner)
+	}
+	if lastTS(ns) != "" || received() != 0 || reports() != 0 {
+		t.Fatalf("the refused click had side effects: last_action_ts %q, %d received events, %d reports", lastTS(ns), received(), reports())
+	}
+
+	// The owner's click on its own notice is claimed and recorded.
+	no, vo := notice(owner, "1700000000.555555")
+	if code, out := app.click(p3sClick{team: team, user: "UHCOWNER", messageTS: "1700000000.555555", action: slackapp.ActionWorking, value: vo}); code != http.StatusOK {
+		t.Fatalf("owner: %d %v", code, out)
+	}
+	if lastTS(no) == "" || received() != 1 || reports() != 1 {
+		t.Fatalf("owner's click: last_action_ts %q, %d received events, %d reports", lastTS(no), received(), reports())
 	}
 }

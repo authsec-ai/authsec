@@ -640,7 +640,7 @@ func TestP3RPCWorkerCollectsUnderPolicyGate(t *testing.T) {
 		return run
 	}
 
-	off := services.NewPolicyGate(false, "", func() *services.GraphProjectionGate { return l.gate })
+	off := services.NewPolicyGate(false, func() *services.GraphProjectionGate { return l.gate })
 	r1 := scan(off, "p3-rpc-off")
 	var n int64
 	l.db.Model(&models.CloudResourcePolicyCoverage{}).Where("workspace_id = ?", l.ws).Count(&n)
@@ -648,7 +648,7 @@ func TestP3RPCWorkerCollectsUnderPolicyGate(t *testing.T) {
 		t.Fatalf("IGA_POLICY off wrote %d coverage rows (run %s)", n, r1.ID)
 	}
 
-	on := services.NewPolicyGate(true, "", func() *services.GraphProjectionGate { return l.gate })
+	on := services.NewPolicyGate(true, func() *services.GraphProjectionGate { return l.gate })
 	if err := on.Verify(l.db); err != nil {
 		t.Fatalf("the integration database must be at 056: %v", err)
 	}

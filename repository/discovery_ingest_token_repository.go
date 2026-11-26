@@ -1,6 +1,7 @@
 package repositories
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -143,17 +145,6 @@ func (r *discoveryIngestTokenRepository) Mint(workspaceID uuid.UUID, sourceID *u
 	if err != nil {
 		return nil, "", err
 	}
-	if sourceID != nil {
-		var n int64
-		if err := r.db.Table("discovery_sources").
-			Where("workspace_id = ? AND id = ?", workspaceID, *sourceID).
-			Count(&n).Error; err != nil {
-			return nil, "", err
-		}
-		if n == 0 {
-			return nil, "", ErrIngestTokenSourceNotFound
-		}
-	}
 	plain, err := GenerateDiscoveryIngestToken()
 	if err != nil {
 		return nil, "", err
@@ -171,7 +162,23 @@ func (r *discoveryIngestTokenRepository) Mint(workspaceID uuid.UUID, sourceID *u
 		Label:       strings.TrimSpace(label),
 		CreatedBy:   createdBy,
 	}
-	if err := r.db.Create(row).Error; err != nil {
+	// The source check and the insert, in one transaction under row-level
+	// security for the workspace.
+	err = tenancy.InWorkspace(context.Background(), r.db, workspaceID, func(tx *gorm.DB) error {
+		if sourceID != nil {
+			var n int64
+			if err := tx.Table("discovery_sources").
+				Where("workspace_id = ? AND id = ?", workspaceID, *sourceID).
+				Count(&n).Error; err != nil {
+				return err
+			}
+			if n == 0 {
+				return ErrIngestTokenSourceNotFound
+			}
+		}
+		return tx.Create(row).Error
+	})
+	if err != nil {
 		return nil, "", err
 	}
 	return row, plain, nil
@@ -179,25 +186,29 @@ func (r *discoveryIngestTokenRepository) Mint(workspaceID uuid.UUID, sourceID *u
 
 func (r *discoveryIngestTokenRepository) List(workspaceID uuid.UUID) ([]models.DiscoveryIngestToken, error) {
 	out := []models.DiscoveryIngestToken{}
-	err := r.db.Select(discoveryIngestTokenColumns).
-		Where("workspace_id = ?", workspaceID).
-		Order("created_at DESC, id").
-		Find(&out).Error
+	err := tenancy.InWorkspaceRead(context.Background(), r.db, workspaceID, func(tx *gorm.DB) error {
+		return tx.Select(discoveryIngestTokenColumns).
+			Where("workspace_id = ?", workspaceID).
+			Order("created_at DESC, id").
+			Find(&out).Error
+	})
 	return out, err
 }
 
 func (r *discoveryIngestTokenRepository) Revoke(workspaceID, id uuid.UUID) (*models.DiscoveryIngestToken, error) {
 	// Conditional on revoked_at IS NULL so a second revoke keeps the first
 	// timestamp: when a token stopped working is evidence.
-	if err := r.db.Model(&models.DiscoveryIngestToken{}).
-		Where("workspace_id = ? AND id = ? AND revoked_at IS NULL", workspaceID, id).
-		Update("revoked_at", gorm.Expr("now()")).Error; err != nil {
-		return nil, err
-	}
 	var out models.DiscoveryIngestToken
-	err := r.db.Select(discoveryIngestTokenColumns).
-		Where("workspace_id = ? AND id = ?", workspaceID, id).
-		Take(&out).Error
+	err := tenancy.InWorkspace(context.Background(), r.db, workspaceID, func(tx *gorm.DB) error {
+		if err := tx.Model(&models.DiscoveryIngestToken{}).
+			Where("workspace_id = ? AND id = ? AND revoked_at IS NULL", workspaceID, id).
+			Update("revoked_at", gorm.Expr("now()")).Error; err != nil {
+			return err
+		}
+		return tx.Select(discoveryIngestTokenColumns).
+			Where("workspace_id = ? AND id = ?", workspaceID, id).
+			Take(&out).Error
+	})
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, ErrIngestTokenNotFound
 	}
@@ -213,6 +224,9 @@ func (r *discoveryIngestTokenRepository) Verify(token string) (*models.Discovery
 	}
 	h := HashDiscoveryIngestToken(token)
 	var row models.DiscoveryIngestToken
+	// TENANT-EXEMPT: the presented credential decides the workspace, so it is
+	// looked up by its hash across workspaces; everything after runs under the
+	// token's workspace.
 	err := r.db.Where("token_hash = ? AND revoked_at IS NULL", h).
 		Where(liveIngestTokenSQL).
 		Take(&row).Error
@@ -235,10 +249,13 @@ func (r *discoveryIngestTokenRepository) Verify(token string) (*models.Discovery
 	// deliberately dropped: last_used_at is a convenience for an operator, not
 	// part of the decision, and a failed touch must not fail an authenticated
 	// call.
-	_ = r.db.Model(&models.DiscoveryIngestToken{}).
-		Where("id = ? AND revoked_at IS NULL AND (last_used_at IS NULL OR last_used_at < now() - make_interval(secs => ?))",
-			row.ID, DiscoveryIngestTouchInterval.Seconds()).
-		Update("last_used_at", gorm.Expr("now()")).Error
+	// Under row-level security for the token's workspace.
+	_ = tenancy.InWorkspace(context.Background(), r.db, row.WorkspaceID, func(tx *gorm.DB) error {
+		return tx.Model(&models.DiscoveryIngestToken{}).
+			Where("workspace_id = ? AND id = ? AND revoked_at IS NULL AND (last_used_at IS NULL OR last_used_at < now() - make_interval(secs => ?))",
+				row.WorkspaceID, row.ID, DiscoveryIngestTouchInterval.Seconds()).
+			Update("last_used_at", gorm.Expr("now()")).Error
+	})
 	return &row, nil
 }
 

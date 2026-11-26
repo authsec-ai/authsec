@@ -2,6 +2,8 @@ package tokens
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"time"
 
 	"github.com/authsec-ai/authsec/models"
@@ -10,10 +12,23 @@ import (
 	"gorm.io/gorm"
 )
 
+// GrantRefIssuerHydraRefresh marks a native_tokens row whose source_grant_jti
+// holds RefreshTokenGrantRef(hydra refresh token): the browser-login grant the
+// access token was minted alongside. It is a row marker, not a token issuer.
+const GrantRefIssuerHydraRefresh = "urn:authsec:hydra-refresh-token"
+
+// RefreshTokenGrantRef is the stored reference to a Hydra refresh token: its
+// SHA-256, hex. The refresh token itself is a credential and is never stored.
+// Revoking the refresh token (RFC 7009) revokes the access tokens carrying it.
+func RefreshTokenGrantRef(refreshToken string) string {
+	sum := sha256.Sum256([]byte(refreshToken))
+	return hex.EncodeToString(sum[:])
+}
+
 // NativeClaims is the input to NativeIssuer.Issue — the resolved, post-policy,
 // post-scope-resolution facts to mint a native access token from.
 type NativeClaims struct {
-	Family           string // models.TokenFamily{M2M,XAA,CIBA}
+	Family           string // models.TokenFamily{M2M,XAA,CIBA,AuthCode}
 	WorkspaceID      uuid.UUID
 	SubjectType      string // "user" | "service_account"
 	SubjectID        uuid.UUID
@@ -26,7 +41,13 @@ type NativeClaims struct {
 	SourceGrantJTI   *string
 	SourceGrantIss   *string
 	RarID            *uuid.UUID
-	TTL              time.Duration
+	// GrantRefHash is RefreshTokenGrantRef of the refresh token this access
+	// token was minted alongside (browser login). Like RarID it is stored on the
+	// row only, never emitted as a claim: a resource server has no use for it,
+	// and a hash of a live credential does not belong in a bearer token. It is
+	// mutually exclusive with SourceGrantJTI/SourceGrantIss (ID-JAG provenance).
+	GrantRefHash *string
+	TTL          time.Duration
 }
 
 // NativeIssuer is the narrow minting seam: it signs claims with the active
@@ -164,7 +185,7 @@ func (i *NativeIssuer) IssueCloudOnboardingToken(ctx context.Context, sub, audie
 	return i.keys.SignWithTyp(claims, CloudOnboardingTyp)
 }
 
-// Issue signs a short-lived, non-refreshable native access token and inserts its
+// Issue signs a short-lived native access token and inserts its
 // authoritative native_tokens row. Any inTx hooks (e.g. the ID-JAG replay-guard
 // insert for XAA) run in the SAME transaction as the row insert, so issuance and
 // replay-marking are atomic — a hook returning an error aborts the whole mint.
@@ -227,6 +248,11 @@ func (i *NativeIssuer) Issue(ctx context.Context, c NativeClaims, inTx ...func(t
 		RarID:            c.RarID,
 		IssuedAt:         now,
 		ExpiresAt:        exp,
+	}
+	if c.GrantRefHash != nil && c.SourceGrantJTI == nil {
+		grantIss := GrantRefIssuerHydraRefresh
+		row.SourceGrantJTI = c.GrantRefHash
+		row.SourceGrantIss = &grantIss
 	}
 
 	err = i.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/internal/logintickets"
 	"github.com/authsec-ai/authsec/database"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
@@ -138,24 +139,16 @@ func (euac *EndUserAuthController) SAMLLogin(c *gin.Context) {
 // @Failure 500 {object} map[string]string "Internal server error"
 // @Router /authsec/uflow/auth/enduser/webauthn-callback [post]
 func (euac *EndUserAuthController) WebAuthnCallback(c *gin.Context) {
-	var input models.WebAuthnCallbackInput
-	if err := c.ShouldBindJSON(&input); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	// The token is minted only for the subject of a login ticket whose first
+	// and second factor were verified on the server. The body's email,
+	// workspace_id and mfa_verified are not trusted (AS-002).
+	ticket, err := logintickets.ConsumeVerified(config.GetDatabase().DB, middlewares.LoginTicketFromRequest(c), logintickets.RealmEndUser)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "sign-in has not completed multi-factor verification"})
 		return
 	}
 
-	input.Email = strings.ToLower(input.Email)
-
-	if input.MFAVerified == nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "MFA verification status is required"})
-		return
-	}
-	if !*input.MFAVerified {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "MFA verification failed"})
-		return
-	}
-
-	tenant, err := euac.workspaceRepo.GetWorkspaceByWorkspaceID(input.WorkspaceID.String())
+	tenant, err := euac.workspaceRepo.GetWorkspaceByWorkspaceID(ticket.WorkspaceID.String())
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not found"})
 		return
@@ -165,7 +158,7 @@ func (euac *EndUserAuthController) WebAuthnCallback(c *gin.Context) {
 	tenantDB := config.DB
 
 	var user models.User
-	if err := tenantDB.Where("LOWER(email) = LOWER(?)", input.Email).First(&user).Error; err != nil {
+	if err := tenantDB.Where("id = ? AND workspace_id = ?", ticket.UserID, tenant.WorkspaceID).First(&user).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "User not found"})
 			return

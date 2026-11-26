@@ -55,8 +55,10 @@ import (
 // graphNodeTypes are the reference types a traversal may start from or reach
 // (§5.4 "The traversal graph", D-39), in the order a level reads them. A
 // policy is not a traversal node (its statements are), and a claim is not a
-// node at all: either as a root is 400.
-var graphNodeTypes = []string{RefWorkload, RefIdentity, RefExternalPrincipal, RefStatement, RefResource}
+// node at all: either as a root is 400. An Azure role assignment is a node of
+// its own (traverse_azure.go); an Azure scope node is a leaf, never a root and
+// never expanded, and is not listed.
+var graphNodeTypes = []string{RefWorkload, RefIdentity, RefExternalPrincipal, RefStatement, RefResource, RefRoleAssignment}
 
 // Edge kinds (§5.4). The claim behind each: relationship (the first four and
 // can_assume), grant, target.
@@ -155,18 +157,18 @@ func (r *Reader) Traversal() *GraphTraversal { return &GraphTraversal{r: r, b: D
 func (r *Reader) TraversalWith(b GraphBudgets) *GraphTraversal { return &GraphTraversal{r: r, b: b} }
 
 // Graph serves GET /graph with the production budgets.
-func (r *Reader) Graph(ctx context.Context, ws uuid.UUID, vals url.Values) (any, error) {
-	return r.Traversal().Graph(ctx, ws, vals)
+func (r *Reader) Graph(ctx context.Context, vals url.Values) (any, error) {
+	return r.Traversal().Graph(ctx, vals)
 }
 
 // ExpandGraph serves GET /graph/expand with the production budgets.
-func (r *Reader) ExpandGraph(ctx context.Context, ws uuid.UUID, vals url.Values) (any, error) {
-	return r.Traversal().Expand(ctx, ws, vals)
+func (r *Reader) ExpandGraph(ctx context.Context, vals url.Values) (any, error) {
+	return r.Traversal().Expand(ctx, vals)
 }
 
 // GraphPath serves GET /graph/path with the production budgets.
-func (r *Reader) GraphPath(ctx context.Context, ws uuid.UUID, vals url.Values) (any, error) {
-	return r.Traversal().Path(ctx, ws, vals)
+func (r *Reader) GraphPath(ctx context.Context, vals url.Values) (any, error) {
+	return r.Traversal().Path(ctx, vals)
 }
 
 /* ------------------------------ response shapes ---------------------------- */
@@ -232,11 +234,19 @@ type GraphNode struct {
 	SubScope *graphOptional `json:"sub_scope,omitempty"`
 	NativeID string         `json:"native_id,omitempty"`
 	K8sRule  *GraphK8sRule  `json:"k8s_rule,omitempty"`
+	// AzureRole is an Azure role assignment node's role (traverse_azure.go):
+	// absent on every other node. provider, scope, sub_scope and native_id
+	// above carry Azure nodes' too ("azure", the azure_tenant scope).
+	AzureRole *GraphAzureRole `json:"azure_role,omitempty"`
+	// AgentRuntime is an AWS identity's or workload's agent-runtime picture
+	// (agent_runtime.go): absent unless there is something to say, so a node
+	// without agent-runtime data is what it always was.
+	AgentRuntime *GraphAgentRuntime `json:"agent_runtime,omitempty"`
 
 	Limitations []GraphLimitation `json:"limitations"`
 
-	provider  string // the node's provider (aws | k8s); "" for an external principal
-	want      string // the provider the node is read as (aws | k8s); "" for a root: either
+	provider  string // the node's provider (aws | k8s | azure); "" for an AWS external principal
+	want      string // the provider the node is read as (aws | k8s | azure); "" for a root: any
 	typ       string
 	id        uuid.UUID
 	key       string // source_key
@@ -257,7 +267,11 @@ type GraphNode struct {
 	// -- the reader /evidence's grant limitations use (D-35).
 	denyIDs          []uuid.UUID
 	boundaryPolicies []uuid.UUID
-	fetched          bool
+	// AWS identities: the immutable key (RoleId / UserId), and the
+	// containment in force its grant edges carry (agent_runtime.go).
+	immutable string
+	arContain *AgentRuntimeContainment
+	fetched   bool
 }
 
 // GraphRestrictions is an identity's restrictions (§5.4, D-78): how many Deny
@@ -321,6 +335,10 @@ type GraphEdge struct {
 	CrossesProvider bool           `json:"crosses_provider,omitempty"`
 	ViaPrincipal    string         `json:"via_principal,omitempty"`
 	Resolution      map[string]any `json:"resolution,omitempty"`
+	// Contained marks an AWS grant edge of an identity under a containment in
+	// force (agent_runtime.go): every grant at identity level, the grants
+	// whose statement allows a model action at model level. Absent otherwise.
+	Contained *GraphContained `json:"contained,omitempty"`
 
 	Limitations []GraphLimitation `json:"limitations"`
 
@@ -423,7 +441,9 @@ func (g *GraphTraversal) meta(q *Query, t *graphTraversal) GraphMeta {
 			{"code": graphLimOrganizations},
 		},
 	}
-	switch aws, k8s := t.sides(); {
+	switch aws, k8s, azure := t.sides(); {
+	case azure:
+		graphAzureMeta(&m, aws, k8s)
 	case aws && k8s:
 		graphMixedMeta(&m)
 	case k8s:
@@ -523,8 +543,9 @@ type graphTraversal struct {
 	budget time.Duration
 
 	// provider is the (first) ROOT's provider: "" until the root is read,
-	// then models.ProviderAWS or models.ProviderK8s. An external principal
-	// root is AWS's: principals are the AWS trust graph's. Every edge is read
+	// then models.ProviderAWS, models.ProviderK8s or models.ProviderAzure. An
+	// external principal root is AWS's (principals are the AWS trust graph's)
+	// unless the Azure projection wrote it. Every edge is read
 	// in the provider of the node it is read FROM (graphProviderSlot), so a
 	// walk stays in its root's provider except across a crossing
 	// (traverse_cross.go).
@@ -535,6 +556,11 @@ type graphTraversal struct {
 	// (traverse_cross.go): with a Kubernetes root, or the first time a level
 	// meets an external principal.
 	cross *graphCross
+	// az is what an Azure walk reads once per request (traverse_azure.go).
+	az *graphAzureState
+	// modelActions are what model-level containment denies, from the agent
+	// runtime source (agent_runtime.go); nil until a level read it.
+	modelActions []string
 
 	nodes   map[string]*GraphNode
 	order   []*GraphNode
@@ -569,7 +595,8 @@ func (t *graphTraversal) node(ref string) *GraphNode { return t.nodes[ref] }
 // of this workspace (404, no hint).
 //
 // A root is looked for among AWS's nodes (and external principals), then
-// Kubernetes'; the first root read sets t.provider. An AWS root exists only
+// Kubernetes', then Azure's (traverse_azure.go: like Kubernetes', no
+// publication is needed); the first root read sets t.provider. An AWS root exists only
 // in a published graph (D-4: nothing exists before the first publication), so
 // without a publication it is 404 exactly as before. Kubernetes rows are not
 // tied to a publication (they are written straight from a sweep), so a
@@ -681,14 +708,14 @@ func (t *graphTraversal) units(lv *graphLevel, frontier []*GraphNode, dir, kind 
 		return nil, nil
 	}
 	var out []graphUnit
-	for _, side := range []string{models.ProviderAWS, models.ProviderK8s} {
-		if graphSideHasKind(side, kind) {
-			u := graphUnit{kind: kind, side: side, spec: spec, groups: map[string][]uuid.UUID{}}
+	for _, side := range []string{models.ProviderAWS, models.ProviderK8s, models.ProviderAzure} {
+		if s := graphSpecForSide(dir, kind, side); s != nil && graphSideHasKind(side, kind) {
+			u := graphUnit{kind: kind, side: side, spec: s, groups: map[string][]uuid.UUID{}}
 			for _, n := range frontier {
 				if n.side() != side {
 					continue
 				}
-				if _, ok := spec.near[n.typ]; !ok {
+				if _, ok := s.near[n.typ]; !ok {
 					continue
 				}
 				if kind == GraphEdgeCanAssume && opts.noAssume[n.Ref] {
@@ -811,7 +838,9 @@ func (t *graphTraversal) step(lv *graphLevel, frontier []*GraphNode, dir string,
 				farSide := u.side
 				var crossing *graphCrossMatch
 				principal := row.FromID
-				if kind == GraphEdgeCanAssume && row.FromType == RefExternalPrincipal &&
+				// An Azure walk never crosses (traverse_azure.go): its
+				// principals are shown, as they were read, and not re-pointed.
+				if kind == GraphEdgeCanAssume && row.FromType == RefExternalPrincipal && u.side != models.ProviderAzure &&
 					(u.cross || (dir == GraphReverse && !t.held(R(RefExternalPrincipal, row.FromID), staged))) {
 					if m, ok := t.cross.match(row.FromID); ok {
 						crossing = &m
@@ -896,6 +925,7 @@ func (t *graphTraversal) step(lv *graphLevel, frontier []*GraphNode, dir string,
 	if err := t.decorateEdges(lv, res.newEdges, lookup); err != nil {
 		return nil, err
 	}
+	t.decorateContained(res.newEdges, lookup)
 	if err := t.decorateLimitations(lv, res.newNodes, res.newEdges); err != nil {
 		return nil, err
 	}
@@ -947,13 +977,19 @@ func nearOf(e *GraphEdge, dir string) string {
 
 // graphKindsFor is every edge kind that can lead out of a node of this type
 // in this direction (§5.4's table). An external principal is terminal in
-// reverse (nothing targets one), and a resource in forward.
+// reverse (nothing targets one), and a resource in forward. Azure's own
+// grant and target specs (traverse_azure.go) are read too: a role assignment
+// has a grant in reverse and a target forward.
 func graphKindsFor(typ, dir string) []string {
 	var out []string
 	for _, k := range graphEdgeKinds {
-		if s := graphSpecFor(dir, k); s != nil {
+		for _, s := range []*graphEdgeSpec{graphSpecFor(dir, k), graphAzureSpecs[dir][k]} {
+			if s == nil {
+				continue
+			}
 			if _, ok := s.near[typ]; ok {
 				out = append(out, k)
+				break
 			}
 		}
 	}
@@ -1096,7 +1132,7 @@ type graphVisit struct {
 // edge to a node already reached is returned, marked closes_cycle when that
 // node is on the path that reached its source, and the node is never expanded
 // again: a node reached twice is returned once, and the edges say how.
-func (g *GraphTraversal) Graph(ctx context.Context, ws uuid.UUID, vals url.Values) (any, error) {
+func (g *GraphTraversal) Graph(ctx context.Context, vals url.Values) (any, error) {
 	if perr := graphCheckParams(vals, "root", "direction", "assume_hops", "include_ended"); perr != nil {
 		return nil, perr
 	}
@@ -1126,7 +1162,7 @@ func (g *GraphTraversal) Graph(ctx context.Context, ws uuid.UUID, vals url.Value
 	}
 
 	var out Envelope
-	err := g.r.Read(ctx, ws, Pin{}, func(q *Query) error {
+	err := g.r.Read(ctx, Pin{}, func(q *Query) error {
 		// D-4 (no AWS object exists before the first publication) is
 		// readRoot's: a Kubernetes root needs none -- and ignores rev (D-111).
 		t, err := newGraphTraversal(q, g.b, g.r.budget, ended)
@@ -1386,7 +1422,8 @@ func GraphExpandRoute(node, kind, dir string) string {
 // An expansion has no path of its own beyond the node, so closes_cycle marks
 // only an edge back to the node itself. Its frontier names the new
 // neighbours' own unexpanded neighbours, so the canvas can show "+N".
-func (g *GraphTraversal) Expand(ctx context.Context, ws uuid.UUID, vals url.Values) (any, error) {
+func (g *GraphTraversal) Expand(ctx context.Context, vals url.Values) (any, error) {
+	ws := workspaceIn(ctx)
 	if perr := graphCheckParams(vals, "node", "edge", "direction", "cursor", "include_ended"); perr != nil {
 		return nil, perr
 	}
@@ -1439,7 +1476,7 @@ func (g *GraphTraversal) Expand(ctx context.Context, ws uuid.UUID, vals url.Valu
 	}
 
 	var out Envelope
-	err := g.r.Read(ctx, ws, pin, func(q *Query) error {
+	err := g.r.Read(ctx, pin, func(q *Query) error {
 		t, err := newGraphTraversal(q, g.b, g.r.budget, ended)
 		if err != nil {
 			return err

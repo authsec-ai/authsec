@@ -66,7 +66,7 @@ func newP2Lab(t *testing.T, name string, projection bool) *p2Lab {
 	db := igaDB(t)
 	runs := scanRuns(t, db) // clears cloud_scan_run at start and at end
 	ws := newWorkspace(t, db, name)
-	gate := services.NewGraphProjectionGate(projection, "")
+	gate := services.NewGraphProjectionGate(projection)
 	if projection {
 		if err := gate.Verify(db); err != nil {
 			t.Fatalf("the integration database must be at 036 for the P2-0 lab: %v", err)

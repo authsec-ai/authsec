@@ -498,16 +498,11 @@ func TestP3WireChannelStoreWithoutVault(t *testing.T) {
 	g := p3NewGov(t, db, "p3-wire-novault")
 	p3Audit(t, db, g.ws)
 	t.Cleanup(services.SetGovNotificationChannelStore(services.NewGovDBChannelStore(nil)))
-	p3exec(t, db, `INSERT INTO governance_notification_settings (workspace_id, webhook_url, webhook_secret, email_enabled)
-		VALUES (?, 'https://hooks.customer.test/legacy', 'legacy-secret', true)`, g.ws)
 	reader := api.token(g.ws, g.author, g.authorMember, "governance:read")
 	enforcer := api.token(g.ws, g.author, g.authorMember, "governance:read governance:enforce")
 	code, body := api.call(http.MethodGet, "/settings", reader, nil)
 	if code != http.StatusOK || dig(body, "data", "notifications", "available") != true || digs(body, "data", "notifications", "source") != "default" {
 		t.Fatalf("GET without Vault: %d %v", code, body)
-	}
-	if n := len(g.eventsNamed(services.GovEventSettingsChannelsCopied)); n != 0 {
-		t.Fatalf("copied without Vault: %d events", n)
 	}
 	code, body = api.call(http.MethodPut, "/settings", enforcer, map[string]any{"notifications": map[string]any{
 		"webhook_url": "https://hooks.example.test/p3", "webhook_secret": "whsec"}})

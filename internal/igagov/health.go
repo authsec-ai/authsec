@@ -199,6 +199,9 @@ type CanaryInput struct {
 	PublishedAfterApply bool
 	// ArtifactOutcome is the artifact dimension's outcome.
 	ArtifactOutcome string
+	// RemovedActions are R1b's removed actions (canonical); empty for an R1a
+	// plan, which leaves every gate and dimension exactly as R1a computes it.
+	RemovedActions []string
 }
 
 // GateResult is one gate's outcome.
@@ -240,6 +243,9 @@ const (
 	DeniedRetainedService = "denied_retained_service"
 	DeniedRemovedService  = "denied_removed_service"
 	DeniedOtherService    = "denied_other_service"
+	// DeniedRemovedAction (R1b): a denial of an action the plan removed
+	// from a retained service.
+	DeniedRemovedAction = "denied_removed_action"
 )
 
 // UnexpectedFailure is a denial no declared expected=denied item explains.
@@ -265,6 +271,9 @@ type CanaryResult struct {
 	ServiceRestriction map[string]string   `json:"service_restriction"`
 	Validations        []ValidationResult  `json:"validations"`
 	UnexpectedFailures []UnexpectedFailure `json:"unexpected_failures"`
+	// ActionRestriction is R1b's per removed action restriction fact
+	// (not_observed | observed | contradicted); omitted for an R1a plan.
+	ActionRestriction map[string]string `json:"action_restriction,omitempty"`
 }
 
 // windowEnd is the canary window's end as of now.
@@ -437,6 +446,8 @@ func EvaluateCanary(in CanaryInput) CanaryResult {
 		svc := e.service()
 		class := DeniedOtherService
 		switch {
+		case len(in.RemovedActions) > 0 && removedAction(in.RemovedActions, e) != "":
+			class = DeniedRemovedAction
 		case removed[svc]:
 			class = DeniedRemovedService
 		case retained[svc]:
@@ -574,7 +585,88 @@ func EvaluateCanary(in CanaryInput) CanaryResult {
 	for _, s := range sortedUnique(in.Removed) {
 		res.ServiceRestriction[s] = serviceRestriction(in, res.Validations, s)
 	}
+	if len(in.RemovedActions) > 0 {
+		actionRestriction(in, &res)
+	}
 	return res
+}
+
+// removedAction returns the removed action an event exercises (R1b, by the
+// R1a and the R1b event→action maps), "" when none.
+func removedAction(removed []string, e TrailEvent) string {
+	keys := map[string]bool{ActionKey(e.action()): true, ActionKey(e.rawAction()): true}
+	if a, ok := ActionForEventR1B(e.EventSource, e.EventName); ok {
+		keys[ActionKey(a)] = true
+	}
+	for _, x := range removed {
+		if keys[ActionKey(x)] {
+			return x
+		}
+	}
+	return ""
+}
+
+// actionRestriction is §8.7's restriction at action level (R1b): per removed
+// action, a declared expected=denied validation that matched with a
+// boundary-attributed denial, or a boundary-attributed denial of the action
+// from the role after applied_at, is `observed`; a contradicted
+// expected=denied item is `contradicted`. When the plan removes actions only
+// (no service), the restriction dimension is derived from these facts the
+// same way R1a derives it from removed services: contradicted fails it, a
+// validation or a boundary-attributed denial passes it, a denial with
+// another cause is cause_unknown, absence is not_observed (never failure).
+func actionRestriction(in CanaryInput, res *CanaryResult) {
+	res.ActionRestriction = map[string]string{}
+	viaValidation, viaEvent, contradicted, unknownCause := false, false, false, false
+	for _, x := range sortedUnique(in.RemovedActions) {
+		state := RestrictionNotObserved
+		for vi, vr := range res.Validations {
+			for ii, ir := range vr.Items {
+				if ir.Expected != ExpectDenied || ActionKey(in.Validations[vi].Items[ii].Action) != ActionKey(x) {
+					continue
+				}
+				if ir.Result == "contradicted" {
+					state, contradicted = RestrictionContradicted, true
+				}
+				if ir.Result == "matched" && ir.BoundaryAttested && state != RestrictionContradicted {
+					state, viaValidation = RestrictionObserved, true
+				}
+			}
+		}
+		if state != RestrictionContradicted {
+			for _, e := range in.Events {
+				if e.PrincipalID != in.RoleID || e.EventTime.Before(in.AppliedAt) || !e.denied() || removedAction([]string{x}, e) == "" {
+					continue
+				}
+				if e.DenialPolicyType == DenialPermissionsBoundary {
+					state, viaEvent = RestrictionObserved, true
+				} else {
+					unknownCause = true
+				}
+			}
+		}
+		res.ActionRestriction[x] = state
+	}
+	if len(in.Removed) > 0 {
+		// Services are removed too: R1a's restriction dimension stands; an
+		// action contradiction still fails it.
+		if contradicted {
+			res.Restriction = DimensionResult{Outcome: OutcomeFailed, Attribution: AttributionValidation, Reason: "expected_denial_was_allowed"}
+		}
+		return
+	}
+	switch {
+	case contradicted:
+		res.Restriction = DimensionResult{Outcome: OutcomeFailed, Attribution: AttributionValidation, Reason: "expected_denial_was_allowed"}
+	case viaValidation:
+		res.Restriction = DimensionResult{Outcome: OutcomePassed, Attribution: AttributionValidation}
+	case viaEvent:
+		res.Restriction = DimensionResult{Outcome: OutcomePassed, Attribution: AttributionBoundary}
+	case unknownCause:
+		res.Restriction = DimensionResult{Outcome: OutcomeAwaitingEvidence, Attribution: AttributionCauseUnknown, Reason: "denied_cause_not_attributed"}
+	default:
+		res.Restriction = DimensionResult{Outcome: OutcomeAwaitingEvidence, Attribution: AttributionNotApplicable, Reason: "not_observed"}
+	}
 }
 
 // restriction is §8.7's restriction dimension. DECISION D42: a boundary-

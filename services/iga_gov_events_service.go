@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 )
 
@@ -249,9 +250,9 @@ func (s *GovEventsService) List(ctx context.Context, ws uuid.UUID, f GovEventFil
 	if limit <= 0 || limit > MaxGovPage {
 		limit = MaxGovPage
 	}
-	rd := NewGovReader(s.db, s.key)
+	rd := NewGovReader(nil, s.key) // cursors only: signing needs no database
 	want := govCursor{Route: "events", WS: ws.String(), Q: f.key()}
-	q := f.apply(s.db.WithContext(ctx).Model(&models.IGAGovEvent{}), ws)
+	var before *int64
 	if cursor != "" {
 		after, err := rd.open(cursor, want)
 		if err != nil {
@@ -261,10 +262,16 @@ func (s *GovEventsService) List(ctx context.Context, ws uuid.UUID, f GovEventFil
 		if err != nil {
 			return nil, nil, govErr(http.StatusBadRequest, "cursor_invalid", "The cursor is not valid for this list; restart it.", nil)
 		}
-		q = q.Where("id < ?", id)
+		before = &id
 	}
 	var rows []models.IGAGovEvent
-	if err := q.Order("id DESC").Limit(limit + 1).Find(&rows).Error; err != nil {
+	if err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
+		q := f.apply(tx.Model(&models.IGAGovEvent{}), ws)
+		if before != nil {
+			q = q.Where("id < ?", *before)
+		}
+		return q.Order("id DESC").Limit(limit + 1).Find(&rows).Error
+	}); err != nil {
 		return nil, nil, err
 	}
 	var next *string
@@ -321,9 +328,12 @@ func (s *GovEventsService) Export(ctx context.Context, ws uuid.UUID, f GovEventF
 		if err := ctx.Err(); err != nil {
 			return n, err
 		}
+		// One short read per batch: the transaction is not held while the
+		// batch is written to the client.
 		var rows []models.IGAGovEvent
-		q := f.apply(s.db.WithContext(ctx).Model(&models.IGAGovEvent{}), ws).Where("id > ?", last)
-		if err := q.Order("id").Limit(govExportBatch).Find(&rows).Error; err != nil {
+		if err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
+			return f.apply(tx.Model(&models.IGAGovEvent{}), ws).Where("id > ?", last).Order("id").Limit(govExportBatch).Find(&rows).Error
+		}); err != nil {
 			return n, err
 		}
 		for _, e := range rows {

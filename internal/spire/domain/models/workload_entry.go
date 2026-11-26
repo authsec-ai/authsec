@@ -5,21 +5,21 @@ import "time"
 // WorkloadEntry represents a workload registration entry.
 // It maps workload selectors to SPIFFE identities.
 type WorkloadEntry struct {
-	ID         string            `json:"id"`
-	WorkspaceID   string            `json:"workspace_id"`
-	SpiffeID   string            `json:"spiffe_id"`
-	ParentID   string            `json:"parent_id"` // Agent SPIFFE ID; empty = broadcast to all agents in tenant
-	Selectors  map[string]string `json:"selectors"` // Workload selectors (k8s:ns, unix:uid, etc.)
-	TTL        *int              `json:"ttl"`       // Certificate TTL override (seconds), nil = use default
-	Admin      bool              `json:"admin"`
-	Downstream bool              `json:"downstream"` // Can issue downstream identities
-	CreatedAt  time.Time         `json:"created_at"`
-	UpdatedAt  time.Time         `json:"updated_at"`
+	ID          string            `json:"id"`
+	WorkspaceID string            `json:"workspace_id"`
+	SpiffeID    string            `json:"spiffe_id"`
+	ParentID    string            `json:"parent_id"` // Agent SPIFFE ID; empty = broadcast to all agents in tenant
+	Selectors   map[string]string `json:"selectors"` // Workload selectors (k8s:ns, unix:uid, etc.)
+	TTL         *int              `json:"ttl"`       // Certificate TTL override (seconds), nil = use default
+	Admin       bool              `json:"admin"`
+	Downstream  bool              `json:"downstream"` // Can issue downstream identities
+	CreatedAt   time.Time         `json:"created_at"`
+	UpdatedAt   time.Time         `json:"updated_at"`
 }
 
 // WorkloadEntryFilter represents filters for querying workload entries
 type WorkloadEntryFilter struct {
-	WorkspaceID        string            `json:"workspace_id"`
+	WorkspaceID     string            `json:"workspace_id"`
 	ParentID        string            `json:"parent_id"`
 	SpiffeID        string            `json:"spiffe_id"`
 	SpiffeIDPartial bool              `json:"spiffe_id_partial"`

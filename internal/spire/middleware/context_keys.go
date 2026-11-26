@@ -3,62 +3,30 @@ package middleware
 import (
 	"crypto/x509"
 
-	"github.com/authsec-ai/authsec/internal/spire/utils"
 	"github.com/gin-gonic/gin"
 )
 
-// Context keys used across SPIRE middleware
+// Context keys set by the certificate middleware. The request's workspace is
+// not among them: it is the tenancy context (tenancy.Workspace(c)), set
+// only from a verified credential.
 const (
-	SpireWorkspaceIDKey   = "spire_workspace_id"
-	SpireUserIDKey     = "spire_user_id"
-	SpireClaimsKey     = "spire_claims"
 	SpireSpiffeIDKey   = "spire_spiffe_id"
 	SpireIsAgentKey    = "spire_is_agent"
 	SpireClientCertKey = "spire_client_cert"
 	SpireAgentIDKey    = "spire_agent_id"
 )
 
-// GetSpireWorkspaceID extracts the tenant ID from the Gin context.
-func GetSpireWorkspaceID(c *gin.Context) (string, bool) {
-	val, exists := c.Get(SpireWorkspaceIDKey)
-	if !exists {
-		return "", false
-	}
-	s, ok := val.(string)
-	return s, ok
-}
-
-// GetSpireUserID extracts the user ID from the Gin context.
-func GetSpireUserID(c *gin.Context) (string, bool) {
-	val, exists := c.Get(SpireUserIDKey)
-	if !exists {
-		return "", false
-	}
-	s, ok := val.(string)
-	return s, ok
-}
-
-// GetSpireClaims extracts the JWT claims from the Gin context.
-func GetSpireClaims(c *gin.Context) (*utils.JWTClaims, bool) {
-	val, exists := c.Get(SpireClaimsKey)
-	if !exists {
-		return nil, false
-	}
-	claims, ok := val.(*utils.JWTClaims)
-	return claims, ok
-}
-
-// GetSpireSpiffeID extracts the SPIFFE ID from the Gin context.
+// GetSpireSpiffeID returns the authenticated SPIFFE ID.
 func GetSpireSpiffeID(c *gin.Context) (string, bool) {
-	val, exists := c.Get(SpireSpiffeIDKey)
-	if !exists {
+	s, ok := c.Get(SpireSpiffeIDKey)
+	if !ok {
 		return "", false
 	}
-	s, ok := val.(string)
-	return s, ok
+	v, ok := s.(string)
+	return v, ok && v != ""
 }
 
-// GetSpireIsAgent extracts the agent flag from the Gin context.
+// GetSpireIsAgent reports whether the caller authenticated as an agent.
 func GetSpireIsAgent(c *gin.Context) (bool, bool) {
 	val, exists := c.Get(SpireIsAgentKey)
 	if !exists {
@@ -68,7 +36,7 @@ func GetSpireIsAgent(c *gin.Context) (bool, bool) {
 	return b, ok
 }
 
-// GetSpireClientCert extracts the client certificate from the Gin context.
+// GetSpireClientCert returns the verified client certificate.
 func GetSpireClientCert(c *gin.Context) (*x509.Certificate, bool) {
 	val, exists := c.Get(SpireClientCertKey)
 	if !exists {
@@ -78,12 +46,12 @@ func GetSpireClientCert(c *gin.Context) (*x509.Certificate, bool) {
 	return cert, ok
 }
 
-// GetSpireAgentID extracts the agent database ID from the Gin context.
+// GetSpireAgentID returns the authenticated agent's id (spire_agents.id).
 func GetSpireAgentID(c *gin.Context) (string, bool) {
 	val, exists := c.Get(SpireAgentIDKey)
 	if !exists {
 		return "", false
 	}
 	s, ok := val.(string)
-	return s, ok
+	return s, ok && s != ""
 }

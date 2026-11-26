@@ -90,6 +90,9 @@ var (
 	// example Complete on an attempt a replacement already marked unknown),
 	// or was prepared under another lease version.
 	ErrAttemptState = errors.New("the attempt is not in the state this step needs")
+	// ErrAttemptWorkspace: the request names another workspace than the job
+	// that would record it (AS-108); nothing is written.
+	ErrAttemptWorkspace = errors.New("the attempt's workspace is not the job's")
 	// ErrOutcomeUnknownPending is §7.12's outcome_unknown_pending: an earlier
 	// mutation on this deployment has no established outcome; nothing may be
 	// sent until it is resolved.
@@ -181,6 +184,9 @@ func (l *IGAGovAttemptLog) Prepare(ctx context.Context, run *PolicyJobRun, req A
 	if req.Operation == "" || req.RequestHash == "" || req.OpSeq < 0 {
 		return nil, errors.New("an attempt needs an operation, a request hash and op_seq >= 0")
 	}
+	if req.WorkspaceID != run.Job.WorkspaceID {
+		return nil, fmt.Errorf("%w: request %s, job %s", ErrAttemptWorkspace, req.WorkspaceID, run.Job.WorkspaceID)
+	}
 	var out models.IGAGovAttempt
 	err := run.InTx(ctx, func(tx *gorm.DB) error {
 		var next int
@@ -223,7 +229,8 @@ func (l *IGAGovAttemptLog) Prepare(ctx context.Context, run *PolicyJobRun, req A
 func (l *IGAGovAttemptLog) Dispatch(ctx context.Context, run *PolicyJobRun, att *models.IGAGovAttempt) error {
 	return run.InTx(ctx, func(tx *gorm.DB) error {
 		var exp *time.Time
-		if err := tx.Raw(`SELECT lease_expires_at FROM iga_gov_job WHERE id = ?`, run.Fence.JobID).Scan(&exp).Error; err != nil {
+		if err := tx.Raw(`SELECT lease_expires_at FROM iga_gov_job WHERE workspace_id = ? AND id = ?`,
+			run.Job.WorkspaceID, run.Fence.JobID).Scan(&exp).Error; err != nil {
 			return err
 		}
 		now := l.now()
@@ -396,6 +403,9 @@ type AttemptRecovery struct {
 // attempt, fenced on THIS run's lease, before anything else is done on the
 // deployment.
 func (l *IGAGovAttemptLog) Recover(ctx context.Context, run *PolicyJobRun, ws, deploymentID uuid.UUID) (*AttemptRecovery, error) {
+	if ws != run.Job.WorkspaceID {
+		return nil, fmt.Errorf("%w: recover in %s, job %s", ErrAttemptWorkspace, ws, run.Job.WorkspaceID)
+	}
 	var out *AttemptRecovery
 	err := run.InTx(ctx, func(tx *gorm.DB) error {
 		var err error
@@ -431,7 +441,7 @@ func (l *IGAGovAttemptLog) RecoverTx(tx *gorm.DB, ws, deploymentID uuid.UUID) (*
 		switch att.Status {
 		case models.GovAttemptPrepared:
 			now := l.now()
-			res := tx.Model(&models.IGAGovAttempt{}).Where("id = ? AND status = ?", att.ID, models.GovAttemptPrepared).
+			res := tx.Model(&models.IGAGovAttempt{}).Where("workspace_id = ? AND id = ? AND status = ?", ws, att.ID, models.GovAttemptPrepared).
 				Updates(map[string]any{"status": models.GovAttemptAbandoned, "completed_at": now})
 			if res.Error != nil {
 				return res.Error

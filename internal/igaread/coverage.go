@@ -246,15 +246,17 @@ func (q *Query) Coverage(accounts []string) ([]CoverageAccount, error) {
 		if len(want) > 0 && !want[c.ScopeID] {
 			continue
 		}
-		recorded := c.AWSAttrs().TemplateVersion
+		attrs := c.AWSAttrs()
 		byConnector[c.ID] = &CoverageAccount{
 			Integration:     R(RefConnector, c.ID),
 			Account:         dir.Of(c.ScopeID),
 			ConnectorStatus: c.Status,
 			Template: map[string]any{
-				"deployed": nullIfBlank(recorded),
+				"deployed": nullIfBlank(attrs.TemplateVersion),
 				"current":  awsdiscovery.TemplateVersion,
-				"outdated": awsdiscovery.TemplateOutdated(recorded),
+				// null unless the stack reported the version itself: the build's own
+				// recorded version proves nothing about the deployed stack.
+				"outdated": awsdiscovery.TemplateOutdated(attrs.StackReportedTemplateVersion()),
 			},
 			Runs:     []string{},
 			Surfaces: []CoverageSurface{},

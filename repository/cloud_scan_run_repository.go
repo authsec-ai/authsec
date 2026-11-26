@@ -42,7 +42,7 @@ type CloudScanRunRepository interface {
 
 	// ClaimForPipeline is Claim with the projection predicate: a connector
 	// whose previous run is still being projected is not claimable (§4.5).
-	// Used ONLY when IGA_GRAPH_PROJECTION is on and verified -- the switch
+	// Used ONLY when the graph pipeline is available and verified -- the switch
 	// decides, never a probe of the schema (§2.8).
 	ClaimForPipeline(owner string, lease time.Duration, now time.Time) (*models.CloudScanRun, error)
 
@@ -217,7 +217,7 @@ func (r *cloudScanRunRepository) claim(
 	var out []models.CloudScanRun
 
 	// The projection predicate names iga_projection_job. It is included only
-	// in pipeline mode, which the IGA_GRAPH_PROJECTION switch decides after
+	// in pipeline mode, which the the graph pipeline decides after
 	// verifying the schema -- so the Phase 1 claim never names a Phase 2 table
 	// and runs unchanged against any schema (S1, §7.5).
 	projectionPredicate := ""
@@ -233,12 +233,16 @@ func (r *cloudScanRunRepository) claim(
 		//     JOBS OLDER THAN ONE LEASE.
 		//   * scan throughput is bounded by projection. Acceptable at one
 		//     connector per customer and a projection measured in seconds.
+		//
+		// TENANT-EXEMPT: part of the cross-workspace claim below, correlated to the candidate run's own workspace and connector.
 		projectionPredicate = `AND NOT EXISTS (
 			       SELECT 1 FROM iga_projection_job j
-			        WHERE j.connector_id = cloud_scan_run.connector_id
+			        WHERE j.workspace_id = cloud_scan_run.workspace_id
+			          AND j.connector_id = cloud_scan_run.connector_id
 			          AND j.status IN (?, ?))`
 	}
 
+	// TENANT-EXEMPT: the scan worker's claim loop takes the oldest claimable run of any workspace; the run row names its workspace, and the scan that follows is scoped to it.
 	query := `
 		UPDATE cloud_scan_run SET
 			status           = ?,
@@ -250,13 +254,20 @@ func (r *cloudScanRunRepository) claim(
 			generation       = CASE WHEN generation > 0 THEN generation
 			                        ELSE (SELECT COALESCE(c.scan_generation, 0) + 1
 			                                FROM cloud_connector c
-			                               WHERE c.id = cloud_scan_run.connector_id)
+			                               WHERE c.workspace_id = cloud_scan_run.workspace_id
+			                                 AND c.id = cloud_scan_run.connector_id)
 			                   END,
 			updated_at       = ?
 		WHERE id = (
+			-- TENANT-EXEMPT: the claim picks the next run across every workspace (see above).
 			SELECT id FROM cloud_scan_run
 			 WHERE (status = ?
 			    OR (status = ? AND (lease_expires_at IS NULL OR lease_expires_at <= ?)))
+			   -- AWS runs only. Azure records its passes here too (so a pass is a
+			   -- durable, fenced thing and two replicas cannot scan one tenant at
+			   -- once), but runs them itself; this worker would scan an Azure
+			   -- connector as an AWS account.
+			   AND connector_id IN (SELECT c.id FROM cloud_connector c WHERE c.provider = '` + models.CloudProviderAWS + `')
 			   ` + projectionPredicate + `
 			 ORDER BY requested_at
 			 FOR UPDATE SKIP LOCKED
@@ -513,7 +524,7 @@ func (row scanRunHistoryRow) projection() *RunProjection {
 // It names iga_projection_job and iga_publication, so it is NOT part of the
 // Phase 1 scan path (whose claim names no Phase 2 table): it serves read
 // routes of a binary that migrates to 036 before it serves anything, where
-// both tables exist whatever IGA_GRAPH_PROJECTION says -- and runs projected
+// both tables exist whatever the graph pipeline says -- and runs projected
 // before a switch-off stay visible with their revision.
 const historySelect = `
 	SELECT r.*, j.status AS job_status, j.attempts AS job_attempts, j.last_error AS job_last_error,

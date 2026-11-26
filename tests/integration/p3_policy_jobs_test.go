@@ -622,9 +622,8 @@ func TestP3T308WorkerStartsOnlyWhenPolicyVerified(t *testing.T) {
 		gate *services.PolicyGate
 		want bool
 	}{
-		{"on and verified", services.NewPolicyGate(true, "", graphOn), true},
-		{"off", services.NewPolicyGate(false, "", graphOn), false},
-		{"bad switch value", services.NewPolicyGate(true, `IGA_POLICY="maybe" is not on or off`, graphOn), false},
+		{"on and verified", services.NewPolicyGate(true, graphOn), true},
+		{"off", services.NewPolicyGate(false, graphOn), false},
 	} {
 		started := false
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

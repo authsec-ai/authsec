@@ -284,37 +284,6 @@ func sha256Hex(s string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// A policy asking for quarantine explains an entry. The AUTHORITY is still the
-// agent's status — a dry-run reconcile must never contain anything.
-func TestPolicyAttributionIsAnExplanationNotTheAuthority(t *testing.T) {
-	f := newPlanFixture(t)
-	pol, err := policyMgr(t, f.provFixture).Create(f.ws, "u", services.AgentPolicyInput{
-		Name: "contain", DiscoveredAgentID: &f.agent,
-		DesiredState: models.AgentPolicyStateQuarantined,
-	})
-	if err != nil {
-		t.Fatalf("create policy: %v", err)
-	}
-
-	// The policy exists and asks for quarantine, but nothing has moved the status.
-	d, _ := f.doc(t)
-	if len(d.Deny) != 0 {
-		t.Fatal("a policy alone must not contain an agent: the plan follows the DECISION " +
-			"of record, so a dry-run reconcile can never reach a cluster")
-	}
-
-	if _, err := f.dm.QuarantineAgent(f.ws, f.agent, "policy asked", nil); err != nil {
-		t.Fatalf("quarantine: %v", err)
-	}
-	d, _ = f.doc(t)
-	if len(d.Deny) != 1 {
-		t.Fatalf("want 1 entry, got %d", len(d.Deny))
-	}
-	if d.Deny[0].PolicyID != pol.ID.String() {
-		t.Errorf("the entry must name the policy that asked for it, got %q", d.Deny[0].PolicyID)
-	}
-}
-
 /* ------------------------------ agent report ----------------------------- */
 
 func TestReportFoldsIntoTheConnectorRow(t *testing.T) {

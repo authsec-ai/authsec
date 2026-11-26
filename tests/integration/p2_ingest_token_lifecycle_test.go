@@ -452,6 +452,7 @@ func ingestAuthHealthCheck(t *testing.T) map[string]any {
 func TestP2IngestAuthNotEnforcedIsLoud(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
+	t.Setenv("ENVIRONMENT", "development")
 	t.Setenv(services.DiscoveryIngestAuthEnv, "")
 	if st := services.CurrentDiscoveryIngestAuthStatus(); st.Mode != services.IngestAuthWarn || st.Enforced || st.Warning == "" {
 		t.Errorf("default status: %+v, want warn, not enforced, with a warning", st)

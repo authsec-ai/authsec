@@ -69,8 +69,9 @@ func (hc *HealthController) ComprehensiveHealthCheck(c *gin.Context) {
 	}
 
 	// Discovery ingress auth: reported, never what makes the service
-	// unhealthy -- warn is the default during rollout, and a 503 would take the
-	// control plane out of its load balancer for a configuration choice.
+	// unhealthy -- warn is a rollout setting (the default outside production),
+	// and a 503 would take the control plane out of its load balancer for a
+	// configuration choice.
 	checks["discovery_ingest_auth"] = hc.checkDiscoveryIngestAuth()
 
 	// 5. Metrics Health Check
@@ -129,6 +130,7 @@ func (hc *HealthController) checkDatabaseHealth() map[string]interface{} {
 
 	// Verify bootstrap schema is present by checking a critical table
 	var tableCount int64
+	// TENANT-EXEMPT: health check reads the Postgres catalog
 	if err := config.DB.Raw("SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'workspaces'").Scan(&tableCount).Error; err != nil || tableCount == 0 {
 		result["healthy"] = false
 		result["message"] = "Bootstrap schema missing: workspaces table not found"

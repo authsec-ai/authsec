@@ -7,6 +7,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 )
 
@@ -72,8 +73,12 @@ func (r *cloudPolicyRepository) UpsertPolicy(p *models.CloudPolicy) (*models.Clo
 		// The SURVIVING row's id: after a conflict the struct still holds the
 		// id GORM generated, and attachments written against it would point at
 		// nothing.
-		return tx.Raw(`SELECT id FROM cloud_policy WHERE connector_id = ? AND native_id = ?`,
-			p.ConnectorID, p.NativeID).Row().Scan(&p.ID)
+		ctx, q, err := txTenant(tx, p.WorkspaceID)
+		if err != nil {
+			return err
+		}
+		return tenancy.QueryRowContext(ctx, q, `SELECT id FROM cloud_policy WHERE workspace_id = $1 AND connector_id = $2 AND native_id = $3`,
+			[]any{p.ConnectorID, p.NativeID}, &p.ID)
 	})
 	if err != nil {
 		return nil, err

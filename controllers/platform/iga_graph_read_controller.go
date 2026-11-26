@@ -14,6 +14,7 @@ import (
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/internal/igaread"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/authsec-ai/authsec/services"
 )
@@ -28,7 +29,7 @@ type IGAGraphReadController struct {
 	gate func() *services.GraphProjectionGate
 	db   func() *gorm.DB
 	key  []byte
-	// policyGate is the IGA_POLICY gate a test installed (WithPolicyGate);
+	// policyGate is the policy gate a test installed (WithPolicyGate);
 	// nil reads the process-wide one (iga_gov_policy_controller.go).
 	policyGate func() *services.PolicyGate
 
@@ -97,7 +98,7 @@ func (ctl *IGAGraphReadController) Reader() *igaread.Reader {
 
 // graphFeatures is what THIS build serves NOW (§5.3 /capabilities). A feature
 // is true only when its routes are implemented AND graph_projection is on
-// (D-11): with the switch off or misconfigured every graph route answers 503,
+// (D-11): while the graph schema is not verified every graph route answers 503,
 // so nothing is usable. The console hides a feature it is told is
 // unavailable, and a feature reported available with no route behind it would
 // render as empty rather than as unavailable -- which §2.14.7 forbids. And only
@@ -122,9 +123,9 @@ func graphFeatures(on bool) gin.H {
 // deployment supports. Any authenticated caller; no permission beyond a token.
 //
 // graph_projection is on | off | misconfigured, with the reason when it is
-// not on. "misconfigured" is the fail-closed state (§2.8): the switch is on and
-// schema verification failed or errored, so the scan worker claims nothing and
-// the projector is not running.
+// not on. "misconfigured" is every unverified state (§2.8): the graph schema is
+// absent (AWS scans run without the graph), partial or unreadable (the scan
+// worker claims nothing); in each, no projector writes. The reason says which.
 func (ctl *IGAGraphReadController) GetCapabilities(c *gin.Context) {
 	// D-82: live state, never pinned -- a rev (or any parameter: the route
 	// takes none) is 400, as on /pipeline, rather than silently ignored.
@@ -145,10 +146,16 @@ func (ctl *IGAGraphReadController) GetCapabilities(c *gin.Context) {
 		"reason":           nullIfEmpty(reason),
 		"features":         graphFeatures(mode == services.GraphProjectionOn),
 		"schema_head":      nullIfEmpty(head),
-		// Phase 3 (SPEC-iga-phase3-policy.md §4.3, T3.02): the IGA_POLICY
+		// Phase 3 (SPEC-iga-phase3-policy.md §4.3, T3.02): the policy
 		// gate and what the policy product serves. Its reason is the one
 		// every /policy route's 503 carries.
-		"policy": policyCapabilities(ctl.policyGateFn()()),
+		"policy": withAccessPolicies(policyCapabilities(ctl.policyGateFn()()), ctl.db()),
+		// Agent runtime visibility P3: containment levels per AWS account.
+		"agent_containment": agentContainCapabilities(c, ctl.db()),
+		// Schema gates ({"available", "reason"}): alerts need 150, the rest
+		// of the agent runtime 147-149.
+		"agent_alerts":  services.AgentAlertsCapabilities(ctl.db()),
+		"agent_runtime": services.AgentRuntimeCapabilities(ctl.db()),
 	}})
 }
 
@@ -161,7 +168,7 @@ type graphCall struct {
 
 // serve runs one graph read under the contract every route shares:
 //
-//   - 503 graph_unavailable unless IGA_GRAPH_PROJECTION is on AND verified
+//   - 503 graph_unavailable unless the graph pipeline is available AND verified
 //     (§2.8, T6.9): the console shows Unavailable, never an empty graph;
 //   - the workspace ONLY from the token, never a parameter (§5);
 //   - errors rendered as {"error": {...}} with the §5.2 status, nothing partial.
@@ -185,11 +192,12 @@ func (ctl *IGAGraphReadController) serve(c *gin.Context, fn func(g graphCall) (a
 	c.JSON(http.StatusOK, body)
 }
 
-// tokenWorkspace is the workspace AuthMiddleware established. Never a
-// parameter, never a fallback to another claim.
+// tokenWorkspace is the workspace AuthMiddleware established in the tenant
+// context (internal/tenancy). Never a parameter, never a fallback to another
+// claim.
 func tokenWorkspace(c *gin.Context) (uuid.UUID, bool) {
-	id, err := uuid.Parse(c.GetString("workspace_id"))
-	if err != nil || id == uuid.Nil {
+	id, err := tenancy.Workspace(c)
+	if err != nil {
 		return uuid.Nil, false
 	}
 	return id, true

@@ -1,0 +1,1 @@
+{"Statement":[{"Action":["s3:AbortMultipartUpload","s3:PutObject"],"Condition":{"DateGreaterThan":{"aws:CurrentTime":"2026-10-20T00:00:00Z"},"DateLessThan":{"aws:CurrentTime":"2026-11-01T00:00:00Z"}},"Effect":"Allow","Resource":"arn:aws:s3:::acme-invoices/*","Sid":"AuthSecAccessObjects"}],"Version":"2012-10-17"}

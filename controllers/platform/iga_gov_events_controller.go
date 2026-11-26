@@ -95,7 +95,7 @@ func (ctl *IGAGovPolicyController) EventKinds(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, gin.H{"data": gin.H{
 		"categories":   services.GovEventCategories(),
-		"events":       services.GovEventVocabulary,
+		"events":       services.GovEventVocabularyServed(),
 		"object_kinds": services.GovEventObjectKinds(),
 	}, "meta": gin.H{}})
 }

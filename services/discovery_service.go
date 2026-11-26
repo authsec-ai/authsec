@@ -415,6 +415,7 @@ func (m *discoveryManager) RegisterAgent(workspaceID uuid.UUID, in AgentRegistra
 	}
 	// Explicit here because AfterFind does not fire for a Create with RETURNING.
 	stored.DeriveConnected(now)
+	stored.DeriveActuationState()
 	return stored, created, nil
 }
 
@@ -551,7 +552,7 @@ func (m *discoveryManager) checkManifestClusterUID(workspaceID uuid.UUID, in Man
 
 // projectK8sSighting copies a Kubernetes sighting into the shared graph at
 // once (K8sRBACManager.ProjectSighting) rather than waiting for the cluster's
-// next RBAC snapshot. A no-op for other sources and while IGA_GRAPH_PROJECTION
+// next RBAC snapshot. A no-op for other sources and while the graph pipeline
 // is off.
 //
 // Best-effort for the same reason as the correlation proposal: the graph is
@@ -565,7 +566,7 @@ func (m *discoveryManager) projectK8sSighting(workspaceID uuid.UUID, source, fin
 	if db == nil {
 		return
 	}
-	if err := NewK8sRBACManager(db, GraphProjectionGateFromEnv()).
+	if err := NewK8sRBACManager(db, GraphProjection()).
 		ProjectSighting(workspaceID, fingerprint); err != nil {
 		log.Printf("[discovery] could not project sighting %s into the graph: %v", fingerprint, err)
 	}
@@ -1101,6 +1102,17 @@ func (m *discoveryManager) ClaimAgent(workspaceID, agentID uuid.UUID, in ClaimIn
 		if err != nil {
 			return nil, err
 		}
+	} else {
+		// A caller-supplied identity must be one of this workspace's own clients;
+		// binding another workspace's client here lets provision/deprovision take
+		// it over or revoke it (AS-026).
+		db := m.repo.DB()
+		if db == nil {
+			return nil, errors.New("cannot verify matched_client_id without a database handle")
+		}
+		if _, err := loadWorkspaceClient(db, workspaceID, clientID); err != nil {
+			return nil, fmt.Errorf("matched_client_id is not a client of this workspace: %w", err)
+		}
 	}
 
 	return m.repo.ClaimAgent(repositories.ClaimAgentInput{
@@ -1135,7 +1147,8 @@ func (m *discoveryManager) QuarantineAgent(workspaceID, agentID uuid.UUID, reaso
 			actor = by.String()
 		}
 		if queued, why := EnforceQuarantine(db, workspaceID, agent, false, actor); !queued && why != "" {
-			if uerr := db.Model(&models.DiscoveredAgent{}).Where("id = ?", agent.ID).
+			if uerr := db.Model(&models.DiscoveredAgent{}).
+				Where("workspace_id = ? AND id = ?", workspaceID, agent.ID).
 				Update("quarantine_enforcement_error",
 					"not enforced in-cluster: "+why).Error; uerr == nil {
 				agent.QuarantineEnforcementError = "not enforced in-cluster: " + why
@@ -1178,7 +1191,8 @@ func (m *discoveryManager) ReleaseQuarantine(workspaceID, agentID uuid.UUID,
 			msg := "released, but the in-cluster NetworkPolicy was NOT removed (" + why +
 				"); delete it manually: kubectl delete networkpolicy -n <ns> " +
 				"-l authsec.ai/quarantine=true"
-			if uerr := db.Model(&models.DiscoveredAgent{}).Where("id = ?", agent.ID).
+			if uerr := db.Model(&models.DiscoveredAgent{}).
+				Where("workspace_id = ? AND id = ?", workspaceID, agent.ID).
 				Update("quarantine_enforcement_error", msg).Error; uerr == nil {
 				agent.QuarantineEnforcementError = msg
 			}

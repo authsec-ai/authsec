@@ -14,20 +14,20 @@ import "github.com/gin-gonic/gin"
 // GetGraph handles GET /api/iga/v1/graph?root=<ref>&direction=forward|reverse&assume_hops=N.
 func (ctl *IGAGraphReadController) GetGraph(c *gin.Context) {
 	ctl.serve(c, func(g graphCall) (any, error) {
-		return g.Reader.Graph(g.C.Request.Context(), g.WS, g.C.Request.URL.Query())
+		return g.Reader.Graph(g.C.Request.Context(), g.C.Request.URL.Query())
 	})
 }
 
 // ExpandGraph handles GET /api/iga/v1/graph/expand?node=<ref>&edge=<kind>&direction=...&cursor=.
 func (ctl *IGAGraphReadController) ExpandGraph(c *gin.Context) {
 	ctl.serve(c, func(g graphCall) (any, error) {
-		return g.Reader.ExpandGraph(g.C.Request.Context(), g.WS, g.C.Request.URL.Query())
+		return g.Reader.ExpandGraph(g.C.Request.Context(), g.C.Request.URL.Query())
 	})
 }
 
 // GetGraphPath handles GET /api/iga/v1/graph/path?from=<ref>&to=<ref>.
 func (ctl *IGAGraphReadController) GetGraphPath(c *gin.Context) {
 	ctl.serve(c, func(g graphCall) (any, error) {
-		return g.Reader.GraphPath(g.C.Request.Context(), g.WS, g.C.Request.URL.Query())
+		return g.Reader.GraphPath(g.C.Request.Context(), g.C.Request.URL.Query())
 	})
 }

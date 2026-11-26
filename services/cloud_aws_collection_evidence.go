@@ -116,9 +116,8 @@ func arnField(arn string, i int) string {
 }
 
 // podIdentityEdgeAttrs is a pod-identity cloud_assume_edge's attrs: where the
-// binding was read. The region is what a later scan needs to tell "EKS is not
-// offered there" from "a binding we recorded there cannot be read"
-// (CountPodIdentityEdges, T3.8); the cluster and association identifiers say
+// binding was read. The region is what a later scan needs to tell which of
+// its edges it did not look for (unreadPodIdentityEdges); the cluster and association identifiers say
 // which EKS objects the edge stands for. Replaced on every read, like the
 // rest of the edge.
 func podIdentityEdgeAttrs(

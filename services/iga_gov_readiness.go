@@ -7,8 +7,10 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 
 	"github.com/authsec-ai/authsec/internal/igagov"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 )
 
@@ -82,19 +84,32 @@ type Readiness struct {
 	Counts        map[string]int  `json:"counts"`
 	Roles         []ReadinessRole `json:"roles"`
 	Next          *string         `json:"-"`
+	// CategoryIDs are the roles of the collected category (not served).
+	CategoryIDs []uuid.UUID `json:"-"`
 }
 
 // Readiness computes readiness at the latest complete evaluation; account
 // filters by AWS account (the role ARN's); the page is ordered by identity
-// id with a signed cursor.
-func (r *GovReader) Readiness(ctx context.Context, ws uuid.UUID, account, cursor string, limit int) (*Readiness, error) {
+// id with a signed cursor. Every read runs in one read-only transaction
+// under row-level security for ws.
+func (r *GovReader) Readiness(ctx context.Context, ws uuid.UUID, account, cursor string, limit int) (out *Readiness, err error) {
+	err = tenancy.InWorkspaceRead(ctx, r.db, ws, govAgreeing(ctx, ws, func(tx *gorm.DB) (e error) {
+		out, e = r.readiness(tx, ws, account, cursor, limit, "")
+		return e
+	}))
+	return out, err
+}
+
+// readiness is Readiness; a non-empty collect also gathers, over every role
+// reviewed, the identity ids of that category (CategoryIDs), which GET
+// /findings?category reads.
+func (r *GovReader) readiness(db *gorm.DB, ws uuid.UUID, account, cursor string, limit int, collect string) (*Readiness, error) {
 	if limit <= 0 {
 		limit = 50
 	}
 	if limit > MaxGovPage {
 		return nil, GovBadParam("limit", "limit must be 1..200.")
 	}
-	db := r.db.WithContext(ctx)
 	out := &Readiness{Counts: map[string]int{}, Roles: []ReadinessRole{}}
 	for _, c := range ReadinessOrder {
 		out.Counts[c] = 0
@@ -180,7 +195,7 @@ func (r *GovReader) Readiness(ctx context.Context, ws uuid.UUID, account, cursor
 		notCollected[n.IdentityAccountID] = append(notCollected[n.IdentityAccountID], n.Reason)
 	}
 	// Resource-policy coverage of each connector's run at rev.
-	coverage, err := r.coverageAt(ctx, ws, rev)
+	coverage, err := r.coverageAt(db, ws, rev)
 	if err != nil {
 		return nil, err
 	}
@@ -295,6 +310,9 @@ func (r *GovReader) Readiness(ctx context.Context, ws uuid.UUID, account, cursor
 		rr.Remedy = readinessRemedy(rr)
 		out.Counts[rr.Category]++
 		out.RolesReviewed++
+		if collect != "" && rr.Category == collect {
+			out.CategoryIDs = append(out.CategoryIDs, ro.ID)
+		}
 		if after != "" && ro.ID.String() <= after {
 			continue
 		}
@@ -312,9 +330,9 @@ func (r *GovReader) Readiness(ctx context.Context, ws uuid.UUID, account, cursor
 
 // coverageAt is the resource-policy coverage summary of each connector's
 // run in rev's manifest.
-func (r *GovReader) coverageAt(ctx context.Context, ws uuid.UUID, rev int64) (map[uuid.UUID]string, error) {
+func (r *GovReader) coverageAt(db *gorm.DB, ws uuid.UUID, rev int64) (map[uuid.UUID]string, error) {
 	var pub struct{ Manifest json.RawMessage }
-	if err := r.db.WithContext(ctx).Raw(`SELECT manifest FROM iga_publication WHERE workspace_id = ? AND rev = ?`, ws, rev).
+	if err := db.Raw(`SELECT manifest FROM iga_publication WHERE workspace_id = ? AND rev = ?`, ws, rev).
 		Scan(&pub).Error; err != nil {
 		return nil, err
 	}
@@ -326,7 +344,7 @@ func (r *GovReader) coverageAt(ctx context.Context, ws uuid.UUID, rev int64) (ma
 			ids[id] = true
 		}
 	}
-	runs, metas, err := loadRunEvidence(r.db.WithContext(ctx), ws, keysOf(ids), rev)
+	runs, metas, err := loadRunEvidence(db, ws, keysOf(ids), rev)
 	if err != nil {
 		return nil, err
 	}
@@ -345,16 +363,20 @@ func (r *GovReader) coverageAt(ctx context.Context, ws uuid.UUID, rev int64) (ma
 	return out, nil
 }
 
+// readinessRemedy is the console page that answers a role's category: the
+// connection's coverage or IaC sources, or the role's own page (the console
+// has no findings page since policy setup moved onto the connections).
 func readinessRemedy(rr ReadinessRole) string {
 	switch rr.Category {
 	case ReadinessBlockedByCollection:
 		return connectionCoverageLink(rr.ConnectorID)
-	case ReadinessNeedsOwner:
-		return "/iga/policy/findings?kind=missing_owner&identity_id=" + rr.IdentityAccountID.String()
 	case ReadinessIaCOnly:
-		return "/iga/policy/setup"
-	case ReadinessIneligible, ReadinessDirectEligible:
-		return "/iga/policy/findings?identity_id=" + rr.IdentityAccountID.String()
+		if rr.ConnectorID == nil {
+			return "/iga/connections"
+		}
+		return "/iga/connections/" + rr.ConnectorID.String() + "/iac"
+	case ReadinessNeedsOwner, ReadinessIneligible, ReadinessDirectEligible:
+		return "/iga/identities/" + rr.IdentityAccountID.String()
 	}
 	return ""
 }

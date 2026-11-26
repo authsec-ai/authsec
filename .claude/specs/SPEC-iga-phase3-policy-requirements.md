@@ -1,6 +1,6 @@
 # Phase 3 — policy creation and enforcement requirements
 
-Updated: 7 October 2026.
+Updated: 13 October 2026.
 
 **Outcome:** remove unnecessary standing access while preserving application
 behavior. AuthSec owns the policy lifecycle; each provider enforces its own
@@ -19,9 +19,8 @@ customer outcome, not from the code that happens to exist.
 - It does not inherit the existing Kubernetes agent-lifecycle policy model:
   not the `agent_policies` root, its reconciliation service, the
   `provisioning_instructions` queue, the warning worker or the retired
-  governance screens. That feature is assessed separately in the disposition
-  plan and is retained, isolated, migrated or retired there, on its own
-  gates.
+  governance screens. That feature is removed under the explicit product decision in the disposition
+  plan. No compatibility stack, customer migration gate or legacy screen remains.
 - Independence does not mean duplicating sound shared infrastructure.
   Workspace authorization and permissions, Vault credential storage, the
   `audit_events` trail, notification transport and console primitives are
@@ -109,12 +108,12 @@ S = supported, B = prerequisite-blocked (named), D = deferred (named release),
 
 | Capability | AWS IAM roles | Kubernetes RBAC (ServiceAccounts) | Kubernetes network containment | Runtime tool controls (AgentCore) |
 |---|---|---|---|---|
-| Discovery and declared relationships | S (published graph) | S, unrevisioned, from an unauthenticated ingress today → B for any policy use until K-1 | Legacy quarantine only (disposition plan) | D R3 |
+| Discovery and declared relationships | S (published graph) | S, unrevisioned, from an unauthenticated ingress today → B for any policy use until K-1 | Not a policy capability | D R3 |
 | Activity evidence | S at service level (Access Advisor, identity-policy scope only); R1b adds CloudTrail history | **None collected.** No usage history exists; "unused" findings are impossible until audit-log evidence is designed (D, later than R1k) | — | D R3 |
 | Recommendation generation | S R1a: unused services; broad grants; shared roles; ownership | D R1k: broad grants, shared ServiceAccounts, alternate bindings, ownership — **not** unused-permission removal | D | D R3 |
 | Static impact preview | S R1a | D R1k | D | D R3 |
 | Historical what-if | D R1b (CloudTrail) | Not planned without activity evidence | — | D R3 |
-| Direct apply | S R1a: AuthSec-owned permissions boundary | D after R1k (needs a separate least-privilege actuation credential; K-3) | Retained legacy only | D R3 |
+| Direct apply | S R1a: AuthSec-owned permissions boundary | D after R1k (needs a separate least-privilege actuation credential; K-3) | Not supported by Phase 3 | D R3 |
 | IaC change proposal | S R1a: Terraform/CloudFormation PR | D R1k: GitOps manifest PR / export | — | — |
 | Verification | S R1a: readback, graph, scoped behavioral evidence | D R1k: authenticated sweep readback | — | D R3 |
 | Rollback | S R1a: undo to recorded before-state; remove-control restores baseline | D R1k | — | D R3 |
@@ -367,7 +366,7 @@ recorded exception.
 | E-09 | MUST R2 | Expiry and revocation across sessions, outages and missed housekeeping |
 | E-10 | MUST R1a | Append-only, redacted chain from finding to rollback, readable in Logs |
 | E-11 | MUST R1a | Qualify Appendix A targets; separate AuthSec processing from provider latency |
-| E-12 | MUST R1a | Legacy coexistence: no two systems own the same provider artifact or operation; legacy controls stay visible and manageable until their retirement gate (disposition plan) |
+| E-12 | MUST R1a | One policy system: remove the superseded agent-policy workers, routes, models, six tables and compatibility UI; preserve discovery, graph, runtime authorization and multitenancy |
 
 ### Runtime and agent-specific controls
 
@@ -405,7 +404,7 @@ test, or a real producer-to-provider run; only the last proves behavior.
 | 8 | Worker crash before and after a provider write | Safe resume; idempotent effect; auditable outcome |
 | 9 | Customer edits the native artifact before rollback | Edit preserved; rollback blocked or role-scoped |
 | 10 | Provider update succeeds, verification stays unknown | Applied-unverified then overdue; never verified by elapsed time |
-| 11 | Legacy and new workers coexist during cutover | No artifact owned by both; legacy controls visible and manageable |
+| 11 | Superseded implementation removed | No old policy worker or API; no legacy store read or compatibility UI; retained integrations and multitenancy still work |
 | 12 | Kubernetes alternate binding preserves access after one binding changes (R1k) | Preview and verification name the remaining binding |
 | 13 | Retired screen bookmark | Lands on the intentional replacement or retirement state |
 | 14 | One target fails in a multi-target rollout | Partial result explicit; never global success |
@@ -420,8 +419,8 @@ test, or a real producer-to-provider run; only the last proves behavior.
 R1a (AWS service-level right-sizing, governance findings) → R1b (action-level
 AWS) and R1k (Kubernetes RBAC, after K-1 to K-3) → R2 (time-bound access) →
 R3 (runtime controls). Each increment beyond R1a needs its own approved
-implementation spec. The legacy agent-lifecycle feature follows the
-disposition plan's gates; Phase 3 neither extends nor silently removes it.
+implementation spec. The pre-Phase-3 agent-policy feature is explicitly removed under the disposition
+plan; it is not a dependency or second policy product.
 
 ## Appendix A. Operating envelope
 
@@ -442,8 +441,7 @@ Elapsed time alone never passes a canary; owner deadlines never auto-approve.
 ## Appendix B. Existing code
 
 The existing Kubernetes agent-lifecycle policy stack is not a starting point
-for Phase 3 (§1). Its traced inventory, consumers and retain / reimplement /
-isolate / migrate / retire decisions are in
+for Phase 3 (§1). Its removal boundary and shared infrastructure that must survive are in
 [PLAN-existing-policy-code-disposition.md](PLAN-existing-policy-code-disposition.md).
 Shared infrastructure reused by Phase 3 is named, with its contract, in the
 implementation spec's baseline section.

@@ -32,7 +32,7 @@ type Tenant struct {
 	WorkspaceDB     string     `json:"workspace_db"`
 	Email        string     `json:"email" gorm:"type:text;uniqueIndex;not null"`
 	Username     *string    `json:"username,omitempty" gorm:"type:text"`
-	PasswordHash string     `json:"password_hash,omitempty"`
+	PasswordHash string     `json:"-"` // never serialized
 	Provider     string     `gorm:"type:text;default:'local';index:idx_users_provider" json:"provider"`
 	ProviderID   *string    `json:"provider_id,omitempty" gorm:"type:text"`
 	Avatar       *string    `json:"avatar,omitempty" gorm:"type:text"`

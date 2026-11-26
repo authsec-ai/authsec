@@ -212,7 +212,7 @@ func TestP2ChangesParametersAndNotFound(t *testing.T) {
 	// And the 503 gate: the switch off answers graph_unavailable, before any
 	// parameter or id is looked at.
 	off := *l
-	off.gate = services.NewGraphProjectionGate(false, "")
+	off.gate = services.NewGraphProjectionGate(false)
 	code, body := off.api().get(changesPath("identity", role, "kind", "bogus"))
 	if code != http.StatusServiceUnavailable || errCode(body) != "graph_unavailable" {
 		t.Errorf("switch off = %d %v, want 503 graph_unavailable", code, body)

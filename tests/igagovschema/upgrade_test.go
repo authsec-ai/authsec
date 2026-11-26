@@ -2,10 +2,10 @@ package igagovschema_test
 
 // SPEC-iga-phase3-policy.md §6.3, "Upgrade over existing rows (synthetic)":
 // a database built to 046 (the chain before Phase 3) is given a workspace, its
-// admin role and two legacy selector policies in agent_policies; then 047-056
-// are applied by the runner. Every table that existed at 046 must keep its
-// exact definition (columns, defaults, constraints, indexes, triggers), the
-// legacy rows must be byte-identical, and the admin role must receive the four
+// admin role and two legacy selector policies in agent_policies; then the policy
+// and cleanup migrations are applied by the runner. Retained tables keep their
+// exact definition (columns, defaults, constraints, indexes, triggers), the six
+// superseded policy tables disappear, and the admin role must receive the four
 // new governance permissions. Also: VerifyPolicySchema refuses the 046 schema
 // and accepts the upgraded one.
 //
@@ -115,16 +115,44 @@ func TestPhase3UpgradeOverExistingRows(t *testing.T) {
 	if s.err != nil {
 		t.Fatalf("legacy rows: %s", describe(s.err))
 	}
-	legacyRows := `SELECT md5(string_agg(t::text, E'\n' ORDER BY t.id)) FROM agent_policies t WHERE workspace_id = {ws}`
-	rowsBefore := s.val(legacyRows)
 	before := fingerprints(t, db)
 
-	if err := runRunner(db, g, migrationsDir()); err != nil {
+	// Apply the original policy chain plus recovery/retirement (157-158).
+	// Do not include the new access-policy feature (137) in this isolation check.
+	// The tenancy program's
+	// migrations (101+) change existing tables on purpose (workspace columns,
+	// RLS policies), which is not what this test is about.
+	phase3Dir := t.TempDir()
+	all, err := filepath.Glob(filepath.Join(migrationsDir(), "*.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range all {
+		v, err := strconv.Atoi(strings.SplitN(filepath.Base(f), "_", 2)[0])
+		if err != nil || v < phase3First || (v >= 100 && v != 157 && v != 158) {
+			continue
+		}
+		body, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(phase3Dir, filepath.Base(f)), body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := runRunner(db, g, phase3Dir); err != nil {
 		t.Fatalf("apply 047-056 over 046: %v", err)
 	}
 
 	after := fingerprints(t, db)
+	retired := map[string]bool{"agent_policies": true, "agent_policy_actions": true, "agent_policy_confirmations": true, "agent_policy_warnings": true, "governance_notification_settings": true}
 	for name, h := range before {
+		if retired[name] {
+			if _, present := after[name]; present {
+				t.Errorf("retired table %s still exists", name)
+			}
+			continue
+		}
 		if after[name] != h {
 			t.Errorf("existing table %s changed definition across 047-056", name)
 		}
@@ -135,12 +163,10 @@ func TestPhase3UpgradeOverExistingRows(t *testing.T) {
 			added++
 		}
 	}
-	// 047-056 add 43 tables; 059_tidy_eval_pruned (fix/p3-tidy) one more.
-	if added != 44 {
-		t.Errorf("047-059 added %d tables, want 44", added)
-	}
-	if got := s.val(legacyRows); got != rowsBefore {
-		t.Errorf("legacy agent_policies rows changed: %s -> %s", rowsBefore, got)
+	// 047-056 add 43 tables; 059_tidy_eval_pruned (fix/p3-tidy) one more;
+	// 060-062 (R1b, R2, R3) 13 more.
+	if added != 57 {
+		t.Errorf("047-062 added %d tables, want 57", added)
 	}
 	s.eq("approve,author,emergency,enforce", `SELECT string_agg(p.action, ',' ORDER BY p.action)
 	        FROM role_permissions rp JOIN permissions p ON p.id = rp.permission_id
@@ -149,8 +175,15 @@ func TestPhase3UpgradeOverExistingRows(t *testing.T) {
 	for _, b := range s.bad {
 		t.Error(b)
 	}
+	// The rest of the chain (the tenancy program's 101+, which the policy
+	// schema also needs: 132's per-workspace notification key), as on any
+	// real database; this also leaves the shared database at the head for
+	// the tests that run after this one.
+	if err := runRunner(db, g, migrationsDir()); err != nil {
+		t.Fatalf("apply the rest of the chain: %v", err)
+	}
 	if err := services.VerifyPolicySchema(g); err != nil {
 		t.Fatalf("VerifyPolicySchema after 047-056: %v", err)
 	}
-	t.Logf("upgrade: %d existing tables unchanged, %d added, legacy rows identical, admin bound to 4 governance permissions", len(before), added)
+	t.Logf("upgrade: %d existing tables unchanged, %d added, superseded policy tables absent, admin bound to 4 governance permissions", len(before), added)
 }

@@ -5,8 +5,8 @@ package integration
 // association listing per cluster, and its coverage must name EVERY failure --
 // not the first reader's -- with a listing that returned nothing outranking
 // detail calls that failed. A region whose EKS endpoint does not resolve is
-// skipped (EKS is not offered there), unless an earlier scan recorded a
-// binding that may come from it.
+// partial: EKS is offered in every region, so a name that does not resolve is
+// a resolver failure, never "not offered".
 
 import (
 	"context"
@@ -163,20 +163,17 @@ func s3bPodEdgeCount(t *testing.T, db *gorm.DB, ws uuid.UUID, subject string) in
 	return n
 }
 
-// T3.8 / E9: a selected region whose EKS endpoint does not resolve is not
-// offered EKS -- skipped, so eks_pod_identity is reached on the regions that
-// are read and the permission scan reconciles (it used to be denied, vetoing
-// reconciliation of every edge, grant and resource for the connector on every
-// run). The region's own binding attrs record where each edge was read.
+// Review P1-11 (T3.8 / E9, revised): a selected region whose EKS endpoint does
+// not resolve is NOT "EKS is not offered there" -- EKS is offered in every
+// region of its partition, so a name that fails to resolve is a resolver
+// failure. eks_pod_identity is partial (never reached or unsupported, so
+// nothing reads it as "no bindings"), names eks:ListClusters, and the permission
+// scan's reconciliation is blocked: the bindings recorded for the unread region
+// -- with or without an attrs region -- are kept.
 //
-// But a binding an earlier scan recorded in that region -- or recorded before
-// edges said where (no region in attrs) -- makes the unresolvable endpoint the
-// failure it may be: denied, naming why, and the binding is kept.
-//
-// Safeguards (mutation-checked): listErr on eks:ListClusters; the prior-
-// binding guard in writePodIdentityEdges; CountPodIdentityEdges counting a
-// region-less edge against every region.
-func TestP2S3bPodIdentityRegionWithoutEKSIsSkipped(t *testing.T) {
+// Safeguards (mutation-checked): listErr on eks:ListClusters (the resolver
+// branch); podIdentityCoverage's partial for an unreachable listing.
+func TestP2S3bPodIdentityUnresolvableRegionIsPartialAndKeepsBindings(t *testing.T) {
 	db := igaDB(t)
 	ws := newWorkspace(t, db, "p2-s3b-eks-not-offered")
 	defer cleanPermissionTables(t, db, ws)
@@ -187,44 +184,32 @@ func TestP2S3bPodIdentityRegionWithoutEKSIsSkipped(t *testing.T) {
 	})
 	stale := awsdiscovery.K8sSubject("payments", "retired-agent")
 	s3bPlantPodEdge(t, db, ws, snap, stale, `{"region": "us-east-1"}`)
-
-	out, cov := s3bPermissionScan(t, scanner, ws, snap)
-	if cov.State != models.CloudCoverageReached || cov.Count != 1 {
-		t.Fatalf("eks_pod_identity with EKS not offered in eu-west-1 = %+v, want reached (1 binding)", cov)
-	}
-	if !out.Complete {
-		t.Fatal("a region without EKS must not block the permission scan's reconciliation")
-	}
-	if n := s3bPodEdgeCount(t, db, ws, stale); n != 0 {
-		t.Fatal("the stale us-east-1 binding survived: reconciliation did not run")
-	}
-	var region string
-	db.Raw(`SELECT attrs->>'region' FROM cloud_assume_edge WHERE workspace_id = ? AND mechanism = ?`,
-		ws, models.AssumeMechanismEKSPodIdentity).Row().Scan(&region)
-	if region != "us-east-1" {
-		t.Fatalf("the binding's attrs region = %q, want us-east-1 (where it was read)", region)
-	}
-
-	// ---- a binding an earlier scan recorded in eu-west-1 ---------------------
-	snap.Generation++
 	west := awsdiscovery.K8sSubject("payments", "west-agent")
 	s3bPlantPodEdge(t, db, ws, snap, west, `{"region": "eu-west-1"}`)
-	out, cov = s3bPermissionScan(t, scanner, ws, snap)
-	if cov.State != models.CloudCoverageDenied || cov.API != "eks:ListClusters" ||
-		!strings.Contains(cov.Error, "earlier scan recorded") {
-		t.Fatalf("EKS not resolving in eu-west-1 where a binding was recorded = %+v, want denied, saying why", cov)
+
+	out, cov := s3bPermissionScan(t, scanner, ws, snap)
+	if cov.State != models.CloudCoveragePartial || cov.API != "eks:ListClusters" || cov.ErrorCode != "" ||
+		!strings.Contains(cov.Error, "DNSNameNotFound") {
+		t.Fatalf("eks_pod_identity with eu-west-1 not resolving = %+v, want partial naming eks:ListClusters and "+
+			"DNSNameNotFound, with no AWS code", cov)
 	}
-	if out.Complete || s3bPodEdgeCount(t, db, ws, west) != 1 {
-		t.Fatalf("complete=%v: the eu-west-1 binding must be kept and reconciliation blocked", out.Complete)
+	if out.Complete {
+		t.Fatal("an EKS endpoint that did not resolve must block the permission scan's reconciliation")
+	}
+	if n := s3bPodEdgeCount(t, db, ws, stale); n != 1 {
+		t.Fatal("a binding was deleted while a selected region's EKS listing failed")
+	}
+	if n := s3bPodEdgeCount(t, db, ws, west); n != 1 {
+		t.Fatal("the unread region's binding was deleted")
 	}
 
 	// ---- a binding recorded before edges said where ---------------------------
 	db.Exec(`UPDATE cloud_assume_edge SET attrs = '{}'::jsonb WHERE workspace_id = ? AND subject = ?`, ws, west)
 	snap.Generation++
 	out, cov = s3bPermissionScan(t, scanner, ws, snap)
-	if cov.State != models.CloudCoverageDenied || out.Complete || s3bPodEdgeCount(t, db, ws, west) != 1 {
-		t.Fatalf("a region-less binding with eu-west-1 unresolvable = %+v (complete=%v): it may come from "+
-			"eu-west-1, so it must block and be kept", cov, out.Complete)
+	if cov.State != models.CloudCoveragePartial || out.Complete || s3bPodEdgeCount(t, db, ws, west) != 1 {
+		t.Fatalf("a region-less binding with eu-west-1 unresolvable = %+v (complete=%v): must block and be kept",
+			cov, out.Complete)
 	}
 }
 
@@ -243,14 +228,10 @@ func (f *s3bDNSAfterFirstPage) ListClusters(ctx context.Context, in *eks.ListClu
 	return f.s3bDNSEKS.ListClusters(ctx, in, opts...)
 }
 
-// A region whose endpoint answered page 1 of ListClusters is, by that answer,
-// a region that OFFERS EKS: a non-resolving page 2 is a listing failure there
-// (denied), never "not offered" -- the region is not skipped, and the clusters
-// it did list are not read as the whole.
-//
-// Safeguard (mutation-checked): the len(clusters) == 0 condition on the
-// not-offered skip in writePodIdentityEdges.
-func TestP2S3bPodIdentityRegionThatListedIsNeverNotOffered(t *testing.T) {
+// A region whose endpoint answered page 1 of ListClusters and then stopped
+// resolving is a listing failure there, like any other unresolvable endpoint:
+// partial -- the clusters it did list are not read as the whole.
+func TestP2S3bPodIdentityRegionThatListedThenFailedIsPartial(t *testing.T) {
 	db := igaDB(t)
 	ws := newWorkspace(t, db, "p2-s3b-eks-listed-then-dns")
 	defer cleanPermissionTables(t, db, ws)
@@ -261,8 +242,7 @@ func TestP2S3bPodIdentityRegionThatListedIsNeverNotOffered(t *testing.T) {
 		"eu-west-1": &s3bDNSAfterFirstPage{&s3bDNSEKS{fakeEKS: west, host: "eks.eu-west-1.amazonaws.com"}},
 	})
 	out, cov := s3bPermissionScan(t, scanner, ws, snap)
-	if cov.State != models.CloudCoverageDenied || cov.API != "eks:ListClusters" || out.Complete {
-		t.Fatalf("eu-west-1 listing clusters, then not resolving = %+v (complete=%v), want denied: "+
-			"a region that answered is not a region without EKS", cov, out.Complete)
+	if cov.State != models.CloudCoveragePartial || cov.API != "eks:ListClusters" || out.Complete {
+		t.Fatalf("eu-west-1 listing clusters, then not resolving = %+v (complete=%v), want partial", cov, out.Complete)
 	}
 }

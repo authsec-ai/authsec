@@ -1,6 +1,7 @@
 package database
 
 import (
+	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/base32"
@@ -9,11 +10,16 @@ import (
 	"strings"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
 )
 
-// DeviceAuthRepository handles device authorization database operations
+// DeviceAuthRepository handles device authorization (RFC 8628) database
+// operations. A device code is created before anyone signs in and carries no
+// workspace until a signed-in user authorizes it; until then it is found only
+// by its random device_code (the CLI) or user_code (the activation page), so
+// those statements are TENANT-EXEMPT. Listing a workspace's codes is scoped.
 type DeviceAuthRepository struct {
 	db *DBConnection
 }
@@ -26,6 +32,7 @@ func NewDeviceAuthRepository(db *DBConnection) *DeviceAuthRepository {
 // CreateDeviceCode creates a new device authorization request.
 // WorkspaceID may be nil when the CLI initiates the flow — it is populated during /authorize.
 func (r *DeviceAuthRepository) CreateDeviceCode(deviceCode *models.DeviceCode) error {
+	// TENANT-EXEMPT: pre-auth RFC 8628 code; the workspace is bound on /authorize.
 	query := `
 		INSERT INTO device_codes (
 			id, workspace_id, client_id, device_code, user_code,
@@ -69,6 +76,7 @@ func (r *DeviceAuthRepository) CreateDeviceCode(deviceCode *models.DeviceCode) e
 
 // FindByDeviceCode retrieves a device code by device_code
 func (r *DeviceAuthRepository) FindByDeviceCode(deviceCode string) (*models.DeviceCode, error) {
+	// TENANT-EXEMPT: pre-auth poll by the globally unique random device_code.
 	query := `
 		SELECT id, workspace_id, client_id, device_code, user_code,
 		       verification_uri, verification_uri_complete,
@@ -84,6 +92,7 @@ func (r *DeviceAuthRepository) FindByDeviceCode(deviceCode string) (*models.Devi
 // FindByUserCode retrieves a device code by user_code.
 // Accepts both "ABCD-1234" (with hyphen) and "ABCD1234" (without) — normalizes via SQL.
 func (r *DeviceAuthRepository) FindByUserCode(userCode string) (*models.DeviceCode, error) {
+	// TENANT-EXEMPT: pre-auth activation page lookup by the globally unique user_code.
 	query := `
 		SELECT id, workspace_id, client_id, device_code, user_code,
 		       verification_uri, verification_uri_complete,
@@ -176,6 +185,7 @@ func (r *DeviceAuthRepository) scanDeviceCode(row *sql.Row) (*models.DeviceCode,
 
 // UpdateStatus updates the status of a device code
 func (r *DeviceAuthRepository) UpdateStatus(deviceCode string, status string) error {
+	// TENANT-EXEMPT: pre-auth code addressed by its globally unique random device_code.
 	query := `
 		UPDATE device_codes
 		SET status = $1, updated_at = $2
@@ -190,6 +200,7 @@ func (r *DeviceAuthRepository) UpdateStatus(deviceCode string, status string) er
 // tooSoon is true if the previous poll was within the minInterval window (rate limit enforced in DB).
 func (r *DeviceAuthRepository) UpdateLastPolled(deviceCode string, minIntervalSeconds int64) (tooSoon bool, err error) {
 	// Use a single UPDATE … RETURNING to atomically check interval and update
+	// TENANT-EXEMPT: pre-auth poll by the globally unique random device_code.
 	query := `
 		UPDATE device_codes
 		SET last_polled_at = $1, updated_at = $2
@@ -230,6 +241,9 @@ func (r *DeviceAuthRepository) AuthorizeDeviceCode(
 		status = "denied"
 	}
 
+	// A code is claimed by the signed-in user's workspace; one already bound
+	// to a workspace can only be completed in that workspace.
+	// TENANT-EXEMPT: binds a workspace-less pre-auth code to the authenticated workspace ($3).
 	query := `
 		UPDATE device_codes
 		SET user_id       = $1,
@@ -242,6 +256,7 @@ func (r *DeviceAuthRepository) AuthorizeDeviceCode(
 		    authorized_at = $8,
 		    updated_at    = $9
 		WHERE REPLACE(user_code, '-', '') = REPLACE($10, '-', '') AND status = 'pending'
+		  AND (device_codes.workspace_id IS NULL OR device_codes.workspace_id = $3)
 	`
 
 	now := time.Now().Unix()
@@ -267,6 +282,7 @@ func (r *DeviceAuthRepository) MarkAsConsumed(deviceCode string) error {
 
 // ExpireOldDeviceCodes marks expired device codes as expired
 func (r *DeviceAuthRepository) ExpireOldDeviceCodes() (int64, error) {
+	// TENANT-EXEMPT: platform retention job over every workspace's device codes.
 	query := `
 		UPDATE device_codes
 		SET status = 'expired', updated_at = $1
@@ -282,6 +298,7 @@ func (r *DeviceAuthRepository) ExpireOldDeviceCodes() (int64, error) {
 
 // DeleteExpiredDeviceCodes deletes old expired device codes for cleanup
 func (r *DeviceAuthRepository) DeleteExpiredDeviceCodes(olderThan time.Duration) (int64, error) {
+	// TENANT-EXEMPT: platform retention job over every workspace's device codes.
 	query := `
 		DELETE FROM device_codes
 		WHERE status IN ('expired', 'consumed', 'denied')
@@ -295,55 +312,35 @@ func (r *DeviceAuthRepository) DeleteExpiredDeviceCodes(olderThan time.Duration)
 	return result.RowsAffected()
 }
 
-// ListPendingDeviceCodes returns all pending device codes for a tenant (optionally filtered by client_id).
-// Also auto-expires stale pending codes before returning.
-func (r *DeviceAuthRepository) ListPendingDeviceCodes(workspaceID uuid.UUID, clientID *uuid.UUID) ([]models.DeviceCode, error) {
+// ListPendingDeviceCodes returns the pending device codes of ctx's workspace
+// (optionally only those of one client), expiring stale ones first.
+func (r *DeviceAuthRepository) ListPendingDeviceCodes(ctx context.Context, clientID *uuid.UUID) ([]models.DeviceCode, error) {
 	now := time.Now().Unix()
 
-	expireQuery := `
+	if _, err := tenancy.ExecContext(ctx, r.db.DB, `
 		UPDATE device_codes
-		SET status = 'expired', updated_at = $1
-		WHERE workspace_id = $2 AND status = 'pending' AND expires_at < $3
-	`
-	r.db.Exec(expireQuery, now, workspaceID, now)
-
-	var query string
-	var args []interface{}
-
-	if clientID != nil {
-		query = `
-			SELECT id, workspace_id, client_id, device_code, user_code,
-			       verification_uri, verification_uri_complete,
-			       user_id, user_email, workspace_domain, status, scopes, device_info,
-			       expires_at, last_polled_at, authorized_at,
-			       created_at, updated_at
-			FROM device_codes
-			WHERE workspace_id = $1 AND client_id = $2 AND status = 'pending' AND expires_at > $3
-			ORDER BY created_at DESC
-		`
-		args = []interface{}{workspaceID, *clientID, now}
-	} else {
-		query = `
-			SELECT id, workspace_id, client_id, device_code, user_code,
-			       verification_uri, verification_uri_complete,
-			       user_id, user_email, workspace_domain, status, scopes, device_info,
-			       expires_at, last_polled_at, authorized_at,
-			       created_at, updated_at
-			FROM device_codes
-			WHERE workspace_id = $1 AND status = 'pending' AND expires_at > $2
-			ORDER BY created_at DESC
-		`
-		args = []interface{}{workspaceID, now}
-	}
-
-	rows, err := r.db.Query(query, args...)
-	if err != nil {
+		SET status = 'expired', updated_at = $2
+		WHERE workspace_id = $1 AND status = 'pending' AND expires_at < $2`, now); err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+
+	query := `
+			SELECT id, workspace_id, client_id, device_code, user_code,
+			       verification_uri, verification_uri_complete,
+			       user_id, user_email, workspace_domain, status, scopes, device_info,
+			       expires_at, last_polled_at, authorized_at,
+			       created_at, updated_at
+			FROM device_codes
+			WHERE workspace_id = $1 AND status = 'pending' AND expires_at > $2`
+	args := []interface{}{now}
+	if clientID != nil {
+		query += ` AND client_id = $3`
+		args = append(args, *clientID)
+	}
+	query += ` ORDER BY created_at DESC`
 
 	var codes []models.DeviceCode
-	for rows.Next() {
+	err := queryScoped(ctx, r.db.DB, query, args, func(rows *sql.Rows) error {
 		dc := models.DeviceCode{}
 		var tID, cID, uID sql.NullString
 		var verificationURIComplete, userEmail, workspaceDomain sql.NullString
@@ -371,7 +368,7 @@ func (r *DeviceAuthRepository) ListPendingDeviceCodes(workspaceID uuid.UUID, cli
 			&dc.UpdatedAt,
 		)
 		if err != nil {
-			return nil, err
+			return err
 		}
 
 		if tID.Valid {
@@ -409,8 +406,11 @@ func (r *DeviceAuthRepository) ListPendingDeviceCodes(workspaceID uuid.UUID, cli
 		}
 
 		codes = append(codes, dc)
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
-
 	return codes, nil
 }
 

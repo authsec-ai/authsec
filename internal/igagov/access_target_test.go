@@ -1,0 +1,98 @@
+package igagov
+
+import (
+	"errors"
+	"strings"
+	"testing"
+)
+
+func TestParseAWSAccessTargetS3(t *testing.T) {
+	got, err := ParseAWSAccessTarget("arn:aws:s3:::reports-prod/2026/*", "invoices/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, ok := got.(S3Target)
+	if !ok || s.Bucket != "reports-prod" || s.Prefix != "invoices/" || got.Type() != AccessTypeS3Bucket ||
+		got.ARN() != "arn:aws:s3:::reports-prod" || got.ARNAccount() != "" || got.ARNPartition() != "aws" {
+		t.Fatalf("parsed %#v", got)
+	}
+	if _, err := ParseAWSAccessTarget("arn:aws:ec2:us-east-1:111122223333:instance/i-0abc", ""); !errors.Is(err, ErrAccessNotSupported) {
+		t.Fatalf("an EC2 ARN: %v, want ErrAccessNotSupported", err)
+	}
+	if got := AccessTypes(); len(got) == 0 || got[0] != AccessTypeS3Bucket || got[len(got)-1] != AccessTypeSNSTopic {
+		t.Fatalf("AccessTypes %v", got)
+	}
+	if got := AccessBlockOnlyTypes(); len(got) != 6 || got[0] != AccessTypeSecretsManagerSecret || got[1] != AccessTypeSSMParameter {
+		t.Fatalf("AccessBlockOnlyTypes %v", got)
+	}
+}
+
+// A "$" in a key prefix is written ${$}: "${" would start a policy variable,
+// so a folder named a${aws:username}/ would match each caller's own name.
+func TestS3PrefixDollarIsLiteral(t *testing.T) {
+	tg, _ := ParseAWSAccessTarget("arn:aws:s3:::acme", "a${aws:username}/")
+	end := AccessNoEnd
+	doc, _, _, resources, err := AccessDocument(AccessEffectBlock, []string{AccessRead}, tg, nil, &end)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(doc), "${aws:username}") || !strings.Contains(string(doc), "a${$}{aws:username}/*") {
+		t.Fatalf("document: %s", doc)
+	}
+	for _, r := range resources {
+		if strings.Contains(r, "${aws") {
+			t.Fatalf("resource %s", r)
+		}
+	}
+	// Every list-guard fragment is escaped too ("a$" -> "a${$}").
+	if !strings.Contains(string(doc), `"a${$}"`) {
+		t.Fatalf("guard fragment not escaped: %s", doc)
+	}
+}
+
+// A block of delete on the whole bucket also denies setting a lifecycle rule
+// (it expires objects); under a folder it cannot (bucket-wide), and an allow
+// never gains it.
+func TestS3DeleteBlocksLifecycle(t *testing.T) {
+	has := func(effect, prefix string) bool {
+		tg, _ := ParseAWSAccessTarget("arn:aws:s3:::acme", prefix)
+		end := AccessNoEnd
+		_, _, acts, _, err := AccessDocument(effect, []string{AccessDelete}, tg, nil, &end)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, a := range acts {
+			if a == "s3:PutLifecycleConfiguration" {
+				return true
+			}
+		}
+		return false
+	}
+	if !has(AccessEffectBlock, "") || has(AccessEffectBlock, "invoices/") || has(AccessEffectAllow, "") {
+		t.Fatalf("lifecycle: block bucket %v, block folder %v, allow %v", has(AccessEffectBlock, ""), has(AccessEffectBlock, "invoices/"), has(AccessEffectAllow, ""))
+	}
+}
+
+// The descriptor capabilities send: a block-only type allows nothing, a type
+// with nothing to delete lists no delete, a limited allow lists its levels.
+func TestAccessKindViews(t *testing.T) {
+	by := map[string]AccessKindView{}
+	for _, v := range AccessKindViews() {
+		by[v.Type] = v
+	}
+	if len(by) != len(AccessKinds()) || !by[AccessTypeS3Bucket].Prefix || len(by[AccessTypeS3Bucket].AllowLevels) != 3 {
+		t.Fatalf("views: %+v", by)
+	}
+	if v := by[AccessTypeKMSKey]; !v.BlockOnly || len(v.AllowLevels) != 0 || v.AllowLevels == nil {
+		t.Fatalf("kms: %+v", v)
+	}
+	if v := by[AccessTypeBedrockModel]; len(v.Levels) != 2 {
+		t.Fatalf("model levels: %+v", v)
+	}
+	if v := by[AccessTypeLambdaFunction]; len(v.AllowLevels) != 1 || v.AllowLevels[0] != AccessRead {
+		t.Fatalf("lambda: %+v", v)
+	}
+	if v := by[AccessTypeSNSTopic]; len(v.AllowLevels) != 1 || v.AllowLevels[0] != AccessWrite {
+		t.Fatalf("sns: %+v", v)
+	}
+}

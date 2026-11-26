@@ -26,8 +26,10 @@ import (
 func NewEnforcementBindingDeployGate(svc *EnforcementBindingService) GovBindingGate {
 	return func(ctx context.Context, ws, connectorID uuid.UUID) error {
 		var rows []models.CloudEnforcementBinding
-		if err := svc.db.WithContext(ctx).Where("workspace_id = ? AND connector_id = ? AND state <> ?", ws, connectorID,
-			models.EnforcementBindingRevoked).Order("updated_at DESC").Limit(1).Find(&rows).Error; err != nil {
+		if err := svc.read(ctx, ws, func(tx *gorm.DB) error {
+			return tx.Where("workspace_id = ? AND connector_id = ? AND state <> ?", ws, connectorID,
+				models.EnforcementBindingRevoked).Order("updated_at DESC").Limit(1).Find(&rows).Error
+		}); err != nil {
 			return err
 		}
 		if len(rows) == 0 {
@@ -62,12 +64,20 @@ func NewEnforcementBindingDispatchCheck(svc *EnforcementBindingService) GovBindi
 			return err
 		}
 		var revoked int64
-		if cerr := svc.db.WithContext(ctx).Model(&models.CloudEnforcementBinding{}).
-			Where("workspace_id = ? AND connector_id = ? AND state = ?", ws, connectorID, models.EnforcementBindingRevoked).
-			Count(&revoked).Error; cerr != nil {
+		var live *models.CloudEnforcementBinding
+		var lerr error
+		if cerr := svc.read(ctx, ws, func(tx *gorm.DB) error {
+			if err := tx.Model(&models.CloudEnforcementBinding{}).
+				Where("workspace_id = ? AND connector_id = ? AND state = ?", ws, connectorID, models.EnforcementBindingRevoked).
+				Count(&revoked).Error; err != nil {
+				return err
+			}
+			live, lerr = svc.liveBinding(tx, ws, connectorID, false)
+			return nil
+		}); cerr != nil {
 			return cerr
 		}
-		if live, lerr := svc.liveBinding(svc.db.WithContext(ctx), ws, connectorID, false); lerr == nil && live == nil && revoked > 0 {
+		if lerr == nil && live == nil && revoked > 0 {
 			return enfErr(http.StatusConflict, EnfCodeNotVerified, "The enforcement binding was revoked.", map[string]any{"state": models.EnforcementBindingRevoked})
 		}
 		return err

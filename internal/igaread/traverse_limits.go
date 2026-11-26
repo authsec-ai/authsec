@@ -71,6 +71,9 @@ const (
 // claims (traverse_k8s.go); a crossing edge is an AWS claim, and carries its
 // own (traverse_cross.go).
 func (t *graphTraversal) decorateLimitations(lv *graphLevel, nodes []*GraphNode, edges []*GraphEdge) error {
+	nodes, azNodes := graphSplitAzureNodes(nodes)
+	edges, azEdges := graphSplitAzureEdges(edges)
+	graphAzureLimitations(azNodes, azEdges)
 	nodes, k8sNodes := graphSplitNodes(nodes)
 	edges, k8sEdges := graphSplitEdges(edges)
 	if len(k8sNodes)+len(k8sEdges) > 0 {
@@ -220,6 +223,8 @@ func graphSortPairs(ps []graphPair, pos, kindPos map[string]int) {
 // decorated as one (its ServiceAccount end has no account, so it never
 // crosses an account).
 func (t *graphTraversal) decorateEdges(lv *graphLevel, edges []*GraphEdge, node func(string) *GraphNode) error {
+	edges, az := graphSplitAzureEdges(edges)
+	graphAzureDecorateEdges(az, node)
 	edges, k8s := graphSplitEdges(edges)
 	if len(k8s) > 0 {
 		if err := t.decorateK8sEdges(lv, k8s, node); err != nil {

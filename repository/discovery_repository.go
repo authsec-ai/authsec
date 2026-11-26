@@ -1,6 +1,7 @@
 package repositories
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,8 +9,10 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/internal/k8sgraph"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -106,8 +109,29 @@ type AgentFilter struct {
 	// DiscoverySourceID scopes to one connector — in practice, "agents in this
 	// cluster", which is the question self-registration exists to make answerable.
 	DiscoverySourceID *uuid.UUID
-	Limit             int
-	Offset            int
+	// TenantID scopes to one Entra tenant: an Azure agent comes from a tenant
+	// connector and has no discovery source, so its metadata names the tenant.
+	TenantID string
+	// Subscriptions and ResourceGroups scope Azure agents to where they live, as
+	// the inventory's filters of the same names: subscription ids, and
+	// "<subscription id>/<resource group>"s. An agent matches any one of each
+	// list; one with no subscription (an Entra object) matches neither.
+	Subscriptions  []string
+	ResourceGroups []string
+	// SubscriptionObjectIDs and GroupObjectIDs are the object ids of the Azure
+	// identities placed in those subscriptions and resource groups
+	// (igaread.PlacedIdentityObjectIDs): an agent with no ARM id of its own
+	// (one Agent ID lists, or one inferred from sign-ins) is where its
+	// identity is.
+	SubscriptionObjectIDs []string
+	GroupObjectIDs        []string
+	// OnlyAgents leaves out what is not one agent: identities inferred to be
+	// agents from their sign-ins, and Entra agent identities not tied to one
+	// agent (Foundry tags an agent's own identity agentName:<agent>; a
+	// project's shared identity has no such tag).
+	OnlyAgents bool
+	Limit      int
+	Offset     int
 }
 
 // MarkAbsentInput describes a completed resync sweep. Absence is only meaningful
@@ -283,7 +307,10 @@ func (r *discoveryRepository) UpdateSource(s *models.DiscoverySource) error {
 // delete that did not revoke first fails instead of widening a credential.
 func (r *discoveryRepository) DeleteSource(workspaceID, id uuid.UUID) (string, error) {
 	purgePath := ""
-	err := r.db.Transaction(func(tx *gorm.DB) error {
+	// Under row-level security for the workspace: the graph retirement below
+	// (k8sgraph.RetireSource) runs on this transaction.
+	rlsCtx := tenancy.WithContext(context.Background(), tenancy.Context{WorkspaceID: workspaceID})
+	err := tenancy.RLSTransaction(rlsCtx, r.db, nil, func(tx *gorm.DB, _ uuid.UUID) error {
 		var src models.DiscoverySource
 		if err := tx.First(&src, "id = ? AND workspace_id = ?", id, workspaceID).Error; err != nil {
 			return err
@@ -412,42 +439,48 @@ const clusterUIDConflictHold = 15 * time.Minute
 // has one (refused under IGA_K8S_REQUIRE_CLUSTER_UID): the same status and
 // runtime key, with reported_uid "" and reason "missing", and a last_error
 // that says the UID was missing rather than naming an empty cluster.
+//
+// db must be a base handle, not a transaction: the update runs in its own
+// transaction under row-level security for workspaceID, and through the
+// scoped layer (workspace_id = $1).
 func RecordClusterUIDConflict(db *gorm.DB, workspaceID, sourceID uuid.UUID,
 	reportedUID, via string) error {
 
-	if reportedUID == "" {
-		return db.Exec(`
+	ctx := tenancy.WithContext(context.Background(), tenancy.Context{WorkspaceID: workspaceID})
+	return tenancy.InWorkspace(ctx, db, workspaceID, func(tx *gorm.DB) error {
+		if reportedUID == "" {
+			return tenancy.GormExec(ctx, tx, `
 		UPDATE discovery_sources
-		   SET last_status = ?,
+		   SET last_status = $3,
 		       last_error = format(
 		           'cluster_uid_required: this connection belongs to cluster %s, but an incoming %s '
 		        || 'states no cluster UID, so it cannot be shown to come from this cluster and is '
 		        || 'refused. Upgrade the agent so it reports its cluster UID, or set '
-		        || 'IGA_K8S_REQUIRE_CLUSTER_UID=false on the control plane.', cluster_uid, ?::text),
+		        || 'IGA_K8S_REQUIRE_CLUSTER_UID=false on the control plane.', cluster_uid, $4::text),
 		       runtime = COALESCE(runtime, '{}'::jsonb) || jsonb_build_object('cluster_uid_conflict',
 		           jsonb_build_object('recorded_uid', cluster_uid, 'reported_uid', '',
-		                              'reason', 'missing', 'via', ?::text, 'last_seen_at', now())),
+		                              'reason', 'missing', 'via', $4::text, 'last_seen_at', now())),
 		       updated_at = now()
-		 WHERE workspace_id = ? AND id = ? AND cluster_uid <> ''`,
-			ClusterUIDConflictStatus, via, via, workspaceID, sourceID).Error
-	}
+		 WHERE workspace_id = $1 AND id = $2 AND cluster_uid <> ''`,
+				sourceID, ClusterUIDConflictStatus, via).Error
+		}
 
-	return db.Exec(`
+		return tenancy.GormExec(ctx, tx, `
 		UPDATE discovery_sources
-		   SET last_status = ?,
+		   SET last_status = $3,
 		       last_error = format(
 		           'cluster_uid_conflict: this connection belongs to cluster %s, but an incoming %s '
 		        || 'reports cluster %s. Two clusters are installed under one cluster name; '
 		        || 'data from %s is refused. Rename one cluster, or delete and re-add this '
-		        || 'connection to re-bind it.', cluster_uid, ?::text, ?::text, ?::text),
+		        || 'connection to re-bind it.', cluster_uid, $4::text, $5::text, $5::text),
 		       runtime = COALESCE(runtime, '{}'::jsonb) || jsonb_build_object('cluster_uid_conflict',
-		           jsonb_build_object('recorded_uid', cluster_uid, 'reported_uid', ?::text,
-		                              'via', ?::text, 'last_seen_at', now())),
+		           jsonb_build_object('recorded_uid', cluster_uid, 'reported_uid', $5::text,
+		                              'via', $4::text, 'last_seen_at', now())),
 		       updated_at = now()
-		 WHERE workspace_id = ? AND id = ?
-		   AND cluster_uid <> '' AND cluster_uid <> ?`,
-		ClusterUIDConflictStatus, via, reportedUID, reportedUID, reportedUID, via,
-		workspaceID, sourceID, reportedUID).Error
+		 WHERE workspace_id = $1 AND id = $2
+		   AND cluster_uid <> '' AND cluster_uid <> $5::text`,
+			sourceID, ClusterUIDConflictStatus, via, reportedUID).Error
+	})
 }
 
 // UpsertSelfRegistration folds an agent heartbeat into its connector row.
@@ -623,6 +656,41 @@ func (r *discoveryRepository) ListAgents(workspaceID uuid.UUID, f AgentFilter) (
 	}
 	if f.DiscoverySourceID != nil {
 		q = q.Where("discovery_source_id = ?", *f.DiscoverySourceID)
+	}
+	if f.TenantID != "" {
+		q = q.Where("lower(metadata->>'tenant_id') = lower(?)", f.TenantID)
+	}
+	if f.OnlyAgents {
+		// TENANT-EXEMPT: reads the agent row's own metadata column only.
+		q = q.Where(`coalesce(metadata->>'inference_rule', '') = '' AND NOT (metadata->>'evidence_source' = 'entra_agent_id' AND NOT EXISTS (
+			SELECT 1 FROM jsonb_array_elements_text(CASE WHEN jsonb_typeof(metadata->'tags') = 'array' THEN metadata->'tags' ELSE '[]'::jsonb END) t
+			 WHERE t LIKE 'agentName:%'))`)
+	}
+	if len(f.Subscriptions) > 0 {
+		subs := make([]string, len(f.Subscriptions))
+		for i, s := range f.Subscriptions {
+			subs[i] = strings.ToLower(s)
+		}
+		cond, args := "lower(metadata->>'subscription_id') IN ?", []interface{}{subs}
+		if len(f.SubscriptionObjectIDs) > 0 {
+			cond, args = "("+cond+" OR lower(metadata->>'object_id') IN ?)", append(args, f.SubscriptionObjectIDs)
+		}
+		q = q.Where(cond, args...)
+	}
+	if len(f.ResourceGroups) > 0 {
+		// A group is its subscription's, and is read from the agent's ARM id: its resource's, or its Foundry project's.
+		conds, args := make([]string, 0, len(f.ResourceGroups)+1), make([]interface{}, 0, 2*len(f.ResourceGroups)+1)
+		for _, g := range f.ResourceGroups {
+			sub, group, _ := strings.Cut(g, "/")
+			conds = append(conds, `(lower(metadata->>'subscription_id') = lower(?)
+				AND substring(lower(coalesce(nullif(metadata->>'resource_id', ''), metadata->>'foundry_project_id', '')) from '/resourcegroups/([^/]+)') = lower(?))`)
+			args = append(args, sub, group)
+		}
+		if len(f.GroupObjectIDs) > 0 {
+			conds = append(conds, "lower(metadata->>'object_id') IN ?")
+			args = append(args, f.GroupObjectIDs)
+		}
+		q = q.Where("("+strings.Join(conds, " OR ")+")", args...)
 	}
 
 	var total int64
@@ -934,7 +1002,7 @@ func (r *discoveryRepository) MarkAbsent(in MarkAbsentInput) ([]string, error) {
 	}
 
 	err := r.db.Model(&models.DiscoveredAgent{}).
-		Where("id IN ?", ids).
+		Where("workspace_id = ? AND id IN ?", in.WorkspaceID, ids).
 		Updates(map[string]interface{}{
 			"runtime_status":      models.RuntimeStatusGone,
 			"runtime_reason":      reason,
@@ -969,24 +1037,29 @@ func (r *discoveryRepository) ApplyPresentRuntime(in PresentRuntimeInput) ([]str
 	if in.ObservedAt.IsZero() {
 		in.ObservedAt = time.Now()
 	}
-	// set is a fixed SQL fragment; every value goes through a placeholder.
-	apply := func(fps, from []string, set string, setArgs ...interface{}) ([]string, error) {
+	// Both statements run in one transaction under row-level security for
+	// the workspace, through the scoped layer: $1 is the workspace.
+	ctx := tenancy.WithContext(context.Background(), tenancy.Context{WorkspaceID: in.WorkspaceID})
+	// set is a fixed SQL fragment whose placeholders are $2..$(1+len(setArgs));
+	// every value goes through a placeholder.
+	apply := func(tx *gorm.DB, fps, from []string, set string, setArgs ...interface{}) ([]string, error) {
 		if len(fps) == 0 {
 			return nil, nil
 		}
 		var rows []struct{ Fingerprint string }
+		n := 1 + len(setArgs)
 		args := append(append([]interface{}{}, setArgs...),
-			in.WorkspaceID, in.Source, in.ClusterName, fps, from, models.EvidenceDeclared, in.ObservedAt)
-		if err := r.db.Raw(`
+			in.Source, in.ClusterName, pq.Array(fps), pq.Array(from), models.EvidenceDeclared, in.ObservedAt)
+		if err := tenancy.GormRaw(ctx, tx, fmt.Sprintf(`
 			UPDATE discovered_agents
-			   SET `+set+`, updated_at = now()
-			 WHERE workspace_id = ? AND source = ?
-			   AND metadata #>> '{cluster,name}' = ?
-			   AND fingerprint IN ?
-			   AND runtime_status IN ?
-			   AND evidence_mode <> ?
-			   AND (runtime_observed_at IS NULL OR runtime_observed_at <= ?)
-			RETURNING fingerprint`, args...).Scan(&rows).Error; err != nil {
+			   SET %s, updated_at = now()
+			 WHERE workspace_id = $1 AND source = $%d
+			   AND metadata #>> '{cluster,name}' = $%d
+			   AND fingerprint = ANY($%d::text[])
+			   AND runtime_status = ANY($%d::text[])
+			   AND evidence_mode <> $%d
+			   AND (runtime_observed_at IS NULL OR runtime_observed_at <= $%d)
+			RETURNING fingerprint`, set, n+1, n+2, n+3, n+4, n+5, n+6), args...).Scan(&rows).Error; err != nil {
 			return nil, err
 		}
 		out := make([]string, 0, len(rows))
@@ -996,23 +1069,30 @@ func (r *discoveryRepository) ApplyPresentRuntime(in PresentRuntimeInput) ([]str
 		return out, nil
 	}
 
-	stopped, err := apply(in.Stopped,
-		[]string{models.RuntimeStatusRunning, models.RuntimeStatusUnknown},
-		`runtime_status = ?, runtime_reason = ?, runtime_observed_at = ?`,
-		models.RuntimeStatusStopped,
-		"scaled to zero: present in a resync sweep with no running replicas", in.ObservedAt)
+	var stopped, resumed []string
+	err := tenancy.InWorkspace(ctx, r.db, in.WorkspaceID, func(tx *gorm.DB) error {
+		var err error
+		stopped, err = apply(tx, in.Stopped,
+			[]string{models.RuntimeStatusRunning, models.RuntimeStatusUnknown},
+			`runtime_status = $2, runtime_reason = $3, runtime_observed_at = $4`,
+			models.RuntimeStatusStopped,
+			"scaled to zero: present in a resync sweep with no running replicas", in.ObservedAt)
+		if err != nil {
+			return fmt.Errorf("mark stopped: %w", err)
+		}
+		resumed, err = apply(tx, in.Running,
+			[]string{models.RuntimeStatusStopped},
+			`runtime_status = $2, runtime_reason = $3, runtime_observed_at = $4,
+		 last_observed_running_at = GREATEST(COALESCE(last_observed_running_at, $4::timestamptz), $4::timestamptz)`,
+			models.RuntimeStatusRunning,
+			"running again: present in a resync sweep with replicas", in.ObservedAt)
+		if err != nil {
+			return fmt.Errorf("mark running: %w", err)
+		}
+		return nil
+	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("mark stopped: %w", err)
-	}
-	resumed, err := apply(in.Running,
-		[]string{models.RuntimeStatusStopped},
-		`runtime_status = ?, runtime_reason = ?, runtime_observed_at = ?,
-		 last_observed_running_at = GREATEST(COALESCE(last_observed_running_at, ?::timestamptz), ?::timestamptz)`,
-		models.RuntimeStatusRunning,
-		"running again: present in a resync sweep with replicas", in.ObservedAt,
-		in.ObservedAt, in.ObservedAt)
-	if err != nil {
-		return nil, nil, fmt.Errorf("mark running: %w", err)
+		return nil, nil, err
 	}
 	return stopped, resumed, nil
 }

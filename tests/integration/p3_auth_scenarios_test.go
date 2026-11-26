@@ -721,7 +721,7 @@ func TestP3T311TrustLiveWithdrawArchiveIsolation(t *testing.T) {
 		t.Fatalf("patch an archived policy: %d %v", code, body)
 	}
 	for _, a := range []string{"withdraw", "archive", "update"} {
-		if l.audits(a) < 1 {
+		if l.awaitAudits(a, 1) < 1 {
 			t.Fatalf("no %s audit row", a)
 		}
 	}

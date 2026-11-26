@@ -29,6 +29,7 @@ import (
 	"gorm.io/gorm"
 
 	platform "github.com/authsec-ai/authsec/controllers/platform"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 )
 
@@ -113,7 +114,12 @@ func newK8sAccessAPI(t *testing.T, db *gorm.DB, ws uuid.UUID) *k8sAccessAPI {
 	a := &k8sAccessAPI{t: t, ws: ws}
 	ctl := platform.NewK8sGraphController(db)
 	eng := gin.New()
-	g := eng.Group("/authsec/discovery", func(c *gin.Context) { c.Set("workspace_id", a.ws.String()) })
+	// Stands in for AuthMiddleware: the workspace is the token's, carried as
+	// the tenancy context the k8s reads run under (RLS).
+	g := eng.Group("/authsec/discovery", func(c *gin.Context) {
+		c.Set("workspace_id", a.ws.String())
+		tenancy.Set(c, tenancy.Context{WorkspaceID: a.ws, PrincipalKind: "user"})
+	})
 	g.GET("/k8s/clusters", ctl.ListClusters)
 	g.GET("/k8s/identities", ctl.ListIdentities)
 	g.GET("/k8s/workloads", ctl.ListWorkloads)
@@ -535,11 +541,12 @@ func TestP2K8sAccessRouteWorkspaceIsolation(t *testing.T) {
 	}
 
 	asB := newK8sAccessAPI(t, kb.db, kb.ws)
-	body, raw := asB.access(researchA)
-	if n := len(digl(body, "grants")); n != 0 || num(body, "summary", "total") != 0 {
-		t.Errorf("workspace B reads workspace A's identity: %s", raw)
+	// Another workspace's identity is not found (404), exactly like an unknown
+	// one -- never an empty list, which would read as "no access".
+	if code, body := asB.status("/k8s/identities/" + researchA.String() + "/access"); code != http.StatusNotFound {
+		t.Errorf("workspace B reads workspace A's identity: %d %v, want 404", code, body)
 	}
-	body, _ = asB.access(researchB)
+	body, _ := asB.access(researchB)
 	if num(body, "summary", "total") != 7 || num(body, "summary", "via_group") != 2 {
 		t.Errorf("workspace B's own access = %v", body["summary"])
 	}

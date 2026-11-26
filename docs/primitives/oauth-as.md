@@ -19,8 +19,8 @@ interactive flows, and dispatches native grants — **all token issuance goes th
 | `GET /oauth/authorize` | `Authorize` | Auth code start. PKCE S256 required. Stores `AuthRequestContext`, redirects browser to Hydra `/oauth2/auth` with `authsec_ctx` correlation key. PAR disabled (explicit error on `request_uri`). |
 | `POST /oauth/token` | `Token` | All grants dispatched here (see Grant table). |
 | `POST /oauth/introspect` | `Introspect` | Classify → native path or Hydra proxy. |
-| `POST /oauth/revoke` | `Revoke` | Classify → native or Hydra. |
-| `GET /oauth/userinfo` | `UserInfo` | OIDC userinfo; guarded (native access tokens are rejected — they're M2M/XAA, not OIDC sessions). |
+| `POST /oauth/revoke` | `Revoke` | Classify → native or Hydra. A Hydra refresh token also revokes the native access token linked to it (RFC 7009 §2.1). |
+| `GET /oauth/userinfo` | `Userinfo` | OIDC userinfo. A native access token is verified locally (never sent to Hydra) and must carry a user subject and `openid`; M2M tokens get 401. |
 | `GET /oauth/jwks` | `JWKS` | Union: native RS256 (`NativeKeys().PublicJWKS()`) + Hydra keys + SPIFFE key. |
 | `POST /oauth/register` | `Register` | RFC 7591 Dynamic Client Registration. |
 | `GET/PUT/DELETE /oauth/register/:id` | `GetRegistration` / `UpdateRegistration` / `DeleteRegistration` | RFC 7592 client management. |
@@ -32,8 +32,8 @@ interactive flows, and dispatches native grants — **all token issuance goes th
 ```
 grant_type                                      → handler
 ──────────────────────────────────────────────────────────────
-authorization_code                              → tokenAuthCodeGrant     (Hydra proxy + context binding)
-refresh_token                                   → tokenRefreshGrant      (Hydra proxy; client must have offline_access)
+authorization_code                              → tokenAuthCodeGrant     (Hydra proxy + context binding; native access token)
+refresh_token                                   → tokenRefreshGrant      (Hydra proxy; client must have offline_access; native access token)
 client_credentials                              → tokenClientCredentialsGrant  (native M2M — no Hydra)
 urn:ietf:params:oauth:grant-type:jwt-bearer     → tokenJWTBearerGrant    (XAA step 2: jwt-bearer → native access token)
 urn:ietf:params:oauth:grant-type:token-exchange → tokenExchangeGrant     (XAA step 1: subject_token → ID-JAG)
@@ -41,7 +41,9 @@ urn:openid:params:grant-type:ciba               → tokenCIBAGrant         (CIBA
 ```
 
 - `authorization_code` and `refresh_token` → **Hydra proxy**. AuthSec captures the
-  response, validates `AuthRequestContext` binding, then forwards to client.
+  response and validates `AuthRequestContext` binding. With `XAA_NATIVE_SEALER` on it
+  replaces Hydra's access token with a native one (family `auth_code`; id_token and
+  refresh token stay Hydra's); with it off it forwards Hydra's response.
 - `client_credentials`, `jwt-bearer`, `token-exchange`, `ciba` → **native path**
   (`NativeIssuer.Issue`); Hydra is not contacted.
 
@@ -60,7 +62,8 @@ POST /oauth/token (authorization_code)
   └─ LookupAuthContext (must be consent_completed=true, consumed=false)
   └─ ValidateRS registration
   └─ ConsumeAuthContext
-  └─ Forward Hydra response
+  └─ Sealer on: mint native access token (aud = bound resource), linked to Hydra's
+     refresh token; sealer off: forward Hydra response
 ```
 
 `revokeIssuedTokens` is called synchronously before any hard-denial response —

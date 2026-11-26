@@ -1,0 +1,1002 @@
+# AuthSec — Progress Log
+
+Newest first. Each session records what was done, what was learned, and what's next.
+
+---
+
+## 2026-11-11 — Agent runtime review 3: ingest durability, shared Lambda interfaces, late log lines (branch `fix/agent-runtime-review-3`)
+
+An external design review; every factual claim was checked against the code and AWS's documentation (spec §12).
+
+### Done
+- Event stream: migration 161 adds `agent_event_seen.dispatched_at`. An event is recorded undispatched, marked once every consumer returns, and dispatched again on EventBridge's retry if it never was. Before, a crash between the insert and the dispatch lost it for the live consumers.
+- DNS attribution: the inventory records Lambda VPC subnets and security groups; a Lambda interface shared by several functions gives an unresolved `workload_set` (a role only when all share it), not the function its description names.
+- Late log lines: DNS and AgentCore span reads cut windows by `@ingestionTime` and search event time 2 h back (`DNSLateArrival`, `SpanLateArrival`). The ingestion filter was run against the lab's Resolver log group.
+- Specs corrected: Resolver logs only unique queries (counts are resolution activity); EventBridge delivery is best effort. Spec §12 records the review's PROPOSED product direction (governed runs, separate classification / visibility / attribution / control, intervention contracts, scoped detection, behaviour envelopes) for decision.
+- Checks: build, vet, unit tests, tenancy ratchet 69 (baseline 72); schema parity (upgrade from 160 applies 161 only, equal to a fresh install); integration suite.
+
+### Open
+- Product decisions in spec §12.3. Detections still run only for labelled identities; "contained" still means applied, not observed.
+
+---
+
+## 2026-11-06 — Legacy agent-policy retirement and Phase 3 recovery, merged onto staging (branch `merge/legacy-policy-retire`)
+
+Uncommitted work from 2026-10-13/14 (saved as-is on `wip/legacy-policy-retire-2026-10-14`) merged onto `authsec-staging` (after PR #106 and the round-3 security fixes).
+
+### Done
+- Phase 3: a role-only recovery plan gets its own approval (scope `recovery`), "Accept drift" and "Re-apply" on a drifted deployment, author notices (`review_response`), isolation proposals, `GET /findings?category`.
+- Retired the pre-Phase-3 agent-policy feature (decision 2026-10-13, disposition plan): workers, `/authsec/governance/agent-policies`, warnings, notification settings, `/api/iga/v1/legacy/*`, the notification-channel copy.
+- Migrations renumbered from 138/139 (taken upstream), then again past PR #106's 152-156, to `157_iga_gov_recovery_approval` (keeps 150's `agent_alert` notice kind) and `158_retire_legacy_agent_policy`; both mirrored at the end of bootstrap; policy schema head `158`.
+- Kept, unlike the original work: `enforcement_plans` and the cluster agent's `GET /authsec/provisioning/enforcement-plan` poll (plus the console history route). Kubernetes access policies (146) read the agent's `bindings=` report from it. Plan entries no longer carry `policy_id`.
+
+### Open
+- `158` drops `agent_policies`, `agent_policy_actions`, `agent_policy_confirmations`, `agent_policy_warnings` and `governance_notification_settings` with their rows. Their production row counts have not been checked; check before release.
+
+---
+
+## 2026-11-05 — Agent runtime review fixes (branch `fix/agent-runtime-review`)
+
+Fixes the code review of PR #105 (`reviews/agent-runtime-aws-code-review-2026-11-05.md` in the workspace). Migrations 159 (one live containment per target) and 160 (`cloud_trail_seen_event`). Committed locally; nothing pushed.
+
+### Done
+- Containment: ECS services matched by exact task-definition revision; one live holder per target (159); "verified" needs CloudTrail evidence past the cutoff in every read region or the stream, otherwise "unverifiable" (re-checked, not final); deny-immune and AWS-service calls ignored; every assumer in the blast radius; Lambda `authsec:protected` read live (`lambda:ListTags`, covered by SecurityAudit); failed policy steps cleaned up before a containment may end failed; release pulled forward; probe covers release actions.
+- Alerts: D1 counts only direct `kms:Decrypt` with a secret encryption context and SSM reads with decryption; `agent_alerts` / `agent_runtime` capabilities and 503s until their schema verifies (sink and worker skip, ingest no longer fails); SIEM URLs redacted in views, audit and errors; SIEM delivery outcomes and retention closes in Logs; DB-clock lease; endpoint-limit lock; alert link to `/iga/agent-runtime/alerts/:id`.
+- Evidence: inference runs when the projection completes; reads overlap the previous mark by 1 h and dedupe by eventID (160), with the pre-upgrade window counted once; per-day buckets and a 30-day window for the rule and findings (legacy documents read safely); root-user model calls raise a `human_credentials` finding; AWS mirror rows retired; usage endpoints show Access Advisor rows only and `last_used_at` is the last successful call; revoked connectors not listed; mirror refreshed after a confirm.
+- Templates: resource control policy form (`form=rcp`); AgentCore runtime, batch inference and `bedrock-mantle:CreateInference` denied; empty tag denied; gate policy under `/authsec-gate/`; event stream gets a dead-letter queue, alarm, narrower pattern and `aws:SourceArn`; `RegisterScalableTarget` limited to ECS desired count.
+- Checks: unit, `tests/integration` (all), flows/onboarding/flagsoff (only the two SPIRE 429 failures, which fail identically on `authsec-staging`), ratchet 72/0, schema parity (fresh == upgraded from the 151 schema).
+
+### Open
+- The lab items above; Q5 (AWS agents in the Agents list) now also changes phase-2 acceptance E16, updated to allow only mirrored AWS agents; production ingress body limit.
+
+---
+
+## 2026-11-05 — Agent runtime on the access graph (branch `feat/agent-runtime-graph`)
+
+- `/graph`, `/graph/expand`, `/graph/path` and the identity and workload details: an AWS role, user or workload carries an additive `agent_runtime` object (label, model calls, open alerts, open findings, suggestion, containment) only when there is something to say; a contained role's grant edges carry `contained: {id, level}` while the containment is in force (identity level: every grant; model level: grants whose statement allows a model action). Nodes and edges without agent-runtime data are unchanged byte for byte.
+- Labels come from the inference service's own rules through an `igaread.AgentRuntimeSource` installed at startup (`services/agent_runtime_graph.go`); one statement per table per graph level, inside the level's RLS transaction.
+- `/capabilities` `features` is not extended: the frozen contract fixes it at eight keys.
+## 2026-11-05 (cont.) — DNS-based detection of direct model-provider calls (branch `feat/agent-runtime-dns`)
+
+Spec `SPEC-agent-runtime-visibility.md` §11. Committed locally; nothing pushed.
+
+### Done
+- Route 53 Resolver query logs (CloudWatch Logs destinations) read per region with one Logs Insights query per log group that returns only lookups of the model-endpoint list; findings `ai_network_traffic` attributed to the EC2 instance, Lambda or ECS task (or the VPC), resolved after 30 gap-free quiet days. Migration 153 (kind CHECK incl. `ai_config_hint`, `cloud_dns_cursor`). Discovery template 2026-11-05 (route53resolver List, logs StartQuery/GetQueryResults/StopQuery, ec2:DescribeNetworkInterfaces).
+- Tests: unit (domain list and in-query filter, configs, windows, truncation, attribution, coverage, permission missing, S3 unsupported), integration (attribution, no other domain stored, cumulative windows, resolve and gap, two-workspace isolation under RLS); tenancy ratchet 72/72.
+
+### Open
+- Publish template 2026-11-05 to the template bucket before release; verify the Logs Insights query (field names, `coalesce`, `(?i)`) and the Lambda/ECS interface descriptions against the lab account; UI for the new finding kind and surfaces.
+
+---
+## 2026-11-05 — Model provider usage, OpenAI and Anthropic (branch `feat/agent-runtime-provider-usage`)
+
+Spec `SPEC-agent-runtime-provider-usage.md`. Built opt-in despite review 2's concern (Ritam, pending Aditya). Committed locally; nothing pushed.
+
+### Done
+- Migration 154: `model_provider_connection` (admin key in Vault per workspace, fingerprint only in the row), `model_provider_key`, `model_provider_usage` (hourly); `agent_finding` admits `ai_config_hint`, `ai_network_traffic`, `unaccounted_model_usage`, `connector_id` nullable, `provider_connection_id` added.
+- `internal/modelprovider`: GET-only clients for the OpenAI and Anthropic Admin APIs (fixed hosts, no redirects, 429 backoff, 401/403 as a refused key).
+- Hourly sync worker, weak attribution by name (Secrets Manager secret names with readers, Lambda env-var names), finding `unaccounted_model_usage`.
+- Routes `/api/iga/v1/agent-runtime/model-providers` (connect, list, get, rotate, revoke, sync, keys, usage), audited.
+
+### Open
+- Aditya's sign-off; UI (connect dialog, keys and usage views); Anthropic's Usage and Cost Analytics API (the messages report is legacy); verify both providers against a real organisation.
+## 2026-11-05 — Agent runtime gateway: live control of MCP tool calls and model calls (branch `feat/agent-runtime-gateway`)
+
+Spec `SPEC-agent-runtime-gateway.md` (revision 1, not reviewed): visibility spec rev 1 §5.7, with the gateway in the customer's environment (provider keys and MCP credentials never reach AuthSec). AuthSec is the PDP (OpenID AuthZEN Authorization API 1.0) and the decision-log sink.
+
+### Done
+- Migration 156 (`agent_gateway`, `agent_gateway_setting`, `agent_tool_policy`, `agent_gateway_decision` append-only with a 30-day default retention), RLS, bootstrap mirror; schema of the four tables identical on upgrade and fresh bootstrap.
+- PDP `/authsec/pdp/access/v1/evaluation(s)`, `/authsec/pdp/v1/decisions`, `/authsec/pdp/v1/policy-hints` (gateway credential `agw_…` only; per-gateway limit; own per-IP ceiling). Admin `/api/iga/v1/agent-runtime/{gateways,gateway-settings,tool-policies,tool-policies/evaluate,gateway-decisions}`.
+- Gateway binary `cmd/agent-gateway` (MCP Streamable HTTP proxy with header/body validation and tool pinning; OpenAI-compatible and Anthropic proxy with usage; cache; fail mode auto/closed/open; batched upload), `deploy/agent-gateway/` (Dockerfile, Helm values, README, example config).
+- Tests: unit (`internal/agentgateway/...`), integration `TestAgentGateway*` (isolation, append-only, retention, rates), ratchet 72/72, IGA isolation check.
+
+### Open
+- Review of the spec; UI; pin approval from the console (Q1); mirroring decisions into `agent_activity_event` (155) once it lands; AuthZEN `/.well-known/authzen-configuration` at the host root.
+
+---
+
+## 2026-11-05 — Agent runtime visibility on AWS (branch `feat/agent-runtime-aws`)
+
+Spec `SPEC-agent-runtime-visibility.md` revision 2, review 2 decisions in §10. Built by five parallel branches (`ar/p1a-evidence`, `ar/p1b-inference`, `ar/p2a-ingest`, `ar/p2b-alerts`, `ar/p3-contain`) on shared contracts (`internal/agentruntime`), merged. Committed locally; nothing pushed.
+
+### Done
+- P1a model-call evidence (147), P1b AI workloads / suggestions / findings / Agents-list mirror (148), P2a event-stream ingest and model-access templates (149), P2b detections D1-D8 and alerts (150), P3 containment (151).
+- Fixes found in testing: alert links named a console page that does not exist (now the connection page, AS-124); the agent runtime and alert routes used `config.DB` instead of the graph controller's handle; the event ingest has its own per-IP rate budget.
+- Tests: unit (all packages), integration for each part including isolation, regression suites (access policies, capabilities contract, Logs vocabulary, R1b, R2, AWS scans), tenancy ratchet 72/72.
+
+### To verify in the lab (220171243705)
+- `bedrock-mantle` event source and IAM namespace; Bedrock token field names; Lambda/ECS session-name format; Lambda/ECS `aws:ResourceTag` on the containment actions; `kms:Decrypt` invokedBy for Secrets Manager; suggestion precision (Q1 condition).
+
+### Open
+- UI: built on `Authsec-ui` branch `feat/agent-runtime-ui` (alert link switched).
+- Production ingress: 1 MB body limit on `/authsec/ingest/aws/events`.
+
+---
+
+## 2026-11-04 — Azure blocks in tenants without PIM (AS-171)
+
+- A colleague found every Azure access block stuck on "Applying" in a tenant without Entra ID P2: the PIM schedule read (added after 22 Oct, so AI Search had worked then) answers 400 `AadPremiumLicenseRequired`, and the block retried it every minute forever. That answer now means the tenant has no PIM, so nothing is time-bound and the block proceeds; any other PIM error still waits. Stuck blocks proceed on their next retry once deployed.
+
+---
+
+## 2026-10-30 — Enforcement with nothing to list (UI-062)
+
+- Owner's call: the agent watches the whole cluster and agents can land in any namespace, so the namespace entry is unnecessary. Quarantine now reaches every namespace by default (iga-agent 0.6.1: one ClusterRole for networkpolicies and reading pods; the agent itself refuses kube-system, kube-public, kube-node-lease and its own namespace). Destruction stays in Roles per `enforcement.deleteNamespaces`.
+- Access policies keep named roles (owner chose "named roles, offered when needed"): `bind` on every role would let a compromised agent or control plane make itself cluster-admin. RoleBindings are changed in every namespace; the agent reports `binding_roles` on its heartbeat; a policy for a role not allowed is refused naming it (`detail.role`, `detail.allowed_roles` on the preview blocker) and the form shows the command that adds it.
+- UI: the setup dialog has "Let AuthSec enforce" instead of namespaces; the Enforcement tab has no namespace fields and says why access policies are off.
+- AS-169: on omniman, support-bot showed "0 rules" after k3s-master's connection was removed and re-created (a read-only query on the replica showed its new grants ended `subject_retired` each sweep). The sweep's assignment-id lookup returned the removed connection's ended row for the same binding key; it now reads live rows only.
+- UI-063 (owner's call after testing research-bot: per-role allowing does not scale): access policies act on every role (`enforcement.bindings.roles="*"`, iga-agent 0.6.2), installed by the console's setup command. The agent restores only subjects it recorded removing and never touches system: roles or the cluster's own namespaces.
+- AS-170: upgrading k3s-master's agent to every role stranded support-bot (removed by 0.6.1, no receipt; restore refused). Restored by hand; 0.6.3 adds `enforcement.bindings.legacyRoles`, filled in by the console, so older removals stay restorable across the upgrade.
+- To do: release iga-agent 0.6.1 (`make release` in iga-agent; the session's push was refused as a new public surface). The UI's commands name chart 0.6.1, so release it before deploying this UI.
+
+---
+
+## 2026-10-29 (cont.) — Kubernetes onboarding without cloning anything (UI-061)
+
+- The iga-agent chart is published as an OCI artifact beside the image: `oci://docker-repo-public.authnull.com/charts/authsec-iga-agent` (pulls are anonymous, checked). `make chart-push` publishes it, `make release` pushes the image under its appVersion and then the chart. `image.tag` defaults to the appVersion, not the mutable `production` tag (which points at an old build reporting "dev").
+- Add connection > Kubernetes is one dialog: a cluster name, optional namespaces to enforce in, and the command with everything filled in (chart and version, `VITE_API_URL`, workspace, a new ingest token). It waits for the agent to register and links to it. The old five-step wizard is gone: its chart path needed a clone, its control plane URL was the console's, it set no ingest token, and its hand-made row's name collided with the agent's registration.
+- Enforcement and Scope commands name the same published chart.
+- To do: push chart 0.6.0 (`make chart-push` in iga-agent; the automated push was refused by the session's permission check as a new public surface).
+
+---
+
+## 2026-10-29 — Enforcement turns on from the console alone (UI-060)
+
+- Why: turning enforcement on still meant copying a token into a Secret and a Helm upgrade that swapped the agent's discovery credential, and discovery was refused until that ran. On k3s-master the upgrade failed (no `actuation.namespaces`) and discovery was 401 again.
+- Backend: `POST /governance/connectors/:id/actuation` with `{"delivery":"agent"}` turns the connector **pending** (`actuation_enabled_at` set, no hash). Discovery stays on the ingest token. The registration response carries `actuation` (off/pending/on) to a verified caller; a pending connector takes the credential the agent offers (`actuation_token` in the body) once, only from a call a valid ingest token authenticated (never warn/off-mode unauthenticated), then refuses the ingest token as before. Re-posting rotates; DELETE turns off. Work can queue while pending. No migration: pending is "enabled, no hash". The old token-shown-once path (empty body) is unchanged.
+- iga-agent 0.6.0 (`internal/credential`): with the actuation role and no token given by hand, the agent generates its credential, stores it in `<release>-actuation` (chart renders it with no data and grants get/update on that name only) with a conditional update so replicas converge on one, and offers it when the heartbeat says pending. A refused credential is dropped for good and discovery falls back to the ingest token (a hand-given token too). The heartbeat reports `actuation_credential` none/fixed/managed.
+- UI: Turn on / Rotate / Turn off are one click; the tab says when the agent cannot take it up (no role, a hand-given token, older than 0.6.0) and gives the one Helm command (namespaces and binding roles, `--reset-then-reuse-values`, copy disabled while incomplete). No token panel, no Secret command, no switch-back step.
+- Still a cluster-admin step by design: which namespaces the agent may write in (Kubernetes RBAC cannot be widened from the console).
+- iga-agent 0.6.0 (`f854ec2`, image `iga-agent:0.6.0`, amd64+arm64) deployed to k3s-master as Helm revision 12, keeping the release's values: it still uses the hand-minted token (`actuation.existingSecret=authsec-iga-actuation`, controlPlane on the same Secret), so it behaves as 0.5.0 did until the backend with the hand-over is live. Then: run the Enforcement tab's command (it points controlPlane back at `authsec-iga-ingest` and clears the hand-given token), press Rotate, and delete the `authsec-iga-actuation` Secret.
+- Backend and UI are committed on `authsec-staging`; the owner builds and deploys them.
+
+---
+
+## 2026-10-28 (cont.) — Enforcement on k3s-master; turning it off (UI-058, UI-059)
+
+- Enforcement turned on for k3s-master from the console. Minting the token cut the cluster's discovery for 7 minutes (UI-058): the server then accepts its reports only under that token. The agent (Helm revision 7-9) now sends it for discovery and actuation; quarantine and access policies act only in `agent-live-demo` (role `llm-key-reader`).
+- Live demo: `support-bot` in `agent-live-demo` (iga-agent `examples/live-demo`) logs WORKING / ACCESS BLOCKED / NETWORK BLOCKED every 5 s. An access policy on `rag-agent` / `rag-reader` was proven end to end (binding emptied, `can-i` no, then restored on end).
+- `agent-demo`, `iga-demo` and `iga-test` deleted with their bots, and the demo ClusterRoles and the stale cluster-viewer binding of `agent-demo/ops-agent`.
+- UI-059: enforcement can be turned off (refused while something is in force).
+- Open: quarantine selects pods by one label (could match more than the workload); a token rotation needs the agent's pods restarted.
+
+---
+
+## 2026-10-28 (cont.) — Kubernetes enforcement from the console (UI-057)
+
+- A Kubernetes connection has an **Enforcement** tab: "Turn on enforcement" mints the cluster's actuation token (governance:admin; "Rotate token" after a confirmation), shown once with the two commands to run in the cluster (a Secret, then a Helm upgrade with the quarantine namespaces and, for access policies, the binding roles and namespaces). It shows what the agent reports: quarantine and access policies "Can act" / "Waiting for the agent" / "Off", the mode, the plan.
+- A sighting's page has **Quarantine** (reason required) and **Release**, and says whether the quarantine is blocked in the cluster, waiting, or not blocked (with the server's reason).
+- Both need this UI deployed; the backend endpoints were already on authsec-staging. The cluster steps stay manual by design: the console never reaches into a cluster.
+
+---
+
+## 2026-10-28 — authsec-staging merged again; iga-agent 0.5.0 on k3s-master
+
+- UI: 12 staging commits merged (Azure vocabulary, Azure agent Access Graph, tabs). `azureGraphSummary.ts` stays deleted (nothing imports it); 396 tests, lint 0 errors, build OK. Backend: nothing new on staging.
+- **iga-agent 0.5.0 deployed** to `authsec-system` on k3s-master, the production cluster (Helm revision 6, image `iga-agent:0.5.0`, commit `3dc0e408b1ef`, amd64+arm64, pushed as its own tag; the registry's `production` tag was not touched). Behaviour unchanged: roles `discovery`, enforcement `observe`, no actuation token, `enforcement.bindings` off. It re-registered as the same discovery source and swept as before.
+- Drift found and folded in: the release's values said `workspace.id` f25343ed…, but the ConfigMap had been changed with `kubectl apply` to 884d366f… (what the agent reports to). The upgrade sets 884d366f… in Helm, so a later upgrade no longer moves the agent to another workspace.
+- The registry holds only `production` and `0.5.0` of iga-agent; 0.4.2 ran from the node's local image (`IfNotPresent`).
+- Not yet possible here: Kubernetes access policies need the backend from this branch (prod runs `authsec-staging`), an actuation token, and `enforcement.bindings` on for chosen roles.
+
+---
+
+## 2026-10-27 — Manual test report: fixes on `feat/iga-enforcement`
+
+The tester's report (9 bugs, aditya.app.authsec.ai) was checked against the code. None came from the access-policy work. Fixed, each with a test:
+- **UI-050:** an Azure connection's Graph card read the Kubernetes sentence; the sentence now follows the provider.
+- **AS-166:** the Slack message showed operator settings and Vault; users now read "Slack is not set up on this server", and the detail stays in the startup log.
+- **AS-167:** the cluster counters read agent fields no agent sends (0.5.0 included); the panel now counts what Discovery holds for the cluster.
+- **UI-051:** the Policy list's "Used by" line shows its full value on hover.
+- **UI-052:** resource pages have Create policy. The form now fills a resource of every AWS type; before, the graph card's "New access policy" on Lambda, KMS, SQS, SNS or a Bedrock model opened with no resource.
+- **AS-168:** an Azure tenant is named by its organization name (read on its next scan) instead of its GUID.
+- **UI-053:** an unknown connection's breadcrumb reads "Not found", not "Bad Id".
+- **UI-055:** S3 rows say "No account in the ARN" instead of "Unknown account".
+- **UI-054 (found during the review, ours):** Kubernetes pages said policy is not supported although Kubernetes access policies are; they now offer one.
+
+Then the rest, on the recommended options:
+- **UI-056:** Azure Resources leaves Entra permissions out of its list and count (new inventory parameter `exclude_kind`), says how many, and shows them on request. Deploy the backend before the UI.
+- **UI-055:** pattern rows (`*`, `/apis/*`) stay listed (a pattern can reach many resources); the list counts them and offers exact references only.
+- **UI-051:** Kubernetes workloads lead with their own name instead of the agent's "container (Kind/name) in ns/namespace".
+
+The report did not exercise any access-policy enforcement; those checks, and agent 0.5.0 on the cluster, are still to run.
+
+---
+
+## 2026-10-24 (cont.) — authsec-staging merged into `feat/iga-enforcement`
+
+- Staging's PR #98 added an Azure data-plane table for AI Search, Key Vault, Service Bus and Event Hubs. This branch already maps those types, and more, in `services/iga_gov_access_azure_planes.go`. The merge keeps that table and drops staging's duplicate in `iga_gov_access_azure.go`.
+- **Adopted from #98:** an allow of read and write on Service Bus or Event Hubs assigns Data Owner. A preview warning says it also manages the namespace. This branch had refused that combination.
+- **#98's unit tests adapted to this branch's behaviour:**
+  - a storage account block also covers queues, tables, files and the SAS paths;
+  - a mapped type's read is its data and key actions, not the management read.
+- Every removal and restore case those tests check still holds. #98's integration test (TestAccessPolicyAzureSearchIndex) runs unchanged.
+
+---
+
+## 2026-10-24 (cont.) — Open items closed
+
+- **AS-138:** all 21 R2/R3 mutation routes now assert their audit row over HTTP (TestP3R2R3RoutesAudited, with a fake AgentCore for the push).
+- **AS-135:** an Azure block never removes a PIM-activated or time-bound assignment, so the restore at the end can no longer make it permanent.
+  - The check reads `roleAssignmentScheduleInstances` (api 2020-10-01).
+  - In the preview, a time-bound assignment is a blocker.
+  - If PIM activates one while a block is on, the job leaves it in place and records it as drift.
+  - If PIM cannot be read, the preview warns and the job waits rather than removing.
+- **AS-155** (recommended defaults; the owner may revisit):
+  - The deploy's rollout waits 20 minutes, and it rolls back only after a crash or a failed verification, never on a timeout alone.
+  - The pre-migration dump refuses to run unless the database volume has at least the database's size free.
+- **UI-049:** reviewed in code. Only checkbox cells could clip their own focus ring, and they are now overflow-visible.
+- **AS-154:** reviewed and accepted as a risk, with the reasons in ISSUES.
+- **Final check, all green:**
+  - backend: vet, unit tests, ratchet 72, full governance suite (449 s), RLS flows;
+  - UI: type-check, 354 tests, lint with 0 errors;
+  - agent: every test except the two chart NOTES tests, which need a reachable cluster and were already failing before these changes.
+
+---
+
+## 2026-10-24 (cont.) — Verification pass, and Kubernetes access policies (backend, UI, iga-agent)
+
+### Checked against primary sources
+- **Bedrock.** Global inference profiles check the model as `arn:aws:bedrock:::foundation-model/<model>`, with no Region. That ARN is now denied explicitly. Whether application profiles and prompt routers also check the model is not settled by AWS's docs; the preview says so (`app_profiles_unverified`).
+- **Secrets Manager.** ListSecrets leaves out secrets scheduled for deletion by default, which is the documented `IncludePlannedDeletion` behaviour.
+- **KMS.** Grants only allow, so an identity Deny still wins.
+- **Lambda.** A function URL with auth type NONE skips IAM.
+- **Azure.**
+  - Every role GUID in the code matches Microsoft's built-in role pages: Key Vault, Search, Storage, Cognitive Services, Service Bus, Event Hubs, Reader, Contributor.
+  - The Key Vault plane missed ARM's `Microsoft.KeyVault/vaults/secrets/write`, which sets a value through management. A write block now takes it, and a broader holder is reported as inherited.
+- **Not checkable without an account:** the ARN a listing of SSM's root path is authorized on, DynamoDB's conditions, and the AS-135 PIM case.
+- **The one unexplained full-suite failure** did not recur in four further runs.
+
+### Kubernetes access policies (AS-165)
+- **Backend.**
+  - Migration 146: `iga_gov_k8s_access`, job `k8s_access`, instructions `remove_binding_subject`/`restore_binding_subject`, and `discovery_sources.enforcement_bindings`.
+  - A policy names a Role or ClusterRole (graph id) and ServiceAccounts. Only block and all access are allowed.
+  - One row per (ServiceAccount, binding), placed by the binding's `discovery_source_id`.
+  - The job queues the instruction in its own workspace transaction, waits for the agent, removes again on drift (a sweep at least 15 minutes after the removal still lists the subject), and restores into the recorded binding uid.
+  - Refusals: an agent without the switch (`k8s_agent_cannot_act`), no binding of the role (`k8s_no_binding`), and a second live block on the same subject and binding (`k8s_policy_conflict`).
+  - Capabilities report `access_policies.k8s`. A ServiceAccount's access names each role's `role_id`.
+  - Schema parity holds: fresh bootstrap equals an upgraded database.
+- **iga-agent** (branch `feat/iga-enforcement`, chart and app 0.5.0).
+  - Gated by `enforcement.bindings.enabled`, `namespaces`, `roles` and `clusterWide`.
+  - The agent reads and writes the whole binding object, conditional on `resourceVersion`, and retries on conflict.
+  - It reports the binding's uid only when it removed something. A restore into a replaced or deleted binding is reported, not done.
+  - The chart grants get/update on bindings and `bind` with `resourceNames` limited to the listed roles. It never grants `escalate`, `create` or `delete`. Unset value blocks fall back to chart defaults.
+  - The agent reports `bindings=` on its plan poll.
+- **UI.** Kubernetes is a provider when the server serves it. The picker chooses a ServiceAccount, then a role it holds. The rule is fixed to block all access.
+- **Not done:** allow (creating RoleBindings, which needs `bind` on every role customers want to grant), User/Group subjects, and a test against a live cluster. The NOTES chart tests need a reachable cluster in this environment and were already failing before this change.
+
+---
+
+## 2026-10-24 (cont.) — Kubernetes enforcement: prerequisites
+
+### Done
+- Mapped what Kubernetes access policies need (spec R1k, "blocked" until K-1 to K-3):
+  - The instruction kind CHECK (last set in 026) needs a migration for new kinds.
+  - The agent refuses payloads without `namespace` and `workload_name`, and has no RBAC client methods or RBAC write verbs.
+  - A binding is stored only as per-subject `iga_policy_assignment` rows; its UID and resourceVersion are dropped.
+  - Snapshots carry no ordering.
+- K-1, ordering half (AS-164): a snapshot whose sweep started no later than the last accepted sweep of its source and cluster is refused with 409 `sweep_stale`. The authentication half was already done (AS-014).
+
+### Next (needs the owner's go-ahead: it changes what the in-cluster agent may do in customer clusters)
+- **K-2:** keep the binding's UID and resourceVersion (agent and wire model), and read bindings by identity.
+- **K-3:** a separate actuation permission set in the Helm chart, per opted-in namespace:
+  - `get`/`list`/`patch` on rolebindings;
+  - `bind` limited by `resourceNames`;
+  - `create` on subjectaccessreviews;
+  - no `escalate`.
+- **Instruction kinds:**
+  - `remove_binding_subject` / `restore_binding_subject`, with a resourceVersion precondition and the before-state recorded;
+  - `apply_rolebinding` / `delete_rolebinding` for an allow;
+  - migration 146 for the kind CHECK;
+  - an `iga_gov_k8s_access` deployment table mirroring `iga_gov_azure_access`.
+
+---
+
+## 2026-10-24 (cont.) — IGA enforcement, steps 7 and 8 (both repos)
+
+### Step 7: Azure storage services, Service Bus, Event Hubs
+- A storage account block now covers blobs, queue messages, table entities and files, plus every key and SAS path (listKeys, listAccountSas, listServiceSas). A container stays blobs only. An allow on an account still assigns a blob role and says so (`azure_allow_blobs_only`).
+- New planes:
+  - queues (Storage Queue Data Reader/Contributor);
+  - tables (Table Data Reader/Contributor);
+  - file shares (SMB Share Reader/Contributor, which keep file ACLs);
+  - Service Bus and Event Hubs: receive is read, send is write, delete is refused. An allow names one level, because no built-in role does both without managing the namespace. SAS keys being on is warned (`azure_sas_keys_also`).
+- All role GUIDs and data actions were checked against Microsoft's built-in-roles and permissions pages.
+- Fixes:
+  - Each plane has its own data prefix (`dataNS`), so a blob role on the account neither reaches a queue nor counts as inherited.
+  - Wildcard data actions (`Microsoft.Storage/*`) count.
+  - The auth mode is read on the top-level resource. Before, an OpenAI deployment, search index or Service Bus queue read its own properties and was refused.
+
+### Resource-type descriptor (AS-163)
+- Capabilities' `access_policies.types` (`igagov.AccessKindViews`) list each AWS type: service, noun, prefix, block only, the levels a block may name and the levels an allow may name. The form takes its rules from it (`typeRules`) and falls back to its registry for an older server.
+
+### Step 8: Lambda, KMS, SQS, SNS
+- **Lambda.**
+  - Block: the function with every version and alias. A read block also refuses AddPermission, PutResourcePolicy and Create/UpdateFunctionUrlConfig.
+  - Allow: invoking only.
+  - The preview reads the function's resource policy from the last complete scan and warns `function_url_public` when a URL takes auth type NONE. No IAM block reaches such callers.
+- **KMS.** Block only. Read is decrypt and CreateGrant; write is encrypt, data keys, sign and administration; delete is deletion, disable and imported material. Multi-Region keys are denied in every Region.
+- **SQS.** Block every level and its hand-offs; allow the plain message actions.
+- **SNS.** Block subscribe, publish, delete and hand-offs; allow publishing only.
+- **UI.** One generic reader for these single-ARN types. The form shows only the levels an allow may name.
+
+---
+
+## 2026-10-24 (cont.) — IGA enforcement, step 6: Bedrock and AgentCore, block only (both repos)
+
+### Done
+- Action tables are now read from AWS's machine-readable service reference (`https://servicereference.us-east-1.amazonaws.com/v1/<service>/<service>.json`). The Secrets Manager and SSM tables were re-checked against it, and SSM gained the parameter resource policy (sharing) in its read block.
+- `BedrockModelTarget`: picked through a foundation-model ARN or a system inference profile (`us.`, `eu.`, `global.`...) of it. Denied in every region, together with the profiles that route to it. Also denied: InvokeModel/InvokeModelWithResponseStream on `*` with `StringLike bedrock:ModelArn`, which covers application profiles and prompt routers when AWS sets the key. Read means calling the model (Converse authorizes as InvokeModel) and batch jobs. Write means building on it (customization, provisioned throughput, profiles, routers, evaluations). Delete is refused.
+- `BedrockAgentTarget` (every alias and version) and `AgentCoreRuntimeTarget` (every endpoint), with read = invoke.
+- New discovery source for picking: the resolver accepts a discovered Bedrock agent or AgentCore runtime by its `iga_workload` id. Its ARN comes from the recognition key, and its placement from the workload's support rows. This works in preview, create, edit and every view. No collector change was needed: the workload scan already lists them.
+- UI: three new types (Allow off; Delete off for a model). Agents and runtimes are picked from the workloads list, models from records. The graph marks covered nodes.
+
+### Not covered / to check
+- OAuth (JWT authorizer) callers of a runtime do not use IAM.
+- Whether `bedrock:ModelArn` is present for application profiles and prompt routers.
+- Foundation models that no IAM policy names cannot be picked yet. A model list from the agents' `FoundationModel` attribute or from ListFoundationModels would add them.
+
+---
+
+## 2026-10-24 (cont.) — IGA enforcement, step 5: AWS SSM parameters, block only (both repos)
+
+### Done
+- `SSMParameterTarget` (`internal/igagov/access_ssm.go`), block only. Read: GetParameter(s), GetParameterHistory (it returns the current value), tags, and `AuthSecAccessPath`: GetParametersByPath on `parameter/` and every path above the parameter. The GetParametersByPath API reference says a role denied `/a/b` can still read it by listing `/a` recursively, so the block refuses listing those paths for its whole window (warned as `path_listing_blocked`). Write: PutParameter, labels, tags. Delete: DeleteParameter(s).
+- Discovery already types these ARNs as `ssm_parameter` (generic fallback); no existence check: the ARN is exact.
+- The block-only refusal now names the type's noun.
+- UI: the SSM parameter type (Allow off), `parameterOf`/`groupParameters`, graph coverage of the exact parameter.
+
+### To check against AWS
+- Which ARN a listing of the root path "/" is authorized on.
+
+---
+
+## 2026-10-24 (cont.) — IGA enforcement, step 4: Azure OpenAI / AI Services (both repos)
+
+### Done
+- A data-plane entry for `microsoft.cognitiveservices/accounts` (and `/deployments`). Read: every inference action (chat, completions, embeddings, audio, realtime, images, search) and reading files, stored completions, thread messages and responses. Write: files, fine-tunes, assistants, responses, batches, stored completions, deployments. Delete: the same objects. Every level includes `listKeys`/`regenerateKey` (a key reaches all data). The management read is not included, so Reader is never removed.
+- Allow: Cognitive Services OpenAI User (read; warned that it also creates assistants, responses and generations) or Contributor (write/delete).
+- ARM properties: no `customSubDomainName` → blocker `azure_ai_keys_only` (Entra tokens need it); local auth on → warning `azure_ai_keys_also`.
+- Role GUIDs and every action name were checked against Microsoft's built-in roles page and the provider operations page (2026-10-24); the Search role GUIDs from step 2 match as well.
+- UI: OpenAI access-level wording.
+
+### Not covered
+- Other data planes of an AI Services account (Speech, Language, Content Safety, MaaS): a role reaching only those is refused for read/write/delete (unclassified) and removed by "all".
+
+---
+
+## 2026-10-24 (cont.) — IGA enforcement, step 3: AWS Secrets Manager, block only (both repos)
+
+### Done
+- `SecretTarget` (`internal/igagov/access_secretsmanager.go`), registered with `BlockOnly`. A block denies every secret named N in the account in every region (`arn:p:secretsmanager:*:A:secret:N-??????`): replicas, a secret re-created under the name and a pick through a selector row write the same document.
+- Read denies GetSecretValue (BatchGetSecretValue checks it per secret) and the paths that hand the value on: replicate, rotate, resource policy, tags. Write and delete add `AuthSecAccessOverwrite` (CreateSecret on `*` with `ForceOverwriteReplicaSecret` and `secretsmanager:Name`). Never denied: actions without a resource type (ListSecrets, BatchGetSecretValue, GetRandomPassword), which a scoped Deny cannot reach.
+- Service: an allow on a block-only type is refused (preview, create, edit); capabilities list `block_only`. The name is checked against ListSecrets of the latest published scan of the secret's own account: a complete scan that does not list it refuses (`resource_not_current`; this also catches a partial ARN such as `prod/db-backup` read as `prod/db`, and a secret scheduled for deletion), otherwise the warning `existence_not_verified`.
+- UI: the Secret type in the form (Allow off), `secretOf`/`groupSecrets`, graph coverage by account and name in any region.
+
+### To check against AWS
+- Which ARN CreateSecret is authorized against when it overwrites a replica (the statement uses `*` and the name condition until then). Whether ListSecrets leaves out secrets scheduled for deletion by default.
+- Step 3b (allow): the exact suffix and the UpdateSecret/DeleteSecret conditions on a live account.
+
+### Known gap
+- A secret reachable only through `Resource: "*"` has no Discovery row to pick. Projecting ListSecrets observations into `iga_resources` is a separate change.
+
+---
+
+## 2026-10-24 (cont.) — IGA enforcement, step 2: Azure Key Vault and AI Search (both repos)
+
+### Done
+- A per-type table of Azure data planes (`services/iga_gov_access_azure_planes.go`), built on Aman's `fix/azure-access-data-actions` review (its Key Vault and Search entries and role GUIDs kept; Service Bus and Event Hubs left for step 7 with their correct roles).
+- Key Vault secrets: read getSecret/readMetadata/backup, write setSecret/update/restore/recover, delete delete/purge; allow Key Vault Secrets User / Officer. AI Search documents: read/write/delete; query keys for read, admin keys for read, write and delete; allow Search Index Data Reader / Contributor.
+- Read on a mapped type no longer means the management read (a Reader role grants no secret): no false inherited-access blocker from a subscription Reader.
+- AS-121 narrowed: a data role is unclassified only if it has data outside the mapped plane (Key Vault keys and certificates are still refused; "all" removes them).
+- A live ARM read of the resource: vault on access policies and keys-only search service are blockers; a search service that also takes keys is a warning; an unreadable one a warning.
+- UI: access-level wording for vaults and search services.
+
+### To check against Azure
+- The four data role GUIDs and the data action names were checked against the reviewer's notes and memory, not against a live tenant; verify with `az role definition list` before release.
+
+---
+
+## 2026-10-24 (cont.) — Staging review findings, round 1 (both repos, `feat/iga-enforcement`)
+
+### Done
+- Plan items 9 and 11 finished: Azure gaps on Discovery as a closeable notice (UI-042); an own-app subscription read that timed out or was throttled is `not_checked`, not "Reader denied" (AS-126).
+- Access policies: failed AWS rows removed (AS-129), `$` in S3 folders (AS-130), End during a running check (AS-131), Azure inherited access after apply is drift (AS-132), Azure removals without R2 (AS-133), restore keeps condition version and description (AS-134), Azure scheduled status (AS-136), allow role warning (AS-139), 144 job-kind check (AS-140), quota warn at 10 / refuse at 20 (AS-141), list truncation (AS-142), Resume after a kept policy (AS-143), S3 tag/ACL/lifecycle/access points (AS-144), cross-workspace Edit/Pause/Resume/Delete tests, audit rows for the six access-policy routes (AS-138, part).
+- Azure onboarding: fail-closed credential lookups and recorded unconfigured app (AS-145), env overlay never in production (AS-146), internal errors hidden and session mismatch 404 (AS-147).
+- Links: every console path the backend writes is a page the console serves (AS-148, TestConsoleLinksNameServedPages).
+- Auto-scan scheduler: change after claim wins (AS-149), time zone without time (AS-150), cross-workspace test, CI runs the scheduler and governance schema suites (AS-151), scheduler_active deployment-wide (AS-152).
+- UI: UI-043 to UI-048.
+- Checkpoint: full governance suite (529 s), all unit tests, ratchet 72.
+
+### Open
+- AS-135 (PIM activations restored as permanent): needs a live tenant with PIM.
+- AS-138: the 21 R2/R3 mutation routes still have no audit_events assertion.
+- UI-049 (shared TableCell clipping): needs a visual pass.
+- AS-155 (deploy.yml rollback and backups): owner decision.
+
+---
+
+## 2026-10-24 — IGA enforcement, step 1: DynamoDB tables (branch `feat/iga-enforcement`, both repos)
+
+### Done
+- Backend: S3 documents pinned byte for byte (`71a413a`); a resource type is now an `AWSAccessTarget` registered in `igagov.AccessKinds()`, with one statement builder for every type (`ef6e8b6`); the service plans, previews and builds views through the target and the view gains `resource_type` and `region` (`fa9e531`); the DynamoDB table target (`31dd58b`); DynamoDB in the service (`4eaa3d3`) and its integration tests (`fd6fc4d`).
+- DynamoDB semantics (checked against the AWS Service Authorization Reference, copies in the session scratchpad): a block denies the item actions on the table and everything under it, plus for read the stream, export, restores, AWS Backup jobs, Kinesis streaming, cross-account replicas, every PartiQL write and writes that ask for the item back; for delete DeleteTable and TTL; creating a replica of the table in any region (checked on the replica's ARN). An allow is item access on the table and its indexes only (DescribeTable with read; without read no PartiQL and ReturnValues NONE). Not closable in IAM, so a preview note: a write whose condition fails returns the item.
+- Owner decisions applied: a block may name a table in another account, an allow may not (`resource_other_account`); a row no current scan supports is `resource_not_current`; patterns and global-table ARNs are refused.
+- UI: resource-type registry (`18d634b`), API types (`50cd45a`), S3 pins (`c972595`), bucket/table switch and table picker (`e923bfe`), graph marks and card (`e5f606c`).
+
+### To check against a live AWS account
+- `aws iam simulate-principal-policy` for the generated documents (action names, the replica-region ARN). Condition keys DynamoDB actually sets (PartiQL `RETURNING`, `ReturnValuesOnConditionCheckFailure`) need real calls on a test table.
+
+---
+
+## 2026-10-23 — IGA enforcement, step 0: Azure access fixes (branch `feat/iga-enforcement`)
+
+On top of `authsec-staging` (pulled 2026-10-23). Plan: fix the serious Azure access bugs first, then extend enforcement one service at a time (DynamoDB, Key Vault/AI Search, Secrets Manager, ...), then Kubernetes. Committed locally; nothing pushed.
+
+### Done
+- AS-118: Azure onboarding returns only to origins AuthSec serves (`3dc402d`).
+- AS-119: a block that ends hands the assignments it removed to another live block on the same principal that still needs them gone (an edited policy's new version, another policy) instead of restoring them; an approved row holding handed assignments ends through `expiring`, so they are restored. `revoked` is appended atomically.
+- AS-120: preview blocker `azure_policy_conflict` (block and allow on the same principal, overlapping scopes; the policy's own rows excluded on edit/resume); blocks never record AuthSec's allow assignments.
+- AS-121: on non-storage resources "all" also removes roles with data actions in the provider namespace; read/write/delete with such a role is a preview blocker `azure_data_access_unclassified`.
+- Tests: `TestAccessPolicyAzureOverlappingBlocks`, `TestAccessPolicyAzureBlockAndAllow`, `TestAccessPolicyAzureNonStorageData` (all three fail on the old code); the Azure test setup is shared (`azLab`).
+- AS-122: a restore Azure can never accept (principal, role or resource gone) is skipped and recorded, and the row ends, so the policy can be deleted; transient errors keep retrying. AS-123: a block that fails to deploy after removing assignments restores them first, then ends `failed`. `TestAccessPolicyAzureRestoreFailures`, `TestAccessPolicyAzureFailedDeployRestores` (both fail on the old code).
+- AS-124 (both repos): `/iga/policy/setup[/section]` forwards to a connection's tab with the query kept, so Slack messages already sent work; Notifications appear on Azure connections; readiness remedies name the identity page or the connection's IaC tab.
+- AS-125: the schema guard counts 137/144's tables, and its key checks (hidden behind the count) list 144's connector/identity ids and both tables' `created_by` with reasons; `tests/igagovschema` passes.
+- Azure gap notices on Discovery: not a bug. Akash removed the strip on purpose (1d1d9d9, abaa356); gaps stay on the connection's Overview and Coverage tabs. Only the stale comment was fixed (UI `da15334`).
+- AS-126: `ConnectCustom` reads subscriptions 4 at a time (`customSubscriptionReads`), so large tenants no longer time out.
+- AS-127: new enforcement bindings get template v2 only while R2 is available (schema verified), else v1.
+- The full governance suite (`IGA_TEST_DSN` only; with `TEST_DATABASE_URL` also set, one test resets the database under the others) and all unit tests pass.
+
+### Next
+- Step 0 is done. Allow re-apply stays as it is (owner's decision, 2026-10-23): an allow removed outside AuthSec is re-applied at the next check on AWS and Azure, and ending the policy is how access is revoked.
+- Next: step 1, AWS DynamoDB access policies.
+
+---
+
+## 2026-10-22 — Azure access policies reach data planes (branch `fix/azure-access-data-actions`)
+
+### Done
+- Found in production: a block on a Foundry project's identity left its agent answering, because the agent reads an Azure AI Search index with Search Index Data Reader, a role with data actions only, and a block outside storage accounts looked at management actions only.
+- `azureActions` now adds data actions (and key listings) for AI Search, Key Vault secrets, Service Bus and Event Hubs (`azureDataPlanes` in `services/iga_gov_access_azure.go`); an allow assigns Search Index Data Reader/Contributor and Key Vault Secrets User/Officer there. Storage accounts and every other type are unchanged. The preview notes AI Search API keys and Key Vault access policies, which role assignments do not cover.
+- Tests: `TestAzureActions*`, `TestAzureBlockReachesSearchIndexData`, `TestAzureAllowAssignsDataRoles`, `TestAzureDataPlaneChildTypes` (unit); `TestAccessPolicyAzureSearchIndex` (integration). The existing `TestAccessPolicyAzure` and the AWS access-policy tests still pass.
+
+### Known limits
+- Cognitive Services / Azure OpenAI and Cosmos DB are not in the table: Cosmos DB's data RBAC is not ARM role assignments, and OpenAI's data actions need a decision on what "read" means for a model.
+
+---
+
+## 2026-10-20 — Azure discovery made multi-tenant; access policies on Azure (branch `fix/azure-tenancy`)
+
+### Done
+- PR #92 (Azure onboarding): migrations renumbered 141–143; 18 files run under RLS (`scripts/tenant-rls-files.txt`); workspace-qualified joins; `Test_Isolation_AzureDiscovery`, `Test_AzureProjectionUnderRLS`.
+- Access policies on Azure resources (migration 144, table `iga_gov_azure_access`, job `azure_access`), same routes and statuses as AWS. Allow: AuthSec creates a role assignment (Storage Blob Data Reader/Contributor on storage accounts, Reader/Contributor elsewhere) and deletes it at the end. Block: AuthSec records and removes the principal's own assignments on the resource that grant the access, and restores them on End, Pause or expiry. `TestAccessPolicyAzure` (fake RBAC client).
+
+### Known limits
+- Azure RBAC has no customer deny: access from a broader scope (resource group, subscription) is a preview blocker (`azure_inherited_access`); access through Entra groups is not examined.
+- Assignments have no expiry of their own; the end depends on AuthSec's job.
+- AuthSec's Azure app needs `Microsoft.Authorization/roleAssignments/write` and `/delete` on the subscription (blocker `azure_write_access_missing`).
+- Committed locally; nothing pushed.
+
+---
+
+## 2026-10-22 — Azure access policies match AWS in the console (branch `feat/policy-azure-backend`)
+
+On top of 2784c81 (switch removal) and 1ad9b4d (SPEC-access-policies.md, D-114). Committed locally; nothing pushed.
+
+### Done
+- D-114: Azure on `/graph`, `/graph/expand`, `/graph/path` (`internal/igaread/traverse_azure.go`): identity -> role assignment -> resource or leaf scope; reverse from a resource lists the assignments and their holders. AWS and k8s responses unchanged (contract test).
+- Policy views say the cloud (`resource.provider/name/kind`, `roles[].kind`, `deployments[].target_ref`, `?provider=`); readiness `azure_subscriptions`; provider wording; new status `ending` until every deployment has left the cloud; migration 144 checked on its own (Azure 503 without it, AWS unaffected).
+- Tests: `TestP2AzureGraph*` (reverse, forward, isolation), `TestP2AzureGraph*` unit tests, `TestAccessPolicyAzure` extended, `TestAccessPolicyAzureWithout144`.
+
+### To check after deploy
+- `GET /api/iga/v1/graph?root=resource:9cbb0fd8-5c8f-4c70-a972-672c93d10873&direction=reverse`: storage account <- Storage Blob Data Reader <- authsec-agent-iga-project-test-01.
+- `root=identity:302bd535-ef0c-4196-af09-c975eb3c5b82`: its storage and Search assignments.
+- `GET /api/iga/v1/policy/access-policies/readiness`: Authnull (6811c717…) ready.
+
+---
+
+## 2026-10-13 — Ritam's IGA work made multi-tenant (branch `fix/governance-tenancy`)
+
+Review of all 102 non-merge commits by ritam77 / ritamAN77 / Ritam Kundu since 2026-10-05 (7 parallel reviews), then the fixes. Kept every feature and its logic; changed how each transaction is scoped. Committed locally; nothing pushed.
+
+### Done
+- AS-110 webhook SSRF (`bba54ca`); AS-111 cross-workspace user deletes and purges refused (`7005360`); migration 131 (RLS on every workspace table; a workspace reads the users it has memberships for).
+- AS-108: `tenancy.InWorkspace` / `InWorkspaceRead`; policy jobs' `InTx` runs under RLS for the job's workspace; 56 governance/IGA files converted (six implementer groups: findings and evidence; authoring, owners, reviews, settings, events, notify; deployments and the AWS executor; rollout and the enforcement binding; IaC, Slack, job queue, legacy compat; Ritam's older discovery/k8s/actuation code). Cross-workspace statements carry TENANT-EXEMPT reasons. The quarantine is empty.
+- Ratchet: multi-line raw SQL is counted (AS-112); RLS-files guard (`scripts/tenant-rls-files.txt`): a base handle there only opens a workspace transaction. Main baseline 82 → 72.
+- Migrations 132 (iga_gov_notification unique per workspace) and 133 (iga_gov_job kind CHECK re-created; 052 had been edited in place).
+- Discovery ingress: `enforce` by default when `ENVIRONMENT=production` (set `IGA_DISCOVERY_INGEST_AUTH=warn` explicitly to keep the old behaviour); no workspace-existence oracle.
+- AS-113 found during the conversion: an actuation report could change another workspace's agent (id-only update).
+- id-only updates in deployments, IaC, actuation, discovery and k8s now also match workspace_id; IGAGovAttemptLog refuses a workspace other than the job's.
+- The long-failing TestP3T311TrustLiveWithdrawArchiveIsolation was a test race (asynchronous audit write); fixed.
+- CI: the IGA isolation check runs on pull requests.
+
+### Verified
+- build, vet (incl. integration tags), ratchet, unit tests, flows/onboarding/flagsoff, the full Phase 3 suite on a fresh database (all pass), IGA isolation check, schema parity: a database built by current staging upgrades with 131-133 to the fresh schema.
+
+### Later the same day (PR #89 conflicts)
+- authsec-staging gained Phase 3 R1b, R2 and R3 (Ritam, 060-062); merged into the branch and converted to RLS like the rest (AS-114), with cross-workspace tests for R2 grants/revocations, the R2 expiry job and R3 runtime controls.
+- Found and fixed: the RLS-files guard matched nothing on gawk (AS-114); 133 had dropped R2's job kinds (AS-115, migration 134); 061's plan check accepted any direct split through a NULL comparison (AS-116, migration 135); R3 holds/budgets could name another workspace's rows (AS-117, migration 136).
+- tests/igagovschema (failing on staging as well) brought up to date with R1b/R2/R3 and the tenancy migrations.
+
+### Next
+- AS-112: burn down the 72 older unscoped statements.
+- Before deploying: mint discovery ingest tokens for every collector (production now enforces), see DEPLOYMENT_CHECKLIST.
+
+## 2026-10-12 (cont.) — authsec-staging merged again (PR conflicts)
+
+The PR from fix/p0-containment to authsec-staging had conflicts; staging was merged into the branch locally (120 commits: IGA governance phase 3, migrations 047-059). Nothing pushed.
+
+### Conflicts and how they were resolved
+- `go.mod`: our direct requirements kept; `go mod tidy` (same versions as staging).
+- `cmd/main.go`: both shutdown steps (policy job worker, metrics server).
+- `services/policy_warning_senders.go`: staging's `notify.Webhook`; `internal/notify` now defaults to the SSRF-safe client (AS-042 would otherwise have regressed).
+- User deletes (`admin_invite`, `admin_user`, `enduser`, `scim_admin`): our scoped transactions kept, staging's 409 `user_has_audit_history` added on top.
+- `database/workspace_repository.go` DeleteTenant: our RLS transaction with staging's purge order and `authsec.workspace_purge` flag; users are counted before the cascading workspace delete.
+- `001_bootstrap.sql`: staging's 047-059 block, then ours (101-130), so 111's RLS loop covers the new tables.
+- Semantic: `policyID` declared twice (ours renamed `spirePolicyID`).
+- Four staging tests assumed lenient behaviour: a foreign body workspace is now 404 (AuthMiddleware), users need a home workspace (105), the purge runs as the workspace owner (no super admin), and the tenancy context is set in harnesses.
+- Staging's purge test found AS-109 (workspace delete always 500 on our branch); fixed.
+
+### Verified
+- Upgrade path: a DB migrated by the staging binary (58 migrations) upgrades with this build (21 applied) to the same schema as a fresh install (`scripts/schema-parity.sh`).
+- Ratchet: main 0; staging's 295 statements quarantined (AS-108).
+- TestP3T311ProposeCompileApprove and TestP3T311TrustLiveWithdrawArchiveIsolation fail on staging itself as well (audit rows); not caused by the merge.
+
+## 2026-10-12 — Manual test reports (two interns): verified and fixed
+
+Two manual test reports (Identity Providers, Directory Sync, Custom Domains, Groups/Team; Apps, Clients, Roles, Logs) were checked against the code; every reported failure was reproduced or traced before it was changed. Committed locally; nothing pushed.
+
+### Done
+- **UI-035/UI-036** (UI `4f49ee9`): IdP Edit used the table row key as the id and always opened the SAML page; OIDC had no edit page and its activate/delete used a name slug. All actions now use `identity_providers.id`; new OIDC edit page; breadcrumb and back fixed; Microsoft/GitHub field names and help.
+- **UI-037** (UI `d7ecfac`): the pre-registration mutation dropped `client_kind`, so "AI Agent" clients were stored as `human_app`. "Approved" right after pre-registration is intended (admin pre-registration is the approval).
+- **AS-104** (`8434ffe`, UI `2d616a4`): role delete 500 reproduced (composite FK SET NULL on an application's default role; RESTRICT from memberships for admin/held roles). Now deletes, or 409 with a reason.
+- **AS-105** (`cc29ba4`, `45d556f`, UI `b954a42`): directory sync secure defaults; AD `use_ssl=false` was stored as true (GORM default tag); AD skip-verify refused in production unless `DIRECTORY_SYNC_ALLOW_SKIP_VERIFY=true`; Entra always verifies TLS; editing Entra kept failing (secret required) and loaded the AuthSec workspace/client ids as the Entra tenant/app; duplicate name 409.
+- **UI-038** (UI `b954a42`): the "akashnr" pre-fill was the browser filling the operator's own login (`autoComplete="username"/"current-password"`), not stored data; secrets are masked by the API and never reached the form.
+- **AS-106** (`3700865`, UI `4d999d5`): domain names validated on both sides; DNS verification says why it failed; another workspace's domain is 404.
+- **UI-039** (UI `aad18eb`): Team page Invite member action.
+- Tests: Test_RoleDelete, Test_SyncConfig_TLSSettings, Test_SyncConfig_EntraUpdateKeepsSecret, Test_CustomDomains_ValidateAndExplain (each fails on the old code), TestValidateDomainName, TestMatchTXT, TestCheckADSkipVerify; UI identityProviders, resourceServersApi, syncConfigForm, domainValidation tests.
+- Verified: backend build, vet, unit tests, flows/onboarding/flagsoff integration suites, ratchet 0; UI type-check 0, 181 tests, lint 0 errors, build.
+
+### Not changed (decisions or not reproducible)
+- **UI-040 Groups**: no Groups page exists in this build by design (routes removed; UsersPage says so). Owner decision: build it or leave it out. Found **AS-107** on the way (`/authz/groups/:id` parses UUIDs as integers).
+- **Entra "an error is displayed"** (Directory Sync 9): no error text was captured. Causes fixed: the edit-mode tenant/app id, the secret requirement, autofilled credentials. Remaining causes are configuration (Graph `User.Read.All` application permission with admin consent, now stated in the form). Test Connection still performs a full dry-run fetch, which can hit the 30 s UI timeout on large directories.
+- **Plain LDAP** is still allowed (warned in the UI and logged); refusing it needs StartTLS support or an owner decision.
+
+## 2026-10-08 (cont.) — AS-081 multi-tenant SPIRE; Phase 6 complete
+
+Owner decision: make the embedded SPIRE control plane multi-tenant. Committed locally; nothing pushed.
+
+### Done
+- **AS-081** (agent, merged):
+  - Migration 120 adds `spire_*` control-plane tables, one per workspace under RLS. They replace the per-workspace-database tables the code still queried.
+  - Repositories run on the scoped layer.
+  - PKI provisioning and the JWT routes are behind `AuthMiddleware` and need owner or admin.
+  - Node attestation uses single-use workspace join tokens (new `/v1/join-tokens` admin endpoints).
+  - Agent and mTLS routes take the workspace from the verified client certificate, which must chain to that workspace's CA.
+  - The `/spire` headless routes are behind `AuthMiddleware` and scoped. `oidc/exchange/spiffe` returns 410.
+  - The production startup refusal is removed.
+  - Rate limits now key on the trusted client address (`90e3c03`).
+- **Phase 6:**
+  - Legacy gin keys retired (`ad67c6c`).
+  - RLS fails closed for `authsec_tenant` (130, `a9b63f1`).
+  - The `authsec_platform` BYPASSRLS role remains a superuser deploy step.
+- **Deploy:** `docs/DEPLOYMENT_CHECKLIST.md` written for the manual deploy.
+- **Bootstrap fix:** the 120/130 blocks were rebuilt after the merge left a conflict marker (`7916dda`).
+
+### Verification
+- Build, vet and unit tests pass.
+- The flows, onboarding and flagsoff suites pass, including 7 new SPIRE tenancy tests and 6 certificate-auth unit tests.
+- Ratchet 0; schema parity holds over 66 migrations.
+
+### Left for later (from the AS-081 review)
+- Vault mount `pki/` prefix handling is inconsistent across services.
+- `/v1/jwt/renew` renews any valid token the caller holds.
+- Within one workspace, any SVID can renew any attested workload.
+- The headless OIDC signing key is in process memory only.
+- `spire_audit_logs.workspace_id` is nullable text.
+
+---
+
+## 2026-10-08 — Owner decisions applied; staging merged
+
+The owner accepted the recommendations. Committed locally; nothing pushed.
+
+### Done
+- **AS-060**, two parts:
+  - Resource URIs are unique per workspace; a URI that another workspace holds can be registered only by the owner of its host (a verified workspace domain), and lookups resolve to that owner (`7ef036a`).
+  - Workload-identity issuers are unique per workspace. The token endpoint tries each provider for the issuer, needs exactly one to accept the token, and binds the result to the requested client (`6d7b64b`).
+- **AS-098:** `.env` is untracked in both repos.
+- **OPS-001:** the deploy jobs already run in a `production` GitHub Environment; required reviewers must be added in the repo settings.
+- **AS-015:** already sends Deprecation and Sunset headers; retirement waits for the SDK.
+- **Two stale IGA integration tests** fixed (`757b337`); the whole `tests/integration` package passes.
+- **CLAUDE.md:** stale facts updated.
+- **`authsec-staging` merged into both branches.** It had moved by 26 backend and 7 UI commits.
+  - **Migration renumbering:** staging's 043–046 have already run in production, so this branch's migrations moved, in the same order, to 101–119.
+  - **Discovery ingress:** staging's ingest tokens replace this branch's collector tokens. The actuation-token binding is kept.
+  - **Kubernetes reads:** staging's new features run under this branch's RLS reads.
+
+### Migration renumbering
+| Former | Now |
+|---|---|
+| `043_login_tickets` | `101_login_tickets` |
+| `044_trusted_issuer_workspace` | `102_trusted_issuer_workspace` |
+| `045_tenancy_expand` | `103_tenancy_expand` |
+| `046_tenancy_backfill` | `104_tenancy_backfill` |
+| `047_tenancy_contract` | `105_tenancy_contract` |
+| `048_tenancy_indexes_uniques` | `106_tenancy_indexes_uniques` |
+| `050_session_token_revocations` | `107_session_token_revocations` |
+| `051_audit_events_append_only` | `108_audit_events_append_only` |
+| `052_users_delete_permission` | `109_users_delete_permission` |
+| `053_voice_active_sessions` | `110_voice_active_sessions` |
+| `054_row_level_security` | `111_row_level_security` |
+| `055_platform_rows_null` | `112_platform_rows_null` |
+| `065_auth_lockouts` | `113_auth_lockouts` |
+| `066_ciba_request_resource_binding` | `114_ciba_request_resource_binding` |
+| `068_otp_entries_scope` | `115_otp_entries_scope` |
+| `069_tenancy_ws_index_backfill` | `116_tenancy_ws_index_backfill` |
+| `070_entra_tenant_id_expand` | `117_entra_tenant_id_expand` |
+| `071_resource_uri_per_workspace` | `118_resource_uri_per_workspace` |
+| `072_wip_issuer_per_workspace` | `119_wip_issuer_per_workspace` |
+
+`067_discovery_collector_tokens` was removed: staging's ingest tokens replace it.
+
+### Release notes (deploy)
+- **Migrations:** staging's 043–046 have already run in production. On deploy, 101–119 apply in order; on a database that never had them, all of them apply.
+- **Discovery ingress:**
+  - `DISCOVERY_ALLOW_UNAUTHENTICATED_INGRESS` and `/discovery/collector-tokens` are gone. Use `/discovery/ingest-tokens` and `IGA_DISCOVERY_INGEST_AUTH`.
+  - The default `warn` mode accepts unauthenticated reports. Set `enforce` once every collector has a token.
+- **Resource servers:** registering a URL that another workspace already uses now needs a verified domain covering its host.
+- **Workload federation:** the `client_id` a token request names must be the client of the workload the token maps to.
+
+### Waiting on the owner
+- **AS-081:** the embedded SPIRE control plane. The UI's SPIRE wizard points customers at `/spiresvc`, so this needs a product call before removal. Also check that production does not set `ENABLE_EMBEDDED_SPIRE`: since `deb5645` the server refuses to start with it in production.
+- **OPS-001:** add the required reviewers.
+- **AS-097:** run the contract migration after the next deploy.
+- **AS-098:** rotate the secrets if they were ever used outside dev.
+- **ENV-001.**
+
+---
+
+## 2026-10-07 (cont. 3) — "complete what's left"
+
+Branches `fix/p0-containment` (backend) and `feat/ui-voice-perf` (UI); nothing pushed.
+
+### Done
+- **Ratchet 151 → 0.** Every raw SQL statement outside `internal/tenancy` is either handed to the scoped layer or carries a specific TENANT-EXEMPT reason.
+  - **New scoped helpers:** `tenancy.GormExec` and `tenancy.GormRaw` for GORM code, and `tenancy.InsertContext` for `INSERT ... VALUES` under RLS.
+  - **Ratchet rules:** a scoped or exempt statement covers its whole multi-line SQL string, and every raw string's open/closed state is tracked. This was checked with probe files.
+  - **Quarantined code:** embedded SPIRE (AS-081) is not counted.
+  - **IGA/graph cluster** (agent):
+    - the GitHub and Kubernetes projections now run under RLS;
+    - the claim and recovery loops carry exemption notes;
+    - AS-103 fixed.
+- **Bugs fixed, each with a test that fails on the old code:**
+  - AS-077: a successful PKI retry never marked the workspace active.
+  - AS-103: governance revocation crossed workspaces for a subject with memberships in two workspaces.
+- **Workspace predicates added to lookups that matched by id alone:**
+  - SPIRE cleanup on service-account delete;
+  - the connector broker's last-seen updates;
+  - trusted-issuer revocation;
+  - resource-server tool counts;
+  - the provisioning resource-server name;
+  - the scope resolver's group subquery;
+  - the applications connections joins;
+  - SoD `user_groups`;
+  - birthright lookups.
+  - Policy role ceilings read only the workspace's own roles or platform roles.
+- **Test fixture:** the provisioning fixture failed after AS-061 (`11ca70d`); it now uses an application role.
+- **UI-033:**
+  - per-person UI state (wizard progress, tours, dismissed notices) is keyed by workspace and user;
+  - the `Tenant*` cache tags are renamed.
+
+### Verification
+- Build, vet and unit tests pass.
+- The flows, onboarding and flagsoff suites pass.
+- The igagraph and ownership (governance, provisioning, agent policy) suites pass on throwaway DBs.
+- UI: 27 files / 167 tests, tsc, lint with 0 errors, and the build all pass.
+
+### Still open (owner decisions or a deploy)
+- AS-060: per-workspace resource URIs need ownership verification first.
+- AS-015, AS-081, AS-097 (contract), AS-098, OPS-001, ENV-001.
+- AS-092: deferred, cosmetic.
+- UI-022: browser end-to-end tests.
+
+---
+
+## 2026-10-07 (cont. 2) — P2/P3 burn-down, schema parity, ratchet
+
+Branch `fix/p0-containment` (backend) and `feat/ui-voice-perf` (UI); nothing pushed.
+
+### Done
+- **AS-065:** SPIFFE SVIDs are verified by kid against the workspace bundle, and the tenancy context is set (`0b0ec03`).
+- **AS-076:** PSAT verification is never switched off by `ENVIRONMENT`; skipping it needs an explicit flag (`e65fff6`).
+- **AS-078:** admin WebAuthn and MFA status act in the signed-in workspace (`4fb6ccd`, `9291044`; UI `b1faa55`). Before this fix, an admin could get passkey-registration options for another workspace's account with the same email.
+- **AS-079:** platform rows are `workspace_id IS NULL`, with a CHECK against new system-workspace rows (055, `456ffd4`).
+- **AS-080:** `scripts/schema-parity.sh` shows that a fresh bootstrap and an upgraded DB end with the same schema. 069 adds the two indexes the upgrade path had missed (`456ffd4`).
+- **AS-081:** embedded SPIRE is refused at startup in production and staging (`deb5645`).
+- **AS-094:** dead config and code deleted, about 930 lines (`04eeb37`).
+- **AS-097:** expand step for `entra_tenant_id` (070, `a44fa5a`).
+- **AS-060:** the ADR records why four uniques stay global for now, and the steps to finish (`87aec78`).
+- **Ratchet:**
+  - It now skips RLS-only packages and statements handed to the scoped layer (`538b92d`, `ef6c39a`).
+  - SCIM writes moved onto the scoped layer (`24ef0e7`).
+  - 445 → 303.
+- **IGA FK catalog test** updated for 047 (`2bd9077`).
+
+- **Ratchet 303 → 175.** The admin controllers, the platform and end-user controllers, and the OAuth AS follow-up statements moved onto the scoped layer, plus most repositories. Statements that run before a workspace is known carry specific TENANT-EXEMPT reasons. The parallel agents found and fixed three cross-tenant or broken-flow bugs:
+  - AS-099: admin sign-up could take over another workspace's pending domain (`946237b`).
+  - AS-100: AD/Entra sync never created memberships (`64ccc89`).
+  - AS-101: end-user sign-up deleted other workspaces' pending registrations (`30d546a`).
+  Eight unrouted legacy `UserController` handlers were also deleted (`3dabc45`).
+- **After the agents:** the agent action guard is scoped (AS-102, `70ad2fe`). The voice repository rewrite an agent left uncommitted was verified and merged (`c992db2`). Platform and pre-session statements got specific exemptions (`ecfcb02`). Ratchet now 151.
+- **Interrupted:** two of the three agents hit the spend limit. Their committed work is merged and verified (build, vet, unit, flows, onboarding and flagsoff all pass). Left to do: `services/oauth_as_service.go`, `scope_resolver.go` and `governance_certify_service.go`, and `database/ciba_auth_repository.go` and `user_repository.go`.
+
+### Verification
+- Build, vet and unit tests pass.
+- The flows, onboarding, flagsoff and igagraph suites pass.
+- Migrations 055, 066–070 were rehearsed on clones of the scratch DB; all are idempotent.
+- Schema parity: fresh == upgraded.
+
+### Release notes (deploy)
+- **Migrations:**
+  - 055: platform rows. The `migrations:*` permissions are removed, and every workspace admin role gains `users:read` and `users:write`.
+  - 069: indexes.
+  - 070: `entra_tenant_id`, kept in sync with the old column by a trigger.
+- **New or changed settings:**
+  - `SPIRE_K8S_INSECURE_SKIP_TOKEN_VERIFY` and `SPIRE_DEV_MTLS_BYPASS`: development only.
+  - `ICP_SERVICE_URL` is required in production when SPIFFE SVIDs are used.
+  - `ENABLE_EMBEDDED_SPIRE` is refused in production and staging.
+  - `ADMIN_CROSS_TENANT_ACCESS` is removed; nothing read it.
+- **Admin MFA status:** send `workspace_id`. Without it, an email that exists in more than one workspace now gets a 400.
+
+### Needs the owner
+- AS-098: `.env` is tracked with dev secrets. Confirm that no environment uses these values, then untrack the file.
+- AS-081: fix or remove the embedded SPIRE control plane.
+- AS-015: retire legacy `/uflow/auth/ciba` (needs a Python SDK change).
+- AS-097: run the contract migration after the next deploy.
+- OPS-001: the deploy-on-push process.
+- ENV-001: the root-owned Go module cache (needs `sudo`).
+
+---
+
+## 2026-10-07 (cont.) — Data layer, auth P0/P1 remainders, IGA reads
+
+Same branch (`fix/p0-containment`), nothing pushed.
+
+### Done
+- **Scoped layer:**
+  - Legacy CIBA, device codes, TOTP devices, and the workspace-plane devices, CIBA and TOTP repositories (`b8cf865`, `4a4c2a2`, `5489e6f`, `84b80ac`).
+  - The unused `EndUserRepository` was deleted (`143f93d`).
+  - IGA graph and Kubernetes graph reads take the workspace from the tenant context and run under RLS (`28c92ca`, `b940571`).
+  - Ratchet 464 → 445.
+- **Auth and security:**
+  - AS-014 (`fa5a39c`)
+  - AS-044 and AS-015 (`53e8b81`)
+  - AS-018 (`09a8bff`)
+  - AS-025 (`21396a2`)
+  - AS-038 (`f77562e`)
+  - AS-064 (`ea07bb1`)
+  - AS-083 (`e7ead9d`)
+  - AS-095 (`6a243ce`)
+- **Fixes found while merging:**
+  - A `//` TENANT-EXEMPT note inside a SQL string broke admin sign-up (`6b5a98a`).
+  - The IGA FK catalog test now covers 047's `cloud_*` workspace keys (`2bd9077`).
+
+### Verification
+- Build, vet and unit tests pass.
+- The flows, onboarding, flagsoff and igagraph suites pass.
+- The ratchet is at 445 against a baseline of 446.
+- Migrations 066–068 were applied twice to a clone of the scratch DB: they apply cleanly and are idempotent.
+- `001_bootstrap.sql` applies to an empty DB and reaches the same end state.
+
+### Release notes (deploy)
+- **Migrations:**
+  - 066 adds `workspace_ciba_auth_requests.resource_server_id`.
+  - 067 adds `discovery_collector_tokens`.
+  - 068 adds `otp_entries.workspace_id` and `purpose`.
+- **Discovery collectors:** collectors without an actuation token stop reporting. To keep them reporting, do one of these:
+  - mint a collector token (`POST /authsec/discovery/collector-tokens`) and set it as `controlPlane.sourceToken`;
+  - set `DISCOVERY_ALLOW_UNAUTHENTICATED_INGRESS=true`.
+- **CIBA:** workspace CIBA needs HTTP Basic client authentication. `CIBA_ALLOW_UNAUTHENTICATED_CLIENTS=true` is a temporary opt-out.
+- **Registration:** `POST /uflow/user/register` now only starts registration. The account is created by `/user/register/complete` with the emailed OTP.
+- **OTP codes:** codes issued before the upgrade no longer verify. Users request a new one.
+- **Host checks:** Host, Origin and `X-Forwarded-Host` count only for allow-listed hosts. Set `CORS_ALLOW_ORIGIN`, `BASE_URL` and `TRUSTED_PROXIES` correctly.
+
+### Still open
+- AS-015: retire legacy `/uflow/auth/ciba` (the Python SDK has no client secret).
+- AS-060, 065, 076, 078, 079, 080, 081, 094, 097.
+- The ratchet's remaining 445 raw statements.
+- UI-033, OPS-001, ENV-001.
+
+---
+
+## 2026-10-07 — Voice tables, row-level security, remaining areas and P2/P3
+
+**Owner asked for:** build the voice-auth tables; switch on RLS; move the remaining areas onto the scoped layer and work through P2/P3. Committed locally on `fix/p0-containment` (backend) and `feat/ui-voice-perf` (UI, stacked on `fix/ui-integrations`); nothing pushed.
+
+### Done
+- **Voice auth (AS-047), `208d8e7`:**
+  - Migration 053 adds `voice_active_sessions`.
+  - The voice flow was unsafe as well as broken, so voice backends must now authenticate as an OAuth client of the workspace, and a session belongs to its client.
+  - UI watcher re-mounted (`d773999`).
+- **Row-level security (AS-050), `978e8d7`:**
+  - Migration 054 enables and forces the `tenancy_isolation` policy on all 163 workspace tables.
+  - `internal/tenancy` transactions set `app.workspace_id` and `SET LOCAL ROLE authsec_tenant`, because superusers bypass RLS.
+  - A test fails if any workspace table lacks the policy.
+- **Multi-tenant sign-up (AS-030), `c9b6b11`:** single-tenant guard removed; a second workspace signs up end to end.
+- **Scoped-layer migration:**
+  - Admin users, seeding, the workspace registry, end-user lookups and sign-up writes (`f397c7a`, `fd643db`).
+  - Ratchet 482 → 464.
+- **P1/P2 fixes:** AS-033, 034, 004, 036, 042, 061, 067, 071, 072, 073, 075, 082, 096. See `ISSUES.md`.
+- **UI:** route-level code splitting (UI-034).
+
+### Interrupted
+- All three parallel agents hit the account spend limit.
+- Their committed work was merged and verified after each set (build, vet, unit, all integration suites, upgrade rehearsals 053, 054 and 065, each 0 failed).
+- Small uncommitted remainders were finished and verified here: the AS-061 connection-grant check, and the SSRF client.
+- One large uncommitted remainder was **discarded**: the database/ device, CIBA, TOTP and OTP repositories moved onto the scoped layer. It conflicted with the newly merged TOTP lockout code and was untested. That migration is still to do.
+
+### Release notes (deploy)
+- **Row-level security:** run `scripts/create-tenant-role.sql` if migration 054 logged that it could not create `authsec_tenant`.
+- **New settings:**
+  - `TRUSTED_PROXIES` (unset means forwarding headers are ignored)
+  - `AUTH_LOCKOUT_MAX_FAILURES`, `AUTH_LOCKOUT_WINDOW`, `AUTH_LOCKOUT_DURATION`
+  - `METRICS_TOKEN` or `METRICS_ADDR` (otherwise metrics are not exposed)
+  - `OUTBOUND_ALLOWED_HOSTS`, `OUTBOUND_ALLOWED_CIDRS`
+- **Startup now refuses to run when:**
+  - `ENVIRONMENT=production` and the native signing key is ephemeral, unless Vault works or `NATIVE_RSA_PRIVATE_KEY_B64` is set;
+  - XAA issuance flags are on without `XAA_NATIVE_SEALER`.
+- **Behaviour changes for clients:**
+  - Voice assistant backends must use OAuth client credentials.
+  - Session tokens are now class-bound: admin tokens work on the console, end-user tokens on self-service, SDK tokens on the SDK surface. Tokens issued before this change keep working until they expire.
+
+### Still open
+- AS-014: per-workspace collector credentials.
+- AS-015/044: CIBA client authentication.
+- AS-018, AS-025, AS-038: remaining parts.
+- AS-060: global `resource_uri` and issuer uniques.
+- AS-064, 065, 076, 078, 079, 080, 081, 083, 094, 095, 097.
+- The ratchet's remaining 464 raw statements.
+- UI-033: `Tenant*` naming.
+- OPS-001: deploy-on-push process.
+- ENV-001: local Go module cache owned by root (needs your `sudo`).
+
+## 2026-10-06 (cont.) — Phases 1–6 run back to back (owner: "complete each phase and commit, do not push")
+
+**Branches (local only, nothing pushed):**
+- Backend: `fix/p0-containment`, about 50 commits on top of `authsec-staging`.
+- UI: `fix/p0-admin-login-ticket` → `chore/ui-stabilize` → `feat/ui-tenancy` → `fix/ui-integrations`. Each branch is stacked on the previous one; the tip is `fix/ui-integrations`.
+
+### By phase
+- **P0 containment (before Phase 1).**
+  - Sign-in chain: login tickets.
+  - The token's workspace is enforced on path, query and body.
+  - User management and SCIM need owner/admin.
+  - Global listings are scoped, and password hashes are never serialized.
+  - OTPs no longer echoed; the TOTP key and its rotation are fixed; secrets are out of logs.
+  - Token exchange requires client authentication.
+  - Issuers and SPIFFE providers are scoped to a workspace.
+  - SAML signatures are verified; legacy CIBA, registration and OIDC paths are scoped.
+  - Discovery, provisioning, redirect approval, extsvc and delegation-token lookups stay in their workspace.
+  - OIDC sign-in is a first factor only.
+  - Policies enforced by default; session revocation and logout; audit persistence; one reconciler leader across replicas.
+- **Phase 1:** `docs/adr/0001-tenancy-model.md`.
+- **Phase 2:**
+  - Default tests green without local services.
+  - `go mod tidy`.
+  - `deploy/dev` stack (Postgres, Hydra, Vault) and a `Makefile`.
+  - `/authsec/healthz` and `/authsec/readyz`.
+  - `internal/tenancy` scoped layer.
+  - `TwoTenants` isolation harness.
+  - TENANT-EXEMPT ratchet wired into CI.
+  - UI type-check and lint at 0 errors.
+- **Phase 3:**
+  - Migrations 045–048: missing `workspace_id` columns, backfill with orphan report, FKs and NOT NULL added NOT VALID, per-workspace uniques. Plus 050 (session revocation), 051 (audit append-only) and 052 (`users:delete` for admins).
+  - Per-request membership re-check.
+  - Users and identity domain moved onto the scoped layer.
+  - Agent/resource-plane fixes.
+  - Isolation tests per endpoint for users, groups, RBAC, password reset, sync/SCIM and the agent plane.
+  - Ratchet 487 → 482.
+- **Phase 4 (UI):**
+  - Workspace from token claims.
+  - Full cache reset on identity change, cross-tab and logout, plus server-side logout.
+  - Workspace switcher (backed by `GET /authsec/workspaces`).
+  - OIDC `state_token`.
+  - About 12 broken integrations fixed.
+  - Global 401 handler, not-found states, HubSpot token leak closed.
+- **Phase 6 (in part):**
+  - `tests/integration/flows/e2e_agent_books_flight_test.go`: the two-tenant flight-booking story.
+  - Unscoped-SQL sweep: 482 statements remain outside the layer. By area: database 107, igaread 84, controllers/admin 62, services 51, controllers/platform 47, repository 46, other 85. 9 TENANT-EXEMPT markers.
+
+### Verification at the end
+- **Backend:** `go build`, `go vet` and `go test ./...` green. Integration flows, onboarding and flags-off green. Ratchet at its baseline.
+- **Upgrade rehearsals on the scratch DB:** 043 → 052 applied, 0 failed.
+- **UI:** type-check 0 errors, lint 0 errors (572 warnings), 26 files / 165 tests pass, build OK.
+
+### Not done / needs a decision
+- **RLS** is not enabled on tables yet. It needs the application/owner DB role split (ADR §4.4) and a deploy change.
+- **Caller migration** is finished for users and identity only. The other domains are still scoped by hand, and the ratchet tracks them.
+- **Interrupted agents.** Two delegated agents stopped on the account spend limit. Their committed work was merged and verified; the users-domain work-in-progress was finished by hand and verified.
+- **Phase 5 leftovers:** open P2/P3 rows in `docs/ISSUES.md`, e.g. AS-047 voice tables, AS-060 global `resource_uri`/issuer squatting, AS-079 platform-row convention, AS-080 bootstrap drift, AS-014 per-workspace collector credentials, AS-015 legacy CIBA client authentication.
+- **Release notes required:**
+  - TOTP key must be valid hex in production (startup fails otherwise).
+  - Collectors with actuation must set `controlPlane.sourceToken`.
+  - The Python SDK's legacy CIBA call must send `client_id`.
+  - SAML IdPs must sign responses.
+  - Run `scripts/tenancy-validate.sql` after the 047 deploy.
+  - Test passkey registration on Windows Hello.
+- **Housekeeping:**
+  - Agent worktrees remain under `.claude/worktrees/`, which git ignores; remove them with `git worktree remove`.
+  - Containers still running: `authsec-audit-pg` and the `authsec-dev` compose stack.
+
+## 2026-10-06 (cont.) — P0 containment track, item 1: interactive sign-in chain (AS-001/002/003/029, UI-001)
+
+**Status:** done, pending your review. **Uncommitted** on backend branch `fix/p0-containment` and UI branch `fix/p0-admin-login-ticket`. Nothing is pushed. You approved the two edits the permission classifier had blocked.
+
+### What changed
+- **Login tickets.**
+  - Migration `101_login_tickets.sql`, with the same end state in `001_bootstrap.sql`, plus a new package `internal/logintickets`.
+  - Tickets are opaque, stored as SHA-256 hashes, last 15 minutes, are single use, and carry a realm (`admin` or `enduser`).
+- **Issued only after a server-verified first factor:**
+  - admin: `/uflow/login`, `/auth/admin/login` (when MFA is required), the OIDC admin login response
+  - end user: `/uflow/user/login`, `/uflow/user/oidc/login`, the SAML ACS redirect
+  - **Never** issued by the anonymous `/uflow/user/saml/login` (AS-029).
+- **`middlewares.RequireLoginSubject`** gates every enrolment and verification route under `/authsec/webauthn/*`: admin, end-user, legacy, biometric, TOTP and SMS.
+  - It accepts a ticket or a Bearer session, and body or query `email`, `workspace_id` and `user_id` must match it.
+  - A 2xx from a verify route marks the ticket as MFA-verified.
+  - `mfa/status` and `mfa/loginStatus` stay open for the Python SDK.
+- **Both `webauthn-callback` endpoints** mint only by consuming a verified ticket of their realm, for that ticket's subject.
+- **The forged-attestation fallback is deleted** (`handlers/fallback.go`, plus its uses in all three handlers).
+- **CORS** allows `X-Login-Ticket`.
+- **UI:**
+  - `src/auth/loginTicket.ts` provides `withLoginTicket`, applied to `baseApi`, `userAuthApi` and `oidcApi`: it sends the header on MFA and callback URLs, captures `login_ticket` from responses, and clears the ticket after a successful callback.
+  - `main.tsx` picks up the ticket from the SAML redirect URL.
+
+### Verification
+- **Backend:** 9 new integration tests (`tests/integration/flows/{admin,enduser}_login_ticket_test.go`), all pass.
+  - Full flows suite: only the pre-existing `Test_MCP_RegisterDiscoverActivate` failure.
+  - `go test ./...`: only the 3 known "no Postgres on :5432" failures.
+  - `go build` and `go vet` are clean; gofmt is clean on every changed hunk.
+- **Upgrade rehearsal:** the audit's scratch DB (at 042, with data) applied 043 with "1 applied, 0 failed". The Phase-0 live exploit now returns 401.
+- **UI:** 5 new vitest tests; full suite 14 files / 123 tests pass; `vite build` OK; tsc error count unchanged (197, pre-existing); no new lint errors.
+- **Not tested end to end:** a real browser WebAuthn ceremony, and a SAML IdP round-trip. ⚠️ Check Windows Hello passkey registration manually; the deleted fallback existed for it.
+
+### Next
+- Review, then commit (one commit per repo).
+- Continue the P0 list: AS-006 (body `workspace_id`), AS-009, AS-019, AS-007/008/023, AS-010/011/012, …
+
+## 2026-10-06 — Phase 0: Discovery and audit (read-only)
+
+**Status:** complete, awaiting approval to start Phase 1 (ADR-0001).
+
+### Done
+- Read CLAUDE.md and AGENTS.md. The workspace-level `../AGENTS.md` and `../.claude/DEFINITION-OF-DONE.md` that AGENTS.md references **do not exist** in `merger/`.
+- Mapped both repos: stack, entry points, config, DB, migrations, auth, tests, CI. Filled the `<!-- FILL -->` sections of CLAUDE.md.
+- Built, vetted, tested and ran the backend against a scratch Postgres 16 container (`authsec-audit-pg`, `127.0.0.1:55432`, throwaway). Built, tested, type-checked, linted and started the frontend dev server.
+- Ran a smoke test over HTTP: register → OTP → complete → login for workspace A. To get a second workspace past the single-tenant guard, flipped A's `status` to `inactive` **in the scratch DB only**, registered B, then flipped A back.
+- Reproduced three cross-tenant P0s at runtime (AS-001, AS-006, AS-009) and several other issues.
+- Traced the multi-tenancy history: DB-per-tenant → extracted to `mt-plugin` (`764a654`) → single-tenant substrate (`69c82a3`) → tenant model removed, workspace replaces tenant (`05e289d`).
+- Ran parallel read-only audit agents (schema, request context, data access ×6 parts, tokens and runtime authz, core flows ×4 parts, frontend). Their reports are kept verbatim under `docs/audit/`.
+- Wrote `docs/AUDIT.md`, `docs/ISSUES.md` (about 95 rows) and this log.
+
+### Learned
+- The tenant is the **workspace**. A shared DB with `workspace_id` is about 82% present at the schema level, but enforcement is manual, inconsistent and absent in the older uflow, WebAuthn, CIBA, OIDC and SAML code.
+- The admin UI login currently depends on the AS-001 bypass, so it has to be fixed together with the UI (UI-001).
+- Without Vault, every backend restart invalidates all tokens (ephemeral native keys and HS secrets); expect this in local testing.
+- Admin-auth endpoints are rate-limited to 5/min per IP across register and login, which matters when scripting tests.
+
+### Housekeeping
+- `go.mod` was found modified mid-session (a `go mod tidy`-style reclassification, likely from an audit sub-agent). It was **reverted** to HEAD to keep Phase 0 read-only, and logged as AS-091.
+- The pre-existing uncommitted edit to `CLAUDE.md` (the new template) was kept; only its FILL sections were completed.
+- The scratch container `authsec-audit-pg` is still present (data: the two test workspaces). Remove with `docker rm -f authsec-audit-pg` when no longer needed.
+- Nothing was committed or pushed.
+
+### Next
+- Waiting for approval. Proposed next steps:
+  1. Decide whether P0 containment (AS-001…AS-028) runs **before** Phase 1/2 as a hotfix track, or inside Phase 3/5.
+  2. Phase 1: ADR-0001 tenancy model.
+- Open questions for the user:
+  - Can a user belong to several workspaces (memberships plus switching), or exactly one?
+  - Is a platform super-admin realm needed?
+  - Are the legacy uflow, CIBA and oocmgr endpoints still used by any client other than this UI (SDKs, demos)? If not, delete them rather than fix them.
+  - Is the TOTP key typo (AS-020) still live in prod, and can we schedule a re-encryption migration?
+  - Should `ENV-001` (root-owned Go module cache) be fixed with `sudo chown`?

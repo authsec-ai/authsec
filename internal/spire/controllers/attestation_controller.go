@@ -11,7 +11,7 @@ import (
 	"github.com/authsec-ai/authsec/internal/spire/services"
 )
 
-// AttestationController handles attestation requests
+// AttestationController handles direct workload attestation (mTLS).
 type AttestationController struct {
 	service *services.AttestationService
 	logger  *logrus.Entry
@@ -19,51 +19,40 @@ type AttestationController struct {
 
 // NewAttestationController creates a new attestation controller
 func NewAttestationController(service *services.AttestationService, logger *logrus.Entry) *AttestationController {
-	return &AttestationController{
-		service: service,
-		logger:  logger,
-	}
+	return &AttestationController{service: service, logger: logger}
 }
 
-// Attest handles POST /spire/v1/attest
+// Attest handles POST /spiresvc/v1/attest. The workspace is the client
+// certificate's; the PKI mount is the workspace's own.
 func (ctrl *AttestationController) Attest(c *gin.Context) {
 	var req dto.AttestRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		ctrl.sendError(c, errors.NewBadRequestError("Invalid request body", err))
+		sendError(c, ctrl.logger, errors.NewBadRequestError("Invalid request body", err))
 		return
 	}
-
-	// Validate request
-	if req.WorkspaceID == "" {
-		ctrl.sendError(c, errors.NewBadRequestError("workspace_id is required", nil))
+	if err := sameWorkspace(c, req.WorkspaceID); err != nil {
+		sendError(c, ctrl.logger, err)
 		return
 	}
 	if req.CSR == "" {
-		ctrl.sendError(c, errors.NewBadRequestError("csr is required", nil))
+		sendError(c, ctrl.logger, errors.NewBadRequestError("csr is required", nil))
 		return
 	}
 	if req.AttestationType == "" {
-		ctrl.sendError(c, errors.NewBadRequestError("attestation_type is required", nil))
+		sendError(c, ctrl.logger, errors.NewBadRequestError("attestation_type is required", nil))
 		return
 	}
-
-	// Call service
-	serviceReq := &services.AttestRequest{
-		WorkspaceID:        req.WorkspaceID,
+	resp, err := ctrl.service.Attest(c.Request.Context(), &services.AttestRequest{
 		CSR:             req.CSR,
 		AttestationType: req.AttestationType,
 		Selectors:       req.Selectors,
-		VaultMount:      req.VaultMount,
 		IPAddress:       c.ClientIP(),
 		UserAgent:       c.Request.UserAgent(),
-	}
-
-	resp, err := ctrl.service.Attest(c.Request.Context(), serviceReq)
+	})
 	if err != nil {
-		ctrl.sendError(c, err)
+		sendError(c, ctrl.logger, err)
 		return
 	}
-
 	c.JSON(http.StatusOK, dto.AttestResponse{
 		Certificate:  resp.Certificate,
 		CAChain:      resp.CAChain,
@@ -71,25 +60,5 @@ func (ctrl *AttestationController) Attest(c *gin.Context) {
 		ExpiresAt:    resp.ExpiresAt,
 		WorkloadID:   resp.WorkloadID,
 		SerialNumber: resp.SerialNumber,
-	})
-}
-
-// sendError sends an error response
-func (ctrl *AttestationController) sendError(c *gin.Context, err error) {
-	appErr, ok := err.(*errors.AppError)
-	if !ok {
-		appErr = errors.NewInternalError("Internal server error", err)
-	}
-
-	ctrl.logger.WithFields(logrus.Fields{
-		"code":    appErr.Code,
-		"message": appErr.Message,
-	}).WithError(appErr.Err).Error("Attestation request failed")
-
-	c.JSON(appErr.Status, dto.ErrorResponse{
-		Error: dto.ErrorDetail{
-			Code:    appErr.Code,
-			Message: appErr.Message,
-		},
 	})
 }

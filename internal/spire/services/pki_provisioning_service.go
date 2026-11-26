@@ -15,23 +15,23 @@ import (
 
 // PKIProvisioningService handles PKI provisioning for tenants
 type PKIProvisioningService struct {
-	workspaceRepo  repositories.WorkspaceRepository
-	vaultClient *vault.Client
-	logger      *logrus.Entry
+	workspaceRepo repositories.WorkspaceRepository
+	vaultClient   *vault.Client
+	logger        *logrus.Entry
 }
 
 // NewPKIProvisioningService creates a new PKI provisioning service
 func NewPKIProvisioningService(workspaceRepo repositories.WorkspaceRepository, vaultClient *vault.Client, logger *logrus.Entry) *PKIProvisioningService {
 	return &PKIProvisioningService{
-		workspaceRepo:  workspaceRepo,
-		vaultClient: vaultClient,
-		logger:      logger,
+		workspaceRepo: workspaceRepo,
+		vaultClient:   vaultClient,
+		logger:        logger,
 	}
 }
 
 // ProvisionPKIRequest represents a request to provision PKI for a tenant
 type ProvisionPKIRequest struct {
-	WorkspaceID       string
+	WorkspaceID    string
 	CommonName     string
 	AllowedDomains string
 	TTL            string
@@ -40,7 +40,7 @@ type ProvisionPKIRequest struct {
 
 // ProvisionPKIResponse represents the response after provisioning PKI
 type ProvisionPKIResponse struct {
-	WorkspaceID    string `json:"workspace_id"`
+	WorkspaceID string `json:"workspace_id"`
 	PKIMount    string `json:"pki_mount"`
 	CACert      string `json:"ca_cert"`
 	RoleCreated string `json:"role_created"`
@@ -50,8 +50,8 @@ type ProvisionPKIResponse struct {
 // ProvisionPKI provisions a PKI backend for a tenant in Vault
 func (s *PKIProvisioningService) ProvisionPKI(ctx context.Context, req *ProvisionPKIRequest) (*ProvisionPKIResponse, error) {
 	s.logger.WithFields(logrus.Fields{
-		"workspace_id":   req.WorkspaceID,
-		"common_name": req.CommonName,
+		"workspace_id": req.WorkspaceID,
+		"common_name":  req.CommonName,
 	}).Info("Starting PKI provisioning")
 
 	// Validate request
@@ -60,6 +60,9 @@ func (s *PKIProvisioningService) ProvisionPKI(ctx context.Context, req *Provisio
 	}
 	if req.CommonName == "" {
 		return nil, errors.NewBadRequestError("common_name is required", nil)
+	}
+	if !s.vaultClient.Available() {
+		return nil, vault.ErrUnavailable
 	}
 
 	// 1. Determine PKI mount path (e.g., pki/tenant-id or pki/domain)
@@ -141,14 +144,14 @@ func (s *PKIProvisioningService) ProvisionPKI(ctx context.Context, req *Provisio
 		}).WithError(err).Warn("Tenant not found, skipping vault_mount update")
 	} else {
 		// Update tenant's vault_mount with retry logic
-		tenant.VaultMount = pkiMount
+		_ = tenant
 		err = s.retryOperation(ctx, "update tenant vault_mount", func() error {
-			return s.workspaceRepo.Update(ctx, tenant)
+			return s.workspaceRepo.UpdateVaultMount(ctx, req.WorkspaceID, pkiMount)
 		})
 		if err != nil {
 			s.logger.WithFields(logrus.Fields{
 				"workspace_id": req.WorkspaceID,
-				"pki_mount": pkiMount,
+				"pki_mount":    pkiMount,
 			}).WithError(err).Error("Failed to update tenant vault_mount after retries")
 			// CRITICAL: PKI is fully provisioned in Vault but DB update failed
 			// Return descriptive error so admin knows to retry the provisioning call
@@ -160,18 +163,18 @@ func (s *PKIProvisioningService) ProvisionPKI(ctx context.Context, req *Provisio
 			)
 		}
 		s.logger.WithFields(logrus.Fields{
-			"workspace_id":   req.WorkspaceID,
-			"vault_mount": pkiMount,
+			"workspace_id": req.WorkspaceID,
+			"vault_mount":  pkiMount,
 		}).Info("Updated tenant vault_mount")
 	}
 
 	s.logger.WithFields(logrus.Fields{
 		"workspace_id": req.WorkspaceID,
-		"pki_mount": pkiMount,
+		"pki_mount":    pkiMount,
 	}).Info("PKI provisioning completed successfully")
 
 	return &ProvisionPKIResponse{
-		WorkspaceID:    req.WorkspaceID,
+		WorkspaceID: req.WorkspaceID,
 		PKIMount:    pkiMount,
 		CACert:      caCert,
 		RoleCreated: "agent, workload",

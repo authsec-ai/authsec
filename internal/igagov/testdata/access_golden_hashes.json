@@ -1,0 +1,157 @@
+{
+  "access.s3.allow_read_bucket": {
+    "document_hash": "sha256:173032387f5758ba7f650b51a76d1a604d679b867cbbdfda8927230e3969b90d",
+    "actions": [
+      "s3:GetObject",
+      "s3:GetObjectVersion",
+      "s3:ListBucket"
+    ],
+    "resources": [
+      "arn:aws:s3:::acme-invoices",
+      "arn:aws:s3:::acme-invoices/*"
+    ],
+    "sentence": "Allow read on s3://acme-invoices/* for ApInvoiceReader until 2026-11-01 00:00 UTC."
+  },
+  "access.s3.allow_read_write_delete_prefix": {
+    "document_hash": "sha256:d93c59ec68acd5f5f8bf9518d5793e23dfe8c9ec6e1c05e9e610b39c9b201917",
+    "actions": [
+      "s3:AbortMultipartUpload",
+      "s3:DeleteObject",
+      "s3:DeleteObjectVersion",
+      "s3:GetObject",
+      "s3:GetObjectVersion",
+      "s3:ListBucket",
+      "s3:PutObject"
+    ],
+    "resources": [
+      "arn:aws:s3:::acme-invoices",
+      "arn:aws:s3:::acme-invoices/invoices/*"
+    ],
+    "sentence": "Allow delete, read, write on s3://acme-invoices/invoices/* for ApBatchJob until 2026-11-01 00:00 UTC."
+  },
+  "access.s3.allow_write_start": {
+    "document_hash": "sha256:3c6a9ea34d2029d76688b880ee5de37e21f3d73c85580cb88b4508e73b946cb1",
+    "actions": [
+      "s3:AbortMultipartUpload",
+      "s3:PutObject"
+    ],
+    "resources": [
+      "arn:aws:s3:::acme-invoices/*"
+    ],
+    "sentence": "Allow write on s3://acme-invoices/* for ApBatchJob from 2026-10-20 00:00 UTC until 2026-11-01 00:00 UTC."
+  },
+  "access.s3.block_all_bucket_no_end": {
+    "document_hash": "sha256:a4f89a0e6b6c05ee9b03b11a4e7869d92040c3350c3a089efa3257350d34dd43",
+    "actions": [
+      "s3:*"
+    ],
+    "resources": [
+      "arn:aws:s3:::acme-invoices",
+      "arn:aws:s3:::acme-invoices/*"
+    ],
+    "sentence": "Block all access on s3://acme-invoices/* for ApInvoiceReader, with no end date."
+  },
+  "access.s3.block_all_prefix": {
+    "document_hash": "sha256:5089601e9f8d68d344810ae76d2563722747dd7244351e8dc4fea45f7666a719",
+    "actions": [
+      "s3:*",
+      "s3:ListBucket",
+      "s3:ListBucketMultipartUploads",
+      "s3:ListBucketVersions"
+    ],
+    "resources": [
+      "arn:aws:s3:::acme-invoices",
+      "arn:aws:s3:::acme-invoices/invoices/*"
+    ],
+    "sentence": "Block all access on s3://acme-invoices/invoices/* for ApInvoiceReader until 2026-11-01 00:00 UTC."
+  },
+  "access.s3.block_read_gov_partition": {
+    "document_hash": "sha256:ba7e8c1a3221a246c220ebd6436339695d8afa27e27b8f34c093a102188d5d21",
+    "actions": [
+      "s3:GetObject",
+      "s3:GetObjectAcl",
+      "s3:GetObjectAttributes",
+      "s3:GetObjectLegalHold",
+      "s3:GetObjectRetention",
+      "s3:GetObjectTagging",
+      "s3:GetObjectVersion",
+      "s3:GetObjectVersionAcl",
+      "s3:GetObjectVersionAttributes",
+      "s3:GetObjectVersionTagging",
+      "s3:ListBucket",
+      "s3:ListBucketMultipartUploads",
+      "s3:ListBucketVersions"
+    ],
+    "resources": [
+      "arn:aws-us-gov:s3:::acme-invoices",
+      "arn:aws-us-gov:s3:::acme-invoices/invoices/*"
+    ],
+    "sentence": "Block read on s3://acme-invoices/invoices/* for ApInvoiceReader until 2026-11-01 00:00 UTC."
+  },
+  "access.s3.block_read_long_prefix": {
+    "document_hash": "sha256:7dc0c99edc2b6fba11dc061b9338e0b546ed7be31b3e382641a15d628dac7dd2",
+    "actions": [
+      "s3:GetObject",
+      "s3:GetObjectAcl",
+      "s3:GetObjectAttributes",
+      "s3:GetObjectLegalHold",
+      "s3:GetObjectRetention",
+      "s3:GetObjectTagging",
+      "s3:GetObjectVersion",
+      "s3:GetObjectVersionAcl",
+      "s3:GetObjectVersionAttributes",
+      "s3:GetObjectVersionTagging",
+      "s3:ListBucket",
+      "s3:ListBucketMultipartUploads",
+      "s3:ListBucketVersions"
+    ],
+    "resources": [
+      "arn:aws:s3:::acme-invoices",
+      "arn:aws:s3:::acme-invoices/abcdefghijabcdefghijabcdefghijabcdefghijabcdefghij_reports_/*"
+    ],
+    "sentence": "Block read on s3://acme-invoices/abcdefghijabcdefghijabcdefghijabcdefghijabcdefghij_reports_/* for ApInvoiceReader until 2026-11-01 00:00 UTC."
+  },
+  "access.s3.block_read_prefix": {
+    "document_hash": "sha256:a00878491891b53365efd7cc559d1b39ed148349639074d2627230ca53e4f8ad",
+    "actions": [
+      "s3:GetObject",
+      "s3:GetObjectAcl",
+      "s3:GetObjectAttributes",
+      "s3:GetObjectLegalHold",
+      "s3:GetObjectRetention",
+      "s3:GetObjectTagging",
+      "s3:GetObjectVersion",
+      "s3:GetObjectVersionAcl",
+      "s3:GetObjectVersionAttributes",
+      "s3:GetObjectVersionTagging",
+      "s3:ListBucket",
+      "s3:ListBucketMultipartUploads",
+      "s3:ListBucketVersions"
+    ],
+    "resources": [
+      "arn:aws:s3:::acme-invoices",
+      "arn:aws:s3:::acme-invoices/invoices/*"
+    ],
+    "sentence": "Block read on s3://acme-invoices/invoices/* for ApInvoiceReader until 2026-11-01 00:00 UTC."
+  },
+  "access.s3.block_write_prefix": {
+    "document_hash": "sha256:65b4799206f1fc4a49a189fbf38efe5ff08d5a36cacb9700c4a54cd855fad2f3",
+    "actions": [
+      "s3:AbortMultipartUpload",
+      "s3:DeleteObjectTagging",
+      "s3:DeleteObjectVersionTagging",
+      "s3:PutObject",
+      "s3:PutObjectAcl",
+      "s3:PutObjectLegalHold",
+      "s3:PutObjectRetention",
+      "s3:PutObjectTagging",
+      "s3:PutObjectVersionAcl",
+      "s3:PutObjectVersionTagging",
+      "s3:RestoreObject"
+    ],
+    "resources": [
+      "arn:aws:s3:::acme-invoices/invoices/*"
+    ],
+    "sentence": "Block write on s3://acme-invoices/invoices/* for ApInvoiceReader, ApBatchJob until 2026-11-01 00:00 UTC."
+  }
+}

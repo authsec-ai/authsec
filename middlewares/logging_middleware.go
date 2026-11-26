@@ -1,8 +1,11 @@
 package middlewares
 
 import (
+	"net/http"
+
 	"encoding/json"
 	"fmt"
+	"github.com/authsec-ai/authsec/config"
 	"os"
 	"strings"
 	"time"
@@ -108,7 +111,7 @@ func AuthLoggingMiddleware(serviceName string) gin.HandlerFunc {
 		duration := time.Since(start)
 
 		// Extract context values (set by your existing AuthMiddleware)
-		workspaceID := c.GetString("workspace_id")
+		workspaceID := WorkspaceIDString(c)
 		userID := c.GetString("user_id")
 		userEmail := c.GetString("email_id")
 
@@ -227,7 +230,7 @@ type AuditCorrelation struct {
 //	middlewares.Audit(c, "role", roleID, "update", changes)
 func Audit(c *gin.Context, objectType string, objectID string, actionType string, changes *AuditChanges) {
 	// Extract context values
-	workspaceID := c.GetString("workspace_id")
+	workspaceID := WorkspaceIDString(c)
 	userID := c.GetString("user_id")
 	userEmail := c.GetString("email_id")
 	reqID := c.GetString("request_id") // From RequestIDMiddleware
@@ -280,6 +283,21 @@ func Audit(c *gin.Context, objectType string, objectID string, actionType string
 	}
 
 	printJSON(entry)
+
+	// Persist to audit_events so the action appears in the workspace's audit
+	// log; stdout alone never reached it (AS-049).
+	if config.AuditLogger != nil {
+		persistedWS := workspaceID
+		if persistedWS == "unknown_workspace" {
+			persistedWS = ""
+		}
+		var before, after interface{}
+		if changes != nil {
+			before, after = changes.Before, changes.After
+		}
+		config.AuditLogger.LogAdminAction(reqID, persistedWS, userID, actionType, objectType, objectID,
+			c.Request.Method, c.FullPath(), c.ClientIP(), c.Request.UserAgent(), http.StatusOK, 0, before, after, "")
+	}
 }
 
 // --- Helper ---

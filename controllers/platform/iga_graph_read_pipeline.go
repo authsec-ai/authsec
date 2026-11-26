@@ -13,8 +13,8 @@ import (
 // Pipeline and coverage (§5.3 Integration, scan and pipeline; §2.14.7,
 // §2.14.13; T2.3; D-55..D-59, D-72, D-82, D-92).
 //
-// Both run behind serve(): 503 graph_unavailable while IGA_GRAPH_PROJECTION is
-// off or misconfigured (D-10, D-11) -- with the switch off there is no barrier,
+// Both run behind serve(): 503 graph_unavailable while the graph pipeline is
+// off or misconfigured (D-10, D-11) -- without a verified schema there is no barrier,
 // no job and no publication, so every account would sit in "first publication
 // pending" forever, which is a lie the Unavailable state does not tell. Both
 // read inside ONE §5.1 snapshot, so the barrier, the runs and the revision they
@@ -35,7 +35,7 @@ func (ctl *IGAGraphReadController) GetPipeline(c *gin.Context) {
 			return nil, perr
 		}
 		var body igaread.Envelope
-		err := g.Reader.Read(c.Request.Context(), g.WS, igaread.Pin{}, func(q *igaread.Query) error {
+		err := g.Reader.Read(c.Request.Context(), igaread.Pin{}, func(q *igaread.Query) error {
 			view, err := q.Pipeline()
 			if err != nil {
 				return err
@@ -68,7 +68,7 @@ func (ctl *IGAGraphReadController) GetCoverage(c *gin.Context) {
 			return nil, perr
 		}
 		var body igaread.Envelope
-		err := g.Reader.Read(c.Request.Context(), g.WS, igaread.Pin{Rev: rev}, func(q *igaread.Query) error {
+		err := g.Reader.Read(c.Request.Context(), igaread.Pin{Rev: rev}, func(q *igaread.Query) error {
 			data, err := q.Coverage(accounts)
 			if err != nil {
 				return err

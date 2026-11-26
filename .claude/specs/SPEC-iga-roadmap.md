@@ -14,7 +14,7 @@
 > [SPEC-iga-phase3-policy.md](SPEC-iga-phase3-policy.md); R1b, R1k, R2 and R3
 > need their own specs. Phase 3 is an independent policy product (its own
 > `iga_gov_*` tables); it does not extend the Kubernetes agent-lifecycle
-> stack, whose disposition is
+> stack, which is removed without a compatibility policy writer under
 > [PLAN-existing-policy-code-disposition.md](PLAN-existing-policy-code-disposition.md).
 >
 > Product context: [SPEC-agentic-access-management.md](SPEC-agentic-access-management.md).

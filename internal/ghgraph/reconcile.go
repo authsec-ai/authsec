@@ -1,10 +1,12 @@
 package ghgraph
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -95,7 +97,7 @@ func (rc *Reconciler) Reconcile(tx *gorm.DB, in ReconcileInput) (*ReconcileResul
 	}
 
 	retired, err := RetireUnsupported(tx, in.WorkspaceID,
-		"s2.integration_id = ?", in.Scope.IntegrationID, at)
+		SourceIntegration, in.Scope.IntegrationID, at)
 	if err != nil {
 		return nil, fmt.Errorf("retire unsupported: %w", err)
 	}
@@ -109,15 +111,30 @@ func (rc *Reconciler) Reconcile(tx *gorm.DB, in ReconcileInput) (*ReconcileResul
 // partitions most in need of reconciling are the ones the scan no longer
 // mentions: a repository dropped from the installation appears nowhere in it.
 func (rc *Reconciler) partitions(tx *gorm.DB, in ReconcileInput) ([]string, error) {
-	var keys []string
-	if err := tx.Raw(`
+	ctx, q, err := txTenant(tx, in.WorkspaceID)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := tenancy.QueryContext(ctx, q, `
 		SELECT partition_key FROM iga_object_support
-		 WHERE workspace_id = ? AND integration_id = ? AND state <> ?
+		 WHERE workspace_id = $1 AND integration_id = $2 AND state <> $3
 		UNION
 		SELECT partition_key FROM iga_access_edges
-		 WHERE workspace_id = ? AND integration_id = ? AND state <> ?`,
-		in.WorkspaceID, in.Scope.IntegrationID, models.RelEnded,
-		in.WorkspaceID, in.Scope.IntegrationID, models.RelEnded).Scan(&keys).Error; err != nil {
+		 WHERE workspace_id = $1 AND integration_id = $2 AND state <> $3`,
+		in.Scope.IntegrationID, models.RelEnded)
+	if err != nil {
+		return nil, fmt.Errorf("list partitions: %w", err)
+	}
+	defer rows.Close()
+	var keys []string
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			return nil, fmt.Errorf("list partitions: %w", err)
+		}
+		keys = append(keys, k)
+	}
+	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("list partitions: %w", err)
 	}
 	sort.Strings(keys)
@@ -174,12 +191,19 @@ func (rc *Reconciler) reconcileEdges(tx *gorm.DB, in ReconcileInput, key string,
 // RetireUnsupported derives each keyed GitHub node's lifecycle from the support
 // that REMAINS, then ends what depended on it, in the caller's transaction.
 //
-// sourceCond names the evidence stream whose support may have just ended
-// ("s2.integration_id = ?" for a scan, "s2.discovery_source_id = ?" for a repo
-// scan), so a node is only reconsidered by a reading that ever vouched for it.
-// The multi-source rule (§2.10B) is the NOT EXISTS: a node retires only when
-// NO source still supports it.
-func RetireUnsupported(tx *gorm.DB, ws uuid.UUID, sourceCond string, sourceID uuid.UUID, at time.Time) (int, error) {
+// source names the evidence stream whose support may have just ended
+// (SourceIntegration for a scan, SourceDiscovery for a repo scan), so a node
+// is only reconsidered by a reading that ever vouched for it. The
+// multi-source rule (§2.10B) is the NOT EXISTS: a node retires only when NO
+// source still supports it.
+func RetireUnsupported(tx *gorm.DB, ws uuid.UUID, source SupportSource, sourceID uuid.UUID, at time.Time) (int, error) {
+	if source != SourceIntegration && source != SourceDiscovery {
+		return 0, fmt.Errorf("retire unsupported: unknown support source %q", source)
+	}
+	ctx, q, err := txTenant(tx, ws)
+	if err != nil {
+		return 0, err
+	}
 	total := 0
 	for _, t := range []struct {
 		table      string
@@ -190,34 +214,64 @@ func RetireUnsupported(tx *gorm.DB, ws uuid.UUID, sourceCond string, sourceID uu
 		{"iga_entitlements", "entitlement_id"},
 		{"iga_workload", "workload_id"},
 	} {
-		r := tx.Exec(`
+		r, err := tenancy.ExecContext(ctx, q, `
 			UPDATE `+t.table+` o
-			   SET lifecycle = ?, retired_reason = ?, updated_at = ?
-			 WHERE o.workspace_id = ?
-			   AND o.provider = ?
+			   SET lifecycle = $2, retired_reason = $3, updated_at = $4
+			 WHERE o.workspace_id = $1
+			   AND o.provider = $5
 			   AND o.source_key <> ''
-			   AND o.lifecycle = ?
+			   AND o.lifecycle = $6
 			   AND EXISTS (
 			         SELECT 1 FROM iga_object_support s2
 			          WHERE s2.workspace_id = o.workspace_id
 			            AND s2.`+t.supportCol+` = o.id
-			            AND `+sourceCond+`)
+			            AND s2.`+string(source)+` = $7)
 			   AND NOT EXISTS (
 			         SELECT 1 FROM iga_object_support s
 			          WHERE s.workspace_id = o.workspace_id
 			            AND s.`+t.supportCol+` = o.id
-			            AND s.state <> ?)`,
+			            AND s.state <> $8)`,
 			models.IGALifecycleRetired, models.RetiredUnsupported, at,
-			ws, models.ProviderGitHub, models.IGALifecycleActive, sourceID, models.RelEnded)
-		if r.Error != nil {
-			return total, fmt.Errorf("retire %s: %w", t.table, r.Error)
+			models.ProviderGitHub, models.IGALifecycleActive, sourceID, models.RelEnded)
+		if err != nil {
+			return total, fmt.Errorf("retire %s: %w", t.table, err)
 		}
-		total += int(r.RowsAffected)
+		n, err := r.RowsAffected()
+		if err != nil {
+			return total, fmt.Errorf("retire %s: %w", t.table, err)
+		}
+		total += int(n)
 	}
-	if err := cascade(tx, ws, at); err != nil {
+	if err := cascade(ctx, q, at); err != nil {
 		return total, err
 	}
 	return total, nil
+}
+
+// SupportSource is the iga_object_support column naming the evidence stream
+// a retirement pass reconsiders.
+type SupportSource string
+
+const (
+	// SourceIntegration: support written by an iga_integrations scan.
+	SourceIntegration SupportSource = "integration_id"
+	// SourceDiscovery: support written by a discovery source's repo scan.
+	SourceDiscovery SupportSource = "discovery_source_id"
+)
+
+// txTenant returns ws as the tenant context, on tx's own context, and tx's
+// connection, so the raw statements of the caller's transaction run through
+// the tenancy layer: workspace_id = $1 is bound to ws. A context already
+// carrying another workspace is refused rather than overridden.
+func txTenant(tx *gorm.DB, ws uuid.UUID) (context.Context, tenancy.Querier, error) {
+	ctx := tx.Statement.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if tc, err := tenancy.FromContext(ctx); err == nil && tc.WorkspaceID != ws {
+		return nil, nil, fmt.Errorf("tenancy: a transaction of workspace %s used for workspace %s", tc.WorkspaceID, ws)
+	}
+	return tenancy.WithContext(ctx, tenancy.Context{WorkspaceID: ws}), tx.Statement.ConnPool, nil
 }
 
 // cascade ends the edges a retired node made meaningless, and closes the
@@ -226,23 +280,22 @@ func RetireUnsupported(tx *gorm.DB, ws uuid.UUID, sourceCond string, sourceID uu
 // Done in SQL against the retired set rather than from a Go-side list, because
 // a node may have been retired by an earlier pass whose cascade failed -- and a
 // grant left current under a retired subject is a path the console will draw.
-func cascade(tx *gorm.DB, ws uuid.UUID, at time.Time) error {
+func cascade(ctx context.Context, q tenancy.Querier, at time.Time) error {
 	for _, c := range []struct {
 		col, table, reason string
 	}{
 		{"subject_identity_account_id", "iga_identity_accounts", models.EndedSubjectRetired},
 		{"entitlement_id", "iga_entitlements", models.EndedStatementRetired},
 	} {
-		if err := tx.Exec(`
+		if _, err := tenancy.ExecContext(ctx, q, `
 			UPDATE iga_access_edges
-			   SET state = ?, valid_to = ?, ended_reason = ?, updated_at = ?
-			 WHERE workspace_id = ? AND provider = ? AND source_key <> '' AND state <> ?
+			   SET state = $2, valid_to = $3, ended_reason = $4, updated_at = $3
+			 WHERE workspace_id = $1 AND provider = $5 AND source_key <> '' AND state <> $2
 			   AND `+c.col+` IN (SELECT id FROM `+c.table+`
-			                      WHERE workspace_id = ? AND provider = ?
-			                        AND source_key <> '' AND lifecycle = ?)`,
-			models.RelEnded, at, c.reason, at,
-			ws, models.ProviderGitHub, models.RelEnded,
-			ws, models.ProviderGitHub, models.IGALifecycleRetired).Error; err != nil {
+			                      WHERE workspace_id = $1 AND provider = $5
+			                        AND source_key <> '' AND lifecycle = $6)`,
+			models.RelEnded, at, c.reason,
+			models.ProviderGitHub, models.IGALifecycleRetired); err != nil {
 			return fmt.Errorf("cascade grants from %s: %w", c.table, err)
 		}
 	}
@@ -251,17 +304,16 @@ func cascade(tx *gorm.DB, ws uuid.UUID, at time.Time) error {
 	// reports cannot authenticate -- deleting the key is how it is revoked -- so
 	// its credential leaves the live set as 'revoked', with the reason saying
 	// it was inferred from absence rather than observed.
-	if err := tx.Exec(`
+	if _, err := tenancy.ExecContext(ctx, q, `
 		UPDATE iga_credentials
-		   SET lifecycle = 'revoked', retired_reason = ?, updated_at = ?
-		 WHERE workspace_id = ? AND provider = ? AND source_key <> ''
+		   SET lifecycle = 'revoked', retired_reason = $2, updated_at = $3
+		 WHERE workspace_id = $1 AND provider = $4 AND source_key <> ''
 		   AND lifecycle NOT IN ('revoked', 'expired')
 		   AND identity_account_id IN (SELECT id FROM iga_identity_accounts
-		                                WHERE workspace_id = ? AND provider = ?
-		                                  AND source_key <> '' AND lifecycle = ?)`,
+		                                WHERE workspace_id = $1 AND provider = $4
+		                                  AND source_key <> '' AND lifecycle = $5)`,
 		models.RetiredUnsupported, at,
-		ws, models.ProviderGitHub,
-		ws, models.ProviderGitHub, models.IGALifecycleRetired).Error; err != nil {
+		models.ProviderGitHub, models.IGALifecycleRetired); err != nil {
 		return fmt.Errorf("cascade credentials: %w", err)
 	}
 	return nil

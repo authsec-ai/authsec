@@ -5,6 +5,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/sessiontoken"
 	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
@@ -35,6 +36,24 @@ func NewAuthManagerTokenService() (*AuthManagerTokenService, error) {
 	}, nil
 }
 
+// ErrNoWorkspace refuses a session token that would carry no workspace (or a
+// placeholder such as "admin"): every token is for exactly one workspace
+// (ADR-0001 §5.1, AS-095).
+var ErrNoWorkspace = fmt.Errorf("token: a workspace_id is required")
+
+// requireWorkspace accepts only a real workspace id.
+func requireWorkspace(workspaceID string) error {
+	id, err := uuid.Parse(workspaceID)
+	if err != nil || id == uuid.Nil {
+		return ErrNoWorkspace
+	}
+	return nil
+}
+
+func (s *AuthManagerTokenService) secrets() sessiontoken.Secrets {
+	return sessiontoken.Secrets{Default: string(s.jwtDefaultSecret), SDK: string(s.jwtSDKSecret)}
+}
+
 // TokenClaims represents the standard claims structure for auth-manager compatible tokens
 type TokenClaims struct {
 	WorkspaceID           string
@@ -57,15 +76,24 @@ type TokenClaims struct {
 // Token type: "default" (uses JWT_DEF_SECRET with KID: "default")
 // Auth-manager fetches roles/permissions from DB via GetAuthz() on every request
 // Tokens contain minimal claims; authorization data is fetched from database dynamically
+//
+// GenerateToken mints a console (admin-class) session token; end-user flows
+// use generateEndUserClass. See internal/sessiontoken for the class rule.
 func (s *AuthManagerTokenService) GenerateToken(claims TokenClaims) (string, error) {
-	return s.generateTokenWithType(claims, "default", s.jwtDefaultSecret)
+	return s.generateTokenWithType(claims, "default", sessiontoken.Admin)
+}
+
+// generateEndUserClass mints an end-user-class session token (hosted login,
+// TOTP/CIBA/device/voice sign-in). It is refused on console surfaces.
+func (s *AuthManagerTokenService) generateEndUserClass(claims TokenClaims) (string, error) {
+	return s.generateTokenWithType(claims, "default", sessiontoken.EndUser)
 }
 
 // GenerateSDKToken generates an SDK/agent token following auth-manager patterns
 // Token type: "sdk-agent" (uses JWT_SDK_SECRET with KID: "sdk-agent")
 // Used for service-to-service authentication
 func (s *AuthManagerTokenService) GenerateSDKToken(claims TokenClaims) (string, error) {
-	return s.generateTokenWithType(claims, "sdk-agent", s.jwtSDKSecret)
+	return s.generateTokenWithType(claims, "sdk-agent", sessiontoken.SDK)
 }
 
 func (s *AuthManagerTokenService) GenerateWorkspaceToken(userID uuid.UUID, workspaceID uuid.UUID, membershipID uuid.UUID, clientID string, email string, expiresIn time.Duration) (string, error) {
@@ -84,7 +112,10 @@ func (s *AuthManagerTokenService) GenerateWorkspaceToken(userID uuid.UUID, works
 }
 
 // Uses the same algorithm as auth-manager's TokenController.GenerateToken()
-func (s *AuthManagerTokenService) generateTokenWithType(claims TokenClaims, tokenType string, secret []byte) (string, error) {
+func (s *AuthManagerTokenService) generateTokenWithType(claims TokenClaims, tokenType string, class sessiontoken.Class) (string, error) {
+	if err := requireWorkspace(claims.WorkspaceID); err != nil {
+		return "", err
+	}
 	now := time.Now()
 	expiresIn := claims.ExpiresIn
 	if expiresIn == 0 {
@@ -101,7 +132,6 @@ func (s *AuthManagerTokenService) generateTokenWithType(claims TokenClaims, toke
 		"client_id":    claims.ClientID,
 		"email_id":     claims.EmailID,
 		"token_type":   tokenType,
-		"aud":          "authsec-api",
 		"iat":          now.Unix(),
 		"nbf":          now.Unix(),
 		"exp":          now.Add(expiresIn).Unix(),
@@ -139,11 +169,9 @@ func (s *AuthManagerTokenService) generateTokenWithType(claims TokenClaims, toke
 		jwtClaims["roles"] = claims.Roles
 	}
 
-	// Sign token using auth-manager's signing method
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwtClaims)
-	token.Header["kid"] = tokenType // KID header for key selection
-
-	tokenString, err := token.SignedString(secret)
+	// typ, aud and the per-class key come from sessiontoken (AS-033).
+	jwtClaims["jti"] = uuid.NewString() // revocable by id (AS-031)
+	tokenString, err := sessiontoken.SignWith(s.secrets(), class, jwtClaims)
 	if err != nil {
 		return "", fmt.Errorf("failed to sign token: %w", err)
 	}
@@ -157,31 +185,31 @@ func (s *AuthManagerTokenService) GenerateTokenViaAuthManager(req *sharedmodels.
 	// Auth-manager's TokenController.GenerateToken() requires Gin context
 	// Since we're using it programmatically, we replicate its logic here
 	// using the same signing secrets and algorithm
+	if err := requireWorkspace(req.WorkspaceID); err != nil {
+		return "", err
+	}
 
 	tokenType := "default"
-	secret := s.jwtDefaultSecret
+	class := sessiontoken.Admin
 
 	if req.SecretID != nil {
 		tokenType = "sdk-agent"
-		secret = s.jwtSDKSecret
+		class = sessiontoken.SDK
 	}
 
 	now := time.Now()
 	// Phase 6: workspace_id is the only identity claim.
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+	tokenString, err := sessiontoken.SignWith(s.secrets(), class, jwt.MapClaims{
+		"jti":          uuid.NewString(), // revocable by id (AS-031)
 		"workspace_id": req.WorkspaceID,
 		"client_id":    req.ClientID,
 		"email_id":     req.EmailID,
 		"token_type":   tokenType,
-		"aud":          "authsec-api",
 		"iat":          now.Unix(),
 		"nbf":          now.Unix(),
 		"exp":          now.Add(24 * time.Hour).Unix(),
 		"iss":          "authsec-ai/auth-manager",
 	})
-	token.Header["kid"] = tokenType
-
-	tokenString, err := token.SignedString(secret)
 	if err != nil {
 		return "", fmt.Errorf("failed to generate token via auth-manager pattern: %w", err)
 	}
@@ -191,11 +219,12 @@ func (s *AuthManagerTokenService) GenerateTokenViaAuthManager(req *sharedmodels.
 
 // GenerateAdminToken generates a token for admin users
 func (s *AuthManagerTokenService) GenerateAdminToken(adminUserID uuid.UUID, email string, workspaceID *uuid.UUID, workspaceDomain string, roles []string) (string, error) {
-	// Use actual workspace_id if provided, otherwise default to "admin" for super-admins
-	workspaceIDStr := "admin"
-	if workspaceID != nil && *workspaceID != uuid.Nil {
-		workspaceIDStr = workspaceID.String()
+	// An admin without a workspace gets no token (AS-095); there is no
+	// "admin" pseudo-workspace.
+	if workspaceID == nil || *workspaceID == uuid.Nil {
+		return "", ErrNoWorkspace
 	}
+	workspaceIDStr := workspaceID.String()
 
 	claims := TokenClaims{
 		WorkspaceID:     workspaceIDStr,  // Use actual workspace_id
@@ -244,7 +273,7 @@ func (s *AuthManagerTokenService) GenerateEndUserToken(
 		Scopes:      scopes,
 		ExpiresIn:   expiresIn,
 	}
-	return s.GenerateToken(claims)
+	return s.generateEndUserClass(claims)
 }
 
 // GenerateVoiceAuthToken generates a token for voice authentication
@@ -263,7 +292,7 @@ func (s *AuthManagerTokenService) GenerateVoiceAuthToken(
 		Scopes:      scopes,
 		ExpiresIn:   expiresIn,
 	}
-	return s.GenerateToken(claims)
+	return s.generateEndUserClass(claims)
 }
 
 // GenerateDeviceAuthToken generates a token for device authentication flows
@@ -282,7 +311,7 @@ func (s *AuthManagerTokenService) GenerateDeviceAuthToken(
 		Scopes:      scopes,
 		ExpiresIn:   expiresIn,
 	}
-	return s.GenerateToken(claims)
+	return s.generateEndUserClass(claims)
 }
 
 // GenerateCIBAToken generates a token for CIBA (Client-Initiated Backchannel Authentication)
@@ -301,7 +330,7 @@ func (s *AuthManagerTokenService) GenerateCIBAToken(
 		Scopes:      scopes,
 		ExpiresIn:   expiresIn,
 	}
-	return s.GenerateToken(claims)
+	return s.generateEndUserClass(claims)
 }
 
 // GenerateTenantCIBAToken generates a CIBA token with the correct client_id (not user_id)
@@ -321,7 +350,7 @@ func (s *AuthManagerTokenService) GenerateTenantCIBAToken(
 		Scopes:      scopes,
 		ExpiresIn:   expiresIn,
 	}
-	return s.GenerateToken(claims)
+	return s.generateEndUserClass(claims)
 }
 
 // GenerateTOTPToken generates a token for TOTP authentication
@@ -338,5 +367,5 @@ func (s *AuthManagerTokenService) GenerateTOTPToken(
 		UserID:      &userID,
 		ExpiresIn:   expiresIn,
 	}
-	return s.GenerateToken(claims)
+	return s.generateEndUserClass(claims)
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/authsec-ai/authsec/internal/safehttp"
 	"io"
 	"log"
 	"net/http"
@@ -69,9 +70,8 @@ func NewResourceServerOnboardingService(db *gorm.DB) *ResourceServerOnboardingSe
 	return &ResourceServerOnboardingService{
 		db:            db,
 		scopeResolver: NewScopeResolver(db),
-		httpClient: &http.Client{
-			Timeout: 8 * time.Second,
-		},
+		// Resource-server URLs are tenant-supplied: SSRF-safe client (AS-042).
+		httpClient: safehttp.New(8 * time.Second),
 	}
 }
 

@@ -15,7 +15,7 @@ import (
 // Integration wiring (p3-wire): T3.12's owner review behind T3.11/T3.13's
 // authoring hooks, and T3.11's RetainVersionTx behind T3.12's review hook.
 // cmd/main.go installs both with InstallGovOwnerReviewWiring once the Phase 3
-// schema has verified (IGA_POLICY=on); tests install the same function.
+// schema has verified (policy available); tests install the same function.
 //
 //	OnProposed      -> OpenReviewTx (create, or resync/reopen on a re-propose)
 //	OwnerGate       -> CheckGate (409 review_incomplete / age_unconfirmed /
@@ -54,6 +54,24 @@ func GovOwnerReviewAuthoringHooks(db *gorm.DB) GovAuthoringHooks {
 			return err
 		},
 	}
+}
+
+// GovAdminModeAuthoringHooks are the authoring hooks in admin ownership mode
+// (iga_gov_ownership_mode.go): no owner review is opened, reopened or
+// cancelled, and the owner gate always passes. OwnerGate is never nil --
+// Approve refuses with 503 owner_gate_unavailable without it.
+func GovAdminModeAuthoringHooks() GovAuthoringHooks {
+	return GovAuthoringHooks{
+		OnProposed: func(tx *gorm.DB, p GovProposedVersion) error { return nil },
+		OwnerGate:  func(tx *gorm.DB, c GovApprovalCheck) error { return nil },
+	}
+}
+
+// InstallGovAdminModeWiring installs the admin-mode hooks process-wide and
+// returns a function restoring what was installed before.
+func InstallGovAdminModeWiring() (restore func()) {
+	prev := SetGovAuthoringHooks(GovAdminModeAuthoringHooks())
+	return func() { SetGovAuthoringHooks(prev) }
 }
 
 // govReviewAuthoringAdapter is T3.12's GovReviewAuthoringHook over T3.11's
@@ -112,7 +130,7 @@ func InstallGovOwnerReviewWiring(db *gorm.DB) (restore func()) {
 
 // InstallGovPolicyRuntime installs everything the Phase 3 policy product
 // needs at runtime beyond its routes and worker (cmd/main.go calls it from
-// the IGA_POLICY gate's ready hook, i.e. only once the Phase 3 schema has
+// the policy gate's ready hook, i.e. only once the Phase 3 schema has
 // verified, before the job worker starts):
 //
 //   - the owner review wiring (InstallGovOwnerReviewWiring);
@@ -127,7 +145,13 @@ func InstallGovOwnerReviewWiring(db *gorm.DB) (restore func()) {
 func InstallGovPolicyRuntime(db *gorm.DB, vc vault.VaultClient, discoveryPrincipal string) (restore func()) {
 	prevLive := DefaultGovLiveReader()
 	prevIaC, prevExport := govDeliveryHandler(igagov.DeliveryIaCPR), govDeliveryHandler(igagov.DeliveryExport)
-	rWire := InstallGovOwnerReviewWiring(db)
+	var rWire func()
+	if GovOwnershipEnabled() {
+		rWire = InstallGovOwnerReviewWiring(db)
+	} else {
+		rWire = InstallGovAdminModeWiring()
+		log.Printf("[policy] ownership mode admin: no owner reviews, owner notices or missing_owner findings; the owner gate passes")
+	}
 	// Slack's health-report buttons (review fix R1a P2): T3.16's
 	// health-report path, installed for the process (iga_gov_health_reporter.go).
 	rHealth := InstallGovHealthReporter(db)
@@ -165,7 +189,7 @@ func InstallGovPolicyRuntime(db *gorm.DB, vc vault.VaultClient, discoveryPrincip
 	return restore
 }
 
-// InstallGovPolicyStartup is the IGA_POLICY gate's ready hook body that
+// InstallGovPolicyStartup is the policy gate's ready hook body that
 // cmd/main.go runs before anything Phase 3 is served (fix/p3-appr P1-4):
 // the policy runtime (InstallGovPolicyRuntime: the owner gate and the other
 // authoring hooks first), then -- when slackApp is configured (non-nil) --

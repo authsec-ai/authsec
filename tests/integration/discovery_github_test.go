@@ -159,8 +159,8 @@ func TestGitHubSightingsUseExistingGovernance(t *testing.T) {
 	db.Exec(`INSERT INTO users (id,email,workspace_id,created_at,updated_at)
 	         VALUES (?,?,?,NOW(),NOW())`, owner, owner.String()+"@x.local", ws)
 	client := uuid.New()
-	db.Exec(`INSERT INTO mcp_oauth_clients (id,client_id,hydra_client_id,client_name)
-	         VALUES (?,?,?,?)`, client, "c-"+client.String(), "h-"+client.String(), "gh-agent")
+	db.Exec(`INSERT INTO mcp_oauth_clients (id,client_id,hydra_client_id,client_name,home_workspace_id)
+	         VALUES (?,?,?,?,?)`, client, "c-"+client.String(), "h-"+client.String(), "gh-agent", ws)
 
 	claimed, err := disco.ClaimAgent(ws, agents[0].ID, services.ClaimInput{
 		MatchedClientID: client, OwnerUserID: owner, ClaimedBy: &owner,

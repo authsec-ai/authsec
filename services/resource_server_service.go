@@ -14,6 +14,7 @@ import (
 	"time"
 
 	mcpclient "github.com/authsec-ai/authsec/internal/mcp"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
@@ -54,12 +55,19 @@ type CreateResourceServerRequest struct {
 	// ApplicationType is one of models.ApplicationType* — mcp_server (default),
 	// ai_agent, clawbot, api_service. Optional; left empty defaults to mcp_server.
 	ApplicationType string `json:"application_type,omitempty"`
+	// AgentType labels an ai_agent application. Ignored for other types;
+	// defaults to DefaultAgentType for ai_agent.
+	AgentType string `json:"agent_type,omitempty"`
 	// ScopePresetID, if set and not "blank", seeds preset scopes for this RS.
 	ScopePresetID *string `json:"scope_preset_id,omitempty"`
 	// DefaultAccessEnabled controls the initial enabled flag on the auto-created
 	// access policy. Defaults to false (closed) per the wireframe redesign.
 	DefaultAccessEnabled *bool `json:"default_access_enabled,omitempty"`
 }
+
+// DefaultAgentType is the agent_type given to an ai_agent application created
+// without one; it matches the console's only delegation target type.
+const DefaultAgentType = "mcp-agent"
 
 // ValidApplicationType reports whether the supplied type is one of the
 // supported Application type constants. Empty string is treated as valid and
@@ -115,20 +123,11 @@ func (s *ResourceServerService) Create(req CreateResourceServerRequest, baseURL 
 	}
 	resourceURI := publicURL + basePath
 
-	// Pre-check: detect duplicate resource_uri before the INSERT so we can
-	// return a clean 409-friendly error instead of leaking the raw constraint
-	// name to the operator. The DB unique index is the source of truth.
-	var existingCount int64
-	if err := s.db.Model(&models.ResourceServer{}).
-		Where("resource_uri = ?", resourceURI).
-		Count(&existingCount).Error; err != nil {
-		return nil, nil, fmt.Errorf("check existing resource server: %w", err)
-	}
-	if existingCount > 0 {
-		return nil, nil, fmt.Errorf(
-			"a resource server with this URL already exists (resource_uri=%s) — use a different Public Base URL or Protected Base Path",
-			resourceURI,
-		)
+	// Pre-check: a URI is unique within the workspace, and another
+	// workspace's URI can be registered only by a workspace that owns its host
+	// (AS-060). Returns a clean 409-friendly error instead of a raw constraint.
+	if err := checkResourceURIAvailable(s.db, req.WorkspaceID, resourceURI, nil); err != nil {
+		return nil, nil, err
 	}
 
 	secret, err := generateIntrospectionSecret()
@@ -154,9 +153,21 @@ func (s *ResourceServerService) Create(req CreateResourceServerRequest, baseURL 
 	appSlug := SlugForApp(req.Name)
 	canonicalRequestedScopes := CanonicalAuthSecScopes(req.ScopesSupported, appSlug)
 
+	// An ai_agent always carries an agent_type: delegation policies match on
+	// it and provision-identity refuses an agent without one (AS-046).
+	var agentType *string
+	if appType == models.ApplicationTypeAIAgent {
+		at := strings.TrimSpace(req.AgentType)
+		if at == "" {
+			at = DefaultAgentType
+		}
+		agentType = &at
+	}
+
 	rs := &models.ResourceServer{
 		WorkspaceID:             req.WorkspaceID,
 		ApplicationType:         appType,
+		AgentType:               agentType,
 		Name:                    req.Name,
 		PublicBaseURL:           publicURL,
 		ProtectedBasePath:       basePath,
@@ -331,12 +342,112 @@ func (s *ResourceServerService) GetByID(id string) (*models.ResourceServer, erro
 	return &rs, nil
 }
 
+// GetByResourceURI resolves an OAuth resource indicator to its resource
+// server before any workspace is known (authorize, the token grants, DCR,
+// first contact, the connector broker).
+//
+// resource_uri is unique per workspace (AS-060). When more than one workspace
+// has registered the URI, the one that owns the URI's host wins: the workspace
+// with a verified workspace_domains entry equal to the host or, failing that,
+// the most specific verified parent domain. Without a single owner the URI is
+// ambiguous and nothing is returned (ErrResourceURIAmbiguous). Creation keeps
+// such a state from arising: only a host's owner may register a URI another
+// workspace already uses.
 func (s *ResourceServerService) GetByResourceURI(uri string) (*models.ResourceServer, error) {
-	var rs models.ResourceServer
-	if err := s.db.Where("resource_uri = ? AND active = true", uri).First(&rs).Error; err != nil {
+	var candidates []models.ResourceServer
+	// TENANT-EXEMPT: pre-workspace resolution of an OAuth resource indicator; see above
+	if err := s.db.Where("resource_uri = ? AND active = true", uri).Order("created_at").Find(&candidates).Error; err != nil {
 		return nil, err
 	}
-	return &rs, nil
+	switch len(candidates) {
+	case 0:
+		return nil, gorm.ErrRecordNotFound
+	case 1:
+		return &candidates[0], nil
+	}
+	ids := make([]uuid.UUID, 0, len(candidates))
+	for _, c := range candidates {
+		ids = append(ids, c.WorkspaceID)
+	}
+	owner, err := resourceURIOwner(s.db, uri, ids)
+	if err != nil {
+		return nil, err
+	}
+	for i := range candidates {
+		if owner != uuid.Nil && candidates[i].WorkspaceID == owner {
+			return &candidates[i], nil
+		}
+	}
+	return nil, ErrResourceURIAmbiguous
+}
+
+// ErrResourceURIAmbiguous: several workspaces registered the URI and none of
+// them owns its host.
+var ErrResourceURIAmbiguous = errors.New("resource URI is registered in more than one workspace and none owns its host")
+
+// ErrResourceURITaken: the URI is already used in this workspace, or by
+// another workspace and the caller does not own its host.
+var ErrResourceURITaken = errors.New("a resource server with this URL already exists")
+
+// resourceURIOwner returns which of the given workspaces owns the URI's host:
+// a verified workspace_domains entry equal to the host, else the longest
+// verified parent domain. Domains are globally unique, so the answer is
+// unique; uuid.Nil when none owns it.
+func resourceURIOwner(db *gorm.DB, uri string, workspaces []uuid.UUID) (uuid.UUID, error) {
+	u, err := url.Parse(uri)
+	if err != nil || u.Hostname() == "" || len(workspaces) == 0 {
+		return uuid.Nil, nil
+	}
+	host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
+	var row struct{ WorkspaceID uuid.UUID }
+	// TENANT-EXEMPT: decides which of the candidate workspaces verified the host (domains are globally unique)
+	err = db.Raw(`
+		SELECT workspace_id FROM workspace_domains
+		 WHERE is_verified = true AND workspace_id IN ?
+		   AND (LOWER(domain) = ? OR RIGHT(?, LENGTH(domain) + 1) = '.' || LOWER(domain))
+		 ORDER BY LENGTH(domain) DESC
+		 LIMIT 1`, workspaces, host, host).Scan(&row).Error
+	if err != nil {
+		return uuid.Nil, err
+	}
+	return row.WorkspaceID, nil
+}
+
+// checkResourceURIAvailable enforces the AS-060 registration rule for
+// workspace ws: the URI must not already be used in ws, and if another
+// workspace uses it, ws must own its host. exclude is the resource server
+// being edited, if any.
+func checkResourceURIAvailable(db *gorm.DB, ws uuid.UUID, uri string, exclude *uuid.UUID) error {
+	var holders []uuid.UUID
+	// TENANT-EXEMPT: the registration rule must see every workspace holding the URI
+	q := db.Model(&models.ResourceServer{}).Where("resource_uri = ?", uri)
+	if exclude != nil {
+		q = q.Where("id <> ?", *exclude)
+	}
+	if err := q.Distinct().Pluck("workspace_id", &holders).Error; err != nil {
+		return fmt.Errorf("check existing resource server: %w", err)
+	}
+	if len(holders) == 0 {
+		return nil
+	}
+	for _, h := range holders {
+		if h == ws {
+			return fmt.Errorf("%w (resource_uri=%s) — use a different Public Base URL or Protected Base Path", ErrResourceURITaken, uri)
+		}
+	}
+	owner, err := resourceURIOwner(db, uri, []uuid.UUID{ws})
+	if err != nil {
+		return fmt.Errorf("check resource URI ownership: %w", err)
+	}
+	if owner != ws {
+		u, _ := url.Parse(uri)
+		host := ""
+		if u != nil {
+			host = u.Hostname()
+		}
+		return fmt.Errorf("%w (resource_uri=%s) in another workspace — verify ownership of the domain %q in this workspace to register it here", ErrResourceURITaken, uri, host)
+	}
+	return nil
 }
 
 func (s *ResourceServerService) ListByTenant(workspaceID string) ([]models.ResourceServer, error) {
@@ -424,6 +535,9 @@ func (s *ResourceServerService) UpdateByTenant(id, workspaceID string, updates m
 			}
 			newURI := strings.TrimRight(rs.PublicBaseURL, "/") + rs.ProtectedBasePath
 			if newURI != rs.ResourceURI {
+				if err := checkResourceURIAvailable(tx, rs.WorkspaceID, newURI, &rs.ID); err != nil {
+					return err
+				}
 				if err := tx.Model(&rs).Update("resource_uri", newURI).Error; err != nil {
 					return err
 				}
@@ -443,18 +557,26 @@ func (s *ResourceServerService) UpdateByTenant(id, workspaceID string, updates m
 // Cascades to resource_server_client_registrations (FK lacks ON DELETE CASCADE
 // in older schemas; the explicit delete covers both old and new).
 func (s *ResourceServerService) DeleteByTenant(id, workspaceID string) error {
-	return s.db.Transaction(func(tx *gorm.DB) error {
+	ws, err := uuid.Parse(workspaceID)
+	if err != nil {
+		return fmt.Errorf("resource server not found")
+	}
+	// The whole delete runs under row-level security for the workspace.
+	ctx := tenancy.WithContext(context.Background(), tenancy.Context{WorkspaceID: ws})
+	return tenancy.RLSTransaction(ctx, s.db, nil, func(tx *gorm.DB, _ uuid.UUID) error {
 		var rs models.ResourceServer
-		if err := tx.Where("id = ? AND workspace_id = ?", id, workspaceID).First(&rs).Error; err != nil {
+		if err := tx.Where("id = ? AND workspace_id = ?", id, ws).First(&rs).Error; err != nil {
 			return fmt.Errorf("resource server not found")
 		}
 
 		// Clean up role_bindings scoped to this RS (polymorphic — no FK cascade).
 		// Without this, the PDP (ScopeResolver) could still authorize access
-		// to a deleted application via stale role_bindings rows.
-		if err := tx.Exec(
-			`DELETE FROM role_bindings WHERE scope_type = 'resource_server' AND scope_id = ?`, rs.ID,
-		).Error; err != nil {
+		// to a deleted application via stale role_bindings rows. Only this
+		// workspace's bindings: the PDP never reads another workspace's
+		// bindings for this RS, and they are not this workspace's to delete.
+		if _, err := tenancy.ExecContext(ctx, tx.Statement.ConnPool,
+			`DELETE FROM role_bindings WHERE workspace_id = $1 AND scope_type = 'resource_server' AND scope_id = $2`, rs.ID,
+		); err != nil {
 			return fmt.Errorf("clean up role_bindings: %w", err)
 		}
 
@@ -1239,6 +1361,31 @@ type ChecklistStep struct {
 	Detail   string `json:"detail,omitempty"`
 }
 
+// unmappedToolCount counts the resource server's non-public tools in its
+// policy-effective inventory (SDK manifest, manual, or the last successful
+// scan) that have no admin_override scope mapping. It runs in the resource
+// server's workspace, under row-level security.
+func (s *ResourceServerService) unmappedToolCount(rs *models.ResourceServer) (int64, error) {
+	ctx := tenancy.WithContext(context.Background(), tenancy.Context{WorkspaceID: rs.WorkspaceID})
+	var n int64
+	err := tenancy.RLSTransaction(ctx, s.db, nil, func(tx *gorm.DB, _ uuid.UUID) error {
+		return tenancy.QueryRowContext(ctx, tx.Statement.ConnPool, `
+			SELECT COUNT(*) FROM mcp_tools mt
+			  LEFT JOIN mcp_tool_scope_map m
+			    ON m.workspace_id = mt.workspace_id AND m.tool_id = mt.id AND m.source = 'admin_override'
+			 WHERE mt.workspace_id = $1 AND mt.resource_server_id = $2
+			   AND (mt.inventory_source = ANY($3) OR mt.last_scan_generation = $4)
+			   AND mt.is_public = false
+			   AND m.tool_id IS NULL`,
+			[]interface{}{rs.ID, pq.Array([]string{models.InventorySourceSDKManifest, models.InventorySourceManual}), rs.LastSuccessfulGeneration},
+			&n)
+	})
+	if err != nil {
+		return 0, fmt.Errorf("count unmapped tools: %w", err)
+	}
+	return n, nil
+}
+
 // SetupChecklist returns the step-by-step status for the wizard rail.
 func (s *ResourceServerService) SetupChecklist(rsID uuid.UUID, workspaceID uuid.UUID) ([]ChecklistStep, error) {
 	rs, err := s.GetByIDAndTenant(rsID.String(), workspaceID.String())
@@ -1272,18 +1419,10 @@ func (s *ResourceServerService) SetupChecklist(rsID uuid.UUID, workspaceID uuid.
 	})
 
 	// Step 4: Map tools — every non-public tool has ≥1 admin_override mapping
-	var unmappedCount int64
-	s.db.Raw(`
-		SELECT COUNT(*) FROM mcp_tools mt
-		 WHERE mt.resource_server_id = ?
-		   AND (mt.inventory_source IN ? OR mt.last_scan_generation = ?)
-		   AND mt.is_public = false
-		   AND NOT EXISTS (
-			   SELECT 1 FROM mcp_tool_scope_map m
-			    WHERE m.tool_id = mt.id
-			      AND m.source = 'admin_override'
-		   )
-	`, rs.ID, []string{models.InventorySourceSDKManifest, models.InventorySourceManual}, rs.LastSuccessfulGeneration).Scan(&unmappedCount)
+	unmappedCount, err := s.unmappedToolCount(rs)
+	if err != nil {
+		return nil, err
+	}
 	step4Complete := toolCount > 0 && unmappedCount == 0
 	steps = append(steps, ChecklistStep{
 		Step:     4,
@@ -1440,18 +1579,10 @@ func (s *ResourceServerService) Activate(rsID uuid.UUID, workspaceID uuid.UUID, 
 	}
 
 	// Gate 3: every non-public tool has ≥1 admin_override mapping
-	var unmappedCount int64
-	s.db.Raw(`
-		SELECT COUNT(*) FROM mcp_tools mt
-		 WHERE mt.resource_server_id = ?
-		   AND (mt.inventory_source IN ? OR mt.last_scan_generation = ?)
-		   AND mt.is_public = false
-		   AND NOT EXISTS (
-			   SELECT 1 FROM mcp_tool_scope_map m
-			    WHERE m.tool_id = mt.id
-			      AND m.source = 'admin_override'
-		   )
-	`, rs.ID, []string{models.InventorySourceSDKManifest, models.InventorySourceManual}, rs.LastSuccessfulGeneration).Scan(&unmappedCount)
+	unmappedCount, err := s.unmappedToolCount(rs)
+	if err != nil {
+		return err
+	}
 	if unmappedCount > 0 {
 		failed = append(failed, fmt.Sprintf("step_4_unmapped_tool_count: %d", unmappedCount))
 	}

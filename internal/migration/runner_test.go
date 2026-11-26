@@ -1,6 +1,8 @@
 package migration
 
 import (
+	"time"
+	"net"
 	"database/sql"
 	"fmt"
 	"os"
@@ -32,6 +34,7 @@ func testDSN(dbName string) string {
 
 func connectTestDB(t *testing.T, dbName string) *sql.DB {
 	t.Helper()
+	skipWithoutPostgres(t, testDBHost, testDBPort)
 	db, err := sql.Open("postgres", testDSN(dbName))
 	require.NoError(t, err, "failed to open connection to %s", dbName)
 	require.NoError(t, db.Ping(), "failed to ping %s", dbName)
@@ -336,4 +339,16 @@ func TestMasterMigrations_Flow(t *testing.T) {
 	require.NotNil(t, status)
 	assert.Equal(t, "master", status.DBType)
 	assert.Greater(t, status.LastMigration, 0)
+}
+
+
+// skipWithoutPostgres skips a DB-backed test when no Postgres is listening,
+// instead of failing the package (CI provides one on :5432).
+func skipWithoutPostgres(t *testing.T, host, port string) {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, port), 500*time.Millisecond)
+	if err != nil {
+		t.Skipf("no Postgres at %s:%s: %v", host, port, err)
+	}
+	conn.Close()
 }

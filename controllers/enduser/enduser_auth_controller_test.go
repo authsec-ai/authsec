@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/internal/sessiontoken"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
@@ -59,26 +60,30 @@ func TestEndUserAuthController_generateJWTTokenCompatibility(t *testing.T) {
 	controller := &EndUserAuthController{}
 
 	userID := uuid.New()
-	token, err := controller.generateJWTToken("tenant-1", "client-1", "user@example.com", "example.com", &userID, nil)
+	workspaceID := uuid.NewString() // a token is always for a real workspace (AS-095)
+	token, err := controller.generateJWTToken(workspaceID, "client-1", "user@example.com", "example.com", &userID, nil)
 	require.NoError(t, err)
 	require.NotEmpty(t, token)
 
-	parsed, err := jwt.Parse(token, func(tok *jwt.Token) (interface{}, error) {
-		require.Equal(t, jwt.SigningMethodHS256, tok.Method)
+	// An end-user-class token (AS-033): it verifies only as that class, and
+	// never under the raw JWT_DEF_SECRET.
+	_, rawErr := jwt.Parse(token, func(tok *jwt.Token) (interface{}, error) {
 		return []byte(os.Getenv("JWT_DEF_SECRET")), nil
 	})
+	require.Error(t, rawErr)
+	_, _, err = sessiontoken.Verify(token, sessiontoken.Admin)
+	require.Error(t, err)
+	claims, class, err := sessiontoken.Verify(token, sessiontoken.EndUser)
 	require.NoError(t, err)
-	require.True(t, parsed.Valid)
-
-	claims, ok := parsed.Claims.(jwt.MapClaims)
-	require.True(t, ok, "expected map claims")
+	require.Equal(t, sessiontoken.EndUser, class)
 
 	// Ultra-minimal token: identity only
 	// Auth-manager fetches roles/permissions from DB via GetAuthz() on every request
 	assert.Equal(t, "authsec-ai/auth-manager", claims["iss"])
-	assert.Equal(t, "authsec-api", claims["aud"])
-	assert.Equal(t, "tenant-1", claims["workspace_id"])
-	assert.Equal(t, "tenant-1", claims["project_id"]) // project_id defaults to workspace_id for endusers
+	assert.Equal(t, "authsec-enduser", claims["aud"])
+	assert.Equal(t, "enduser", claims["typ"])
+	assert.Equal(t, workspaceID, claims["workspace_id"])
+	assert.Equal(t, workspaceID, claims["project_id"]) // project_id defaults to workspace_id for endusers
 	assert.Equal(t, "client-1", claims["client_id"])
 	assert.Equal(t, "user@example.com", claims["email_id"])
 

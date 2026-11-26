@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
@@ -16,6 +17,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/authsec-ai/authsec/internal/igagov"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 )
@@ -45,7 +47,11 @@ func (e *GovError) Body() map[string]any {
 	if d == nil {
 		d = map[string]any{}
 	}
-	return map[string]any{"error": map[string]any{"code": e.Code, "message": e.Message, "detail": d}}
+	body := map[string]any{"code": e.Code, "message": e.Message, "detail": d}
+	if f, ok := d["field"].(string); ok && f != "" {
+		body["field"] = f
+	}
+	return map[string]any{"error": body}
 }
 
 func govErr(status int, code, msg string, detail map[string]any) *GovError {
@@ -93,19 +99,79 @@ func NewGovReader(db *gorm.DB, cursorKey []byte) *GovReader {
 	return &GovReader{db: db, repo: repositories.NewIGAGovEvaluationRepository(), key: cursorKey}
 }
 
+// govHandleContext is the context of a handle (a request's, when the
+// controller bound it with WithContext), or Background.
+func govHandleContext(db *gorm.DB) context.Context {
+	if db != nil && db.Statement != nil && db.Statement.Context != nil {
+		return db.Statement.Context
+	}
+	return context.Background()
+}
+
+// readIn runs fn in one read-only transaction under row-level security for
+// ws (AS-108): every statement of a read sees only ws's rows. A handle whose
+// context carries another workspace is refused.
+func (r *GovReader) readIn(ws uuid.UUID, fn func(tx *gorm.DB) error) error {
+	return tenancy.InWorkspaceRead(govHandleContext(r.db), r.db, ws, govAgreeing(govHandleContext(r.db), ws, fn))
+}
+
 // ResolveRev decides the revision a finding read is served at (§7
 // "Evaluation rule") and the meta every read reports. rev 0 with a nil
 // error means no evaluation has completed yet.
-func (r *GovReader) ResolveRev(ws uuid.UUID, requested *int64) (int64, GovRevMeta, error) {
+func (r *GovReader) ResolveRev(ws uuid.UUID, requested *int64) (rev int64, meta GovRevMeta, err error) {
+	err = r.readIn(ws, func(tx *gorm.DB) (e error) { rev, meta, e = r.resolveRev(tx, ws, requested); return e })
+	return rev, meta, err
+}
+
+// ListFindings is GET /findings at the resolved revision.
+func (r *GovReader) ListFindings(ws uuid.UUID, rev int64, f FindingFilter) (out []FindingView, next *string, err error) {
+	err = r.readIn(ws, func(tx *gorm.DB) (e error) { out, next, e = r.listFindings(tx, ws, rev, f); return e })
+	return out, next, err
+}
+
+// ListFindingGroups is GET /findings?group=role at the resolved revision.
+func (r *GovReader) ListFindingGroups(ws uuid.UUID, rev int64, f FindingFilter) (out []RoleGroup, next *string, err error) {
+	err = r.readIn(ws, func(tx *gorm.DB) (e error) { out, next, e = r.listFindingGroups(tx, ws, rev, f); return e })
+	return out, next, err
+}
+
+// Summary counts the findings whose condition holds at rev.
+func (r *GovReader) Summary(ws uuid.UUID, rev int64) (s FindingSummary, err error) {
+	err = r.readIn(ws, func(tx *gorm.DB) (e error) { s, e = r.summary(tx, ws, rev); return e })
+	return s, err
+}
+
+// Finding reads one finding at rev. Another workspace's id is 404.
+func (r *GovReader) Finding(ws, id uuid.UUID, rev int64) (d *FindingDetail, err error) {
+	err = r.readIn(ws, func(tx *gorm.DB) (e error) { d, e = r.finding(tx, ws, id, rev); return e })
+	return d, err
+}
+
+// ActivityEvidence is GET /identities/:id/activity-evidence at rev.
+func (r *GovReader) ActivityEvidence(ws, identity uuid.UUID, rev int64) (out []models.IGAGovActivityEvidence, err error) {
+	err = r.readIn(ws, func(tx *gorm.DB) (e error) { out, e = r.activityEvidence(tx, ws, identity, rev); return e })
+	return out, err
+}
+
+// EvidenceBundle is GET /evidence-bundles/:id (see evidenceBundle).
+func (r *GovReader) EvidenceBundle(ws, id uuid.UUID) (out map[string]any, err error) {
+	err = r.readIn(ws, func(tx *gorm.DB) (e error) { out, e = r.evidenceBundle(tx, ws, id); return e })
+	return out, err
+}
+
+// resolveRev decides the revision a finding read is served at (§7
+// "Evaluation rule") and the meta every read reports. rev 0 with a nil
+// error means no evaluation has completed yet.
+func (r *GovReader) resolveRev(db *gorm.DB, ws uuid.UUID, requested *int64) (int64, GovRevMeta, error) {
 	var meta GovRevMeta
 	var latest int64
-	if err := r.db.Raw(`SELECT COALESCE(max(rev), 0) FROM iga_publication WHERE workspace_id = ?`, ws).Scan(&latest).Error; err != nil {
+	if err := db.Raw(`SELECT COALESCE(max(rev), 0) FROM iga_publication WHERE workspace_id = ?`, ws).Scan(&latest).Error; err != nil {
 		return 0, meta, err
 	}
 	if latest > 0 {
 		meta.LatestRev = &latest
 	}
-	last, err := r.repo.Latest(r.db, ws)
+	last, err := r.repo.Latest(db, ws)
 	if err != nil {
 		return 0, meta, err
 	}
@@ -114,7 +180,7 @@ func (r *GovReader) ResolveRev(ws uuid.UUID, requested *int64) (int64, GovRevMet
 			Error: last.Error, FinishedAt: last.FinishedAt}
 	}
 	if requested == nil {
-		lc, err := r.repo.LatestComplete(r.db, ws)
+		lc, err := r.repo.LatestComplete(db, ws)
 		if err != nil || lc == nil {
 			return 0, meta, err
 		}
@@ -122,7 +188,7 @@ func (r *GovReader) ResolveRev(ws uuid.UUID, requested *int64) (int64, GovRevMet
 		return lc.Rev, meta, nil
 	}
 	rev := *requested
-	ev, err := r.repo.GetTx(r.db, ws, rev, false)
+	ev, err := r.repo.GetTx(db, ws, rev, false)
 	if err != nil {
 		return 0, meta, err
 	}
@@ -137,13 +203,13 @@ func (r *GovReader) ResolveRev(ws uuid.UUID, requested *int64) (int64, GovRevMet
 	}
 	// Pruning is recorded when it happens (057); it is never inferred from
 	// the retention setting, which may have been raised since.
-	pruned, err := r.repo.Pruned(r.db, ws, rev)
+	pruned, err := r.repo.Pruned(db, ws, rev)
 	if err != nil {
 		return 0, meta, err
 	}
 	if pruned {
 		retention := 30
-		if s, err := repositories.NewIGAGovSettingsRepository(r.db).Get(ws); err == nil {
+		if s, err := repositories.NewIGAGovSettingsRepository(db).Get(ws); err == nil {
 			retention = s.EvidenceRetentionRevs
 		}
 		return 0, meta, govErr(http.StatusGone, "revision_not_retained",
@@ -205,6 +271,10 @@ type FindingFilter struct {
 	IdentityID  *uuid.UUID
 	WorkloadID  *uuid.UUID
 	Account     string
+	// Category keeps the findings of the roles GET /readiness puts in that
+	// category (blocked_by_collection, ineligible, needs_owner, iac_only,
+	// direct_eligible, no_change_needed).
+	Category    string
 	Q           string
 	Cursor      string
 	Limit       int
@@ -213,7 +283,7 @@ type FindingFilter struct {
 
 func (f FindingFilter) key() string {
 	return strings.Join([]string{strings.Join(f.Statuses, ","), strings.Join(f.Kinds, ","), strings.Join(f.Severities, ","),
-		strings.Join(f.Confidences, ","), uuidStr(f.IdentityID), uuidStr(f.WorkloadID), f.Account, f.Q,
+		strings.Join(f.Confidences, ","), uuidStr(f.IdentityID), uuidStr(f.WorkloadID), f.Account, f.Category, f.Q,
 		fmt.Sprint(f.GroupByRole)}, "|")
 }
 
@@ -280,19 +350,35 @@ var (
 	govConfidences = map[string]bool{"qualified": true, "age_unverified": true, "not_applicable": true}
 )
 
+// govKindsNow is the kind filter's vocabulary: R1a's kinds, plus R1b's
+// unused_action while R1b is available.
+func govKindsNow() map[string]bool {
+	if !PolicyActionsOn() {
+		return govKinds
+	}
+	out := map[string]bool{igagov.KindUnusedAction: true}
+	for k, v := range govKinds {
+		out[k] = v
+	}
+	return out
+}
+
 // ValidateFindingFilter checks the enumerations.
 func ValidateFindingFilter(f FindingFilter) error {
 	for _, c := range []struct {
 		param string
 		vals  []string
 		ok    map[string]bool
-	}{{"status", f.Statuses, govStatuses}, {"kind", f.Kinds, govKinds}, {"severity", f.Severities, govSeverities},
+	}{{"status", f.Statuses, govStatuses}, {"kind", f.Kinds, govKindsNow()}, {"severity", f.Severities, govSeverities},
 		{"confidence", f.Confidences, govConfidences}} {
 		for _, v := range c.vals {
 			if !c.ok[v] {
 				return GovBadParam(c.param, fmt.Sprintf("Unknown %s %q.", c.param, v))
 			}
 		}
+	}
+	if f.Category != "" && !containsStr(ReadinessOrder, f.Category) {
+		return GovBadParam("category", fmt.Sprintf("Unknown category %q.", f.Category))
 	}
 	if f.Limit < 0 || f.Limit > MaxGovPage {
 		return GovBadParam("limit", fmt.Sprintf("limit must be 1..%d.", MaxGovPage))
@@ -366,24 +452,13 @@ func connectionCoverageLink(conn *uuid.UUID) string {
 	return "/iga/connections/" + conn.String() + "/coverage"
 }
 
-// ListFindings is GET /findings at the resolved revision.
-func (r *GovReader) ListFindings(ws uuid.UUID, rev int64, f FindingFilter) ([]FindingView, *string, error) {
-	if f.Limit == 0 {
-		f.Limit = 50
-	}
-	want := govCursor{Route: "findings", WS: ws.String(), Rev: rev, Q: f.key()}
-	after := ""
-	if f.Cursor != "" {
-		var err error
-		if after, err = r.open(f.Cursor, want); err != nil {
-			return nil, nil, err
-		}
-	}
-	if rev == 0 {
-		return []FindingView{}, nil, nil
-	}
-	where := []string{"f.workspace_id = ?"}
-	args := []any{rev, ws}
+// findingConds is the WHERE of a findings read: the conditions and their
+// arguments (the first is the workspace). none is true when the filter can
+// match nothing (a readiness category with no roles). db is the caller's
+// workspace-scoped transaction (AS-108), threaded through to readiness.
+func (r *GovReader) findingConds(db *gorm.DB, ws uuid.UUID, f FindingFilter) (where []string, args []any, none bool, err error) {
+	where = []string{"f.workspace_id = ?"}
+	args = []any{ws}
 	add := func(cond string, a ...any) { where = append(where, cond); args = append(args, a...) }
 	if len(f.Statuses) > 0 {
 		add("f.status IN ?", f.Statuses)
@@ -409,17 +484,57 @@ func (r *GovReader) ListFindings(ws uuid.UUID, rev int64, f FindingFilter) ([]Fi
 		// The role ARN's account field (source key "aws␟arn:aws:iam::<acct>:role/…").
 		add("split_part(i.source_key, ':', 5) = ?", f.Account)
 	}
+	if f.Category != "" {
+		rd, err := r.readiness(db, ws, f.Account, "", 1, f.Category)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		if len(rd.CategoryIDs) == 0 {
+			return nil, nil, true, nil
+		}
+		add("f.identity_account_id IN ?", rd.CategoryIDs)
+	}
 	if f.Q != "" {
 		like := "%" + strings.ReplaceAll(strings.ReplaceAll(f.Q, "%", `\%`), "_", `\_`) + "%"
 		add("(i.display_name ILIKE ? OR f.role_id ILIKE ? OR f.detail_key ILIKE ?)", like, like, like)
 	}
+	return where, args, false, nil
+}
+
+// listFindings is GET /findings at a revision: findings ordered by
+// fingerprint, cursor-paged. group=role is listFindingGroups. db is the
+// caller's workspace-scoped transaction (AS-108).
+func (r *GovReader) listFindings(db *gorm.DB, ws uuid.UUID, rev int64, f FindingFilter) ([]FindingView, *string, error) {
+	if f.Limit == 0 {
+		f.Limit = 50
+	}
+	want := govCursor{Route: "findings", WS: ws.String(), Rev: rev, Q: f.key()}
+	after := ""
+	if f.Cursor != "" {
+		var err error
+		if after, err = r.open(f.Cursor, want); err != nil {
+			return nil, nil, err
+		}
+	}
+	if rev == 0 {
+		return []FindingView{}, nil, nil
+	}
+	where, cargs, none, err := r.findingConds(db, ws, f)
+	if err != nil {
+		return nil, nil, err
+	}
+	if none {
+		return []FindingView{}, nil, nil
+	}
+	args := append([]any{rev}, cargs...)
 	if after != "" {
-		add("f.fingerprint > ?", after)
+		where = append(where, "f.fingerprint > ?")
+		args = append(args, after)
 	}
 	q := fmt.Sprintf(findingSelect, "") + " WHERE " + strings.Join(where, " AND ") + " ORDER BY f.fingerprint LIMIT ?"
 	args = append(args, f.Limit+1)
 	var rows []findingRow
-	if err := r.db.Raw(q, args...).Scan(&rows).Error; err != nil {
+	if err := db.Raw(q, args...).Scan(&rows).Error; err != nil {
 		return nil, nil, err
 	}
 	var next *string
@@ -437,38 +552,137 @@ func (r *GovReader) ListFindings(ws uuid.UUID, rev int64, f FindingFilter) ([]Fi
 	return out, next, nil
 }
 
-// RoleGroup is one role's findings (group=role).
+// RoleGroup is one role's findings (group=role), with the workloads that run
+// as the role.
 type RoleGroup struct {
-	RoleID            *string       `json:"role_id"`
-	IdentityAccountID *uuid.UUID    `json:"identity_account_id"`
-	RoleName          string        `json:"role_name"`
-	RoleARN           string        `json:"role_arn"`
-	Findings          []FindingView `json:"findings"`
+	RoleID            *string         `json:"role_id"`
+	IdentityAccountID *uuid.UUID      `json:"identity_account_id"`
+	RoleName          string          `json:"role_name"`
+	RoleARN           string          `json:"role_arn"`
+	Findings          []FindingView   `json:"findings"`
+	Workloads         []GroupWorkload `json:"workloads"`
+	WorkloadCount     int             `json:"workload_count"`
 }
 
-// GroupByRole groups one page of findings by role, in first-seen order
-// (DECISION E10: the page is of findings; a role whose findings straddle two
-// pages appears on both).
-func GroupByRole(fs []FindingView) []RoleGroup {
+// GroupWorkload is a workload that runs as a role.
+type GroupWorkload struct {
+	WorkloadID  uuid.UUID `json:"workload_id"`
+	Name        string    `json:"name"`
+	RuntimeKind string    `json:"runtime_kind"`
+}
+
+// groupWorkloadsShown caps the workloads named per role; the count is whole.
+const groupWorkloadsShown = 5
+
+// groupNoRole is the sort key of the findings that have no role.
+const groupNoRole = "zzzz"
+
+// listFindingGroups is GET /findings?group=role: one entry per role, the page
+// being of roles (limit roles, ordered by identity id, the findings with no
+// role last). A role's findings are all of them that match the filter, never
+// a part split across pages. db is the caller's workspace-scoped transaction
+// (AS-108).
+func (r *GovReader) listFindingGroups(db *gorm.DB, ws uuid.UUID, rev int64, f FindingFilter) ([]RoleGroup, *string, error) {
+	if f.Limit == 0 {
+		f.Limit = 50
+	}
+	want := govCursor{Route: "findings", WS: ws.String(), Rev: rev, Q: f.key()}
+	after := ""
+	if f.Cursor != "" {
+		var err error
+		if after, err = r.open(f.Cursor, want); err != nil {
+			return nil, nil, err
+		}
+	}
+	if rev == 0 {
+		return []RoleGroup{}, nil, nil
+	}
+	where, cargs, none, err := r.findingConds(db, ws, f)
+	if err != nil {
+		return nil, nil, err
+	}
+	if none {
+		return []RoleGroup{}, nil, nil
+	}
+	const key = `coalesce(f.identity_account_id::text, '` + groupNoRole + `')`
+	join := ` FROM iga_gov_finding f
+	  JOIN iga_gov_finding_result r ON r.workspace_id = f.workspace_id AND r.finding_id = f.id AND r.rev = ?
+	  LEFT JOIN iga_identity_accounts i ON i.workspace_id = f.workspace_id AND i.id = f.identity_account_id`
+	pageWhere := append([]string{}, where...)
+	args := append([]any{rev}, cargs...)
+	if after != "" {
+		pageWhere = append(pageWhere, key+" > ?")
+		args = append(args, after)
+	}
+	var keys []string
+	if err := db.Raw("SELECT "+key+" AS k"+join+" WHERE "+strings.Join(pageWhere, " AND ")+" GROUP BY k ORDER BY k LIMIT ?",
+		append(args, f.Limit+1)...).Scan(&keys).Error; err != nil {
+		return nil, nil, err
+	}
+	var next *string
+	if len(keys) > f.Limit {
+		keys = keys[:f.Limit]
+		c := want
+		c.After = keys[len(keys)-1]
+		s := r.sign(c)
+		next = &s
+	}
+	if len(keys) == 0 {
+		return []RoleGroup{}, next, nil
+	}
+	var rows []findingRow
+	if err := db.Raw(fmt.Sprintf(findingSelect, "")+" WHERE "+strings.Join(where, " AND ")+" AND "+key+" IN ? ORDER BY "+key+", f.fingerprint",
+		append(append([]any{rev}, cargs...), keys)...).Scan(&rows).Error; err != nil {
+		return nil, nil, err
+	}
 	idx := map[string]int{}
-	var out []RoleGroup
-	for _, f := range fs {
-		k := ""
-		if f.IdentityAccountID != nil {
-			k = f.IdentityAccountID.String()
+	out := make([]RoleGroup, 0, len(keys))
+	var ids []uuid.UUID
+	for _, fr := range rows {
+		v := fr.view()
+		k := groupNoRole
+		if v.IdentityAccountID != nil {
+			k = v.IdentityAccountID.String()
 		}
 		i, ok := idx[k]
 		if !ok {
 			i = len(out)
 			idx[k] = i
-			out = append(out, RoleGroup{RoleID: f.RoleID, IdentityAccountID: f.IdentityAccountID, RoleName: f.RoleName, RoleARN: f.RoleARN})
+			out = append(out, RoleGroup{RoleID: v.RoleID, IdentityAccountID: v.IdentityAccountID, RoleName: v.RoleName, RoleARN: v.RoleARN,
+				Workloads: []GroupWorkload{}})
+			if v.IdentityAccountID != nil {
+				ids = append(ids, *v.IdentityAccountID)
+			}
 		}
-		out[i].Findings = append(out[i].Findings, f)
+		out[i].Findings = append(out[i].Findings, v)
 	}
-	if out == nil {
-		out = []RoleGroup{}
+	if len(ids) > 0 {
+		var ws2 []struct {
+			IdentityID  uuid.UUID
+			WorkloadID  uuid.UUID
+			Name        string
+			RuntimeKind string
+		}
+		if err := db.Raw(`SELECT DISTINCT r.target_identity_account_id AS identity_id, w.id AS workload_id, w.display_name AS name, w.runtime_kind
+		                      FROM iga_relationship r
+		                      JOIN iga_workload w ON w.workspace_id = r.workspace_id AND w.id = r.source_workload_id
+		                     WHERE r.workspace_id = ? AND r.target_identity_account_id IN ? AND r.state <> 'ended'
+		                       AND r.relationship_type IN ('executes_as','task_execution_role')
+		                     ORDER BY identity_id, name, workload_id`, ws, ids).Scan(&ws2).Error; err != nil {
+			return nil, nil, err
+		}
+		for _, w := range ws2 {
+			i, ok := idx[w.IdentityID.String()]
+			if !ok {
+				continue
+			}
+			out[i].WorkloadCount++
+			if len(out[i].Workloads) < groupWorkloadsShown {
+				out[i].Workloads = append(out[i].Workloads, GroupWorkload{WorkloadID: w.WorkloadID, Name: w.Name, RuntimeKind: w.RuntimeKind})
+			}
+		}
 	}
-	return out
+	return out, next, nil
 }
 
 // FindingSummary is GET /findings/summary.
@@ -480,7 +694,7 @@ type FindingSummary struct {
 }
 
 // Summary counts the findings whose condition holds at rev.
-func (r *GovReader) Summary(ws uuid.UUID, rev int64) (FindingSummary, error) {
+func (r *GovReader) summary(db *gorm.DB, ws uuid.UUID, rev int64) (FindingSummary, error) {
 	s := FindingSummary{ByKind: map[string]int{}, ByStatus: map[string]int{}, BySeverity: map[string]int{}}
 	if rev == 0 {
 		return s, nil
@@ -491,7 +705,7 @@ func (r *GovReader) Summary(ws uuid.UUID, rev int64) (FindingSummary, error) {
 		Severity string
 		N        int
 	}
-	if err := r.db.Raw(`SELECT f.kind, f.status, r.severity, count(*) AS n
+	if err := db.Raw(`SELECT f.kind, f.status, r.severity, count(*) AS n
 	                      FROM iga_gov_finding_result r
 	                      JOIN iga_gov_finding f ON f.workspace_id = r.workspace_id AND f.id = r.finding_id
 	                     WHERE r.workspace_id = ? AND r.rev = ?
@@ -515,6 +729,9 @@ type FindingDetail struct {
 	Owners              []TargetOwnerView               `json:"owners"`
 	LinkedPolicy        *LinkedPolicy                   `json:"linked_policy"`
 	Consumers           []ConsumerView                  `json:"consumers"`
+	// ActionEvidence is an unused_action finding's frozen R1b evidence at
+	// rev (omitted for every other kind).
+	ActionEvidence []GovActionEvidence `json:"action_evidence,omitempty"`
 }
 
 // LinkedPolicy is the live control on the finding's role, if any.
@@ -525,10 +742,10 @@ type LinkedPolicy struct {
 }
 
 // Finding reads one finding at rev. Another workspace's id is 404.
-func (r *GovReader) Finding(ws, id uuid.UUID, rev int64) (*FindingDetail, error) {
+func (r *GovReader) finding(db *gorm.DB, ws, id uuid.UUID, rev int64) (*FindingDetail, error) {
 	var rows []findingRow
 	q := fmt.Sprintf(findingSelect, "LEFT") + " WHERE f.workspace_id = ? AND f.id = ?"
-	if err := r.db.Raw(q, rev, ws, id).Scan(&rows).Error; err != nil {
+	if err := db.Raw(q, rev, ws, id).Scan(&rows).Error; err != nil {
 		return nil, err
 	}
 	if len(rows) != 1 {
@@ -541,9 +758,19 @@ func (r *GovReader) Finding(ws, id uuid.UUID, rev int64) (*FindingDetail, error)
 	if d.IdentityAccountID == nil {
 		return d, nil
 	}
-	q2 := r.db.Where("workspace_id = ? AND rev = ? AND identity_account_id = ?", ws, rev, *d.IdentityAccountID)
+	q2 := db.Where("workspace_id = ? AND rev = ? AND identity_account_id = ?", ws, rev, *d.IdentityAccountID)
 	if d.Kind == igagov.KindUnusedService {
 		q2 = q2.Where("service = ?", d.DetailKey)
+	}
+	if d.Kind == igagov.KindUnusedAction {
+		// R1b: the service's activity evidence and the action's own.
+		ns, _, _ := igagov.SplitAction(d.DetailKey)
+		q2 = q2.Where("service = ?", ns)
+		d.ActionEvidence = []GovActionEvidence{}
+		if err := db.Where("workspace_id = ? AND rev = ? AND identity_account_id = ? AND action_key = ?",
+			ws, rev, *d.IdentityAccountID, d.DetailKey).Find(&d.ActionEvidence).Error; err != nil {
+			return nil, err
+		}
 	}
 	if err := q2.Order("service").Find(&d.Evidence).Error; err != nil {
 		return nil, err
@@ -559,15 +786,15 @@ func (r *GovReader) Finding(ws, id uuid.UUID, rev int64) (*FindingDetail, error)
 		}
 	}
 	var err error
-	if d.Consumers, err = consumersOf(r.db, ws, *d.IdentityAccountID); err != nil {
+	if d.Consumers, err = consumersOf(db, ws, *d.IdentityAccountID); err != nil {
 		return nil, err
 	}
-	if d.Owners, err = ownersOf(r.db, ws, *d.IdentityAccountID, d.Consumers); err != nil {
+	if d.Owners, err = ownersOf(db, ws, *d.IdentityAccountID, d.Consumers); err != nil {
 		return nil, err
 	}
 	if d.RoleID != nil {
 		var lp []LinkedPolicy
-		if err := r.db.Raw(`SELECT id AS control_id, policy_id, state FROM iga_gov_control
+		if err := db.Raw(`SELECT id AS control_id, policy_id, state FROM iga_gov_control
 		                     WHERE workspace_id = ? AND role_id = ? AND state <> 'removed'`, ws, *d.RoleID).Scan(&lp).Error; err != nil {
 			return nil, err
 		}
@@ -578,10 +805,35 @@ func (r *GovReader) Finding(ws, id uuid.UUID, rev int64) (*FindingDetail, error)
 	return d, nil
 }
 
+// ActionEvidence is GET /identities/:id/action-evidence at rev (R1b).
+func (r *GovReader) ActionEvidence(ws, identity uuid.UUID, rev int64) ([]GovActionEvidence, error) {
+	var out []GovActionEvidence
+	err := r.readIn(ws, func(tx *gorm.DB) error {
+		var n int64
+		if err := tx.Raw(`SELECT count(*) FROM iga_identity_accounts WHERE workspace_id = ? AND id = ?`, ws, identity).Scan(&n).Error; err != nil {
+			return err
+		}
+		if n == 0 {
+			return GovNotFound()
+		}
+		if rev == 0 {
+			out = []GovActionEvidence{}
+			return nil
+		}
+		var err error
+		out, err = actionEvidenceAt(tx, ws, rev, identity)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ActivityEvidence is GET /identities/:id/activity-evidence at rev.
-func (r *GovReader) ActivityEvidence(ws, identity uuid.UUID, rev int64) ([]models.IGAGovActivityEvidence, error) {
+func (r *GovReader) activityEvidence(db *gorm.DB, ws, identity uuid.UUID, rev int64) ([]models.IGAGovActivityEvidence, error) {
 	var n int64
-	if err := r.db.Raw(`SELECT count(*) FROM iga_identity_accounts WHERE workspace_id = ? AND id = ?`, ws, identity).Scan(&n).Error; err != nil {
+	if err := db.Raw(`SELECT count(*) FROM iga_identity_accounts WHERE workspace_id = ? AND id = ?`, ws, identity).Scan(&n).Error; err != nil {
 		return nil, err
 	}
 	if n == 0 {
@@ -591,15 +843,15 @@ func (r *GovReader) ActivityEvidence(ws, identity uuid.UUID, rev int64) ([]model
 	if rev == 0 {
 		return out, nil
 	}
-	err := r.db.Where("workspace_id = ? AND rev = ? AND identity_account_id = ?", ws, rev, identity).Order("service").Find(&out).Error
+	err := db.Where("workspace_id = ? AND rev = ? AND identity_account_id = ?", ws, rev, identity).Order("service").Find(&out).Error
 	return out, err
 }
 
 // EvidenceBundle is GET /evidence-bundles/:id: the stored canonical facts,
 // re-verified (igagov.ParseBundle), with trust re-derived from the facts.
-func (r *GovReader) EvidenceBundle(ws, id uuid.UUID) (map[string]any, error) {
+func (r *GovReader) evidenceBundle(db *gorm.DB, ws, id uuid.UUID) (map[string]any, error) {
 	var b models.IGAGovEvidenceBundle
-	if err := r.db.Where("workspace_id = ? AND id = ?", ws, id).Take(&b).Error; err != nil {
+	if err := db.Where("workspace_id = ? AND id = ?", ws, id).Take(&b).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, GovNotFound()
 		}

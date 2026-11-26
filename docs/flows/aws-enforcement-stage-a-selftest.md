@@ -195,7 +195,7 @@ Then `aws iam delete-policy --profile enf --policy-arn $P2` → ok.
 
 ## 7. Optional: the same self-test through AuthSec
 
-On a lab AuthSec deployment with `IGA_POLICY=on` and the lab account connected:
+On a lab AuthSec deployment with the lab account connected:
 `POST /authsec/discovery/aws/connectors/:id/enforcement/sessions` (deploy with
 the returned `stack_parameters`, or open `quick_create_url`), then either let
 the callback bind it or `POST .../enforcement` with both role ARNs, then

@@ -9,11 +9,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+
+	"github.com/authsec-ai/authsec/internal/githubhost"
 )
 
 // GitHub-App installation tokens are minted (not OAuth-refreshed): sign a short
@@ -31,6 +34,12 @@ type GitHubAppCreds struct {
 	AppID          string
 	PrivateKeyPEM  string
 	InstallationID string
+	// ProviderHost is the GitHub host the App is installed on; blank is
+	// github.com. A GitHub Enterprise Server host is validated
+	// (internal/githubhost) before the App JWT is sent to it, and it must
+	// come from the workspace's verified integration record, never from
+	// request input.
+	ProviderHost string
 }
 
 type ghInstallToken struct {
@@ -65,6 +74,7 @@ func ghCacheKey(creds GitHubAppCreds) string {
 		creds.WorkspaceID,
 		creds.AppID,
 		creds.InstallationID,
+		strings.ToLower(strings.TrimSpace(creds.ProviderHost)),
 		hex.EncodeToString(sum[:8]),
 	}, ":")
 }
@@ -94,6 +104,11 @@ func MintGitHubInstallationToken(ctx context.Context, creds GitHubAppCreds) (str
 	if creds.WorkspaceID == "" {
 		return "", fmt.Errorf("github app credentials incomplete (workspace is required to scope the token cache)")
 	}
+	// Validated before the JWT is signed: an invalid host never receives it.
+	apiBase, err := githubhost.APIBase(creds.ProviderHost)
+	if err != nil {
+		return "", err
+	}
 	cacheKey := ghCacheKey(creds)
 
 	ghTokenCacheMu.Lock()
@@ -109,7 +124,7 @@ func MintGitHubInstallationToken(ctx context.Context, creds GitHubAppCreds) (str
 		return "", err
 	}
 
-	endpoint := fmt.Sprintf("https://api.github.com/app/installations/%s/access_tokens", creds.InstallationID)
+	endpoint := fmt.Sprintf("%s/app/installations/%s/access_tokens", apiBase, url.PathEscape(creds.InstallationID))
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, nil)
 	if err != nil {
 		return "", err

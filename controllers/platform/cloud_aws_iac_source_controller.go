@@ -21,7 +21,7 @@ import (
 //	POST   /aws/connectors/:id/iac-sources        governance:enforce  map a repository directory (format, discovery_source_id, repository, base_branch, directory, role_match)
 //	DELETE /aws/connectors/:id/iac-sources/:sid   governance:enforce  remove a mapping (409 iac_source_in_use once PRs were opened from it)
 //
-// The Phase 3 rules apply (§7 intro): the IGA_POLICY gate, the workspace
+// The Phase 3 rules apply (§7 intro): the policy gate, the workspace
 // from the token only, another workspace's connector or source 404, the
 // {data, meta} / {error} envelope, an iga_gov_event in the service's
 // transaction and an audit_events row here.
@@ -53,7 +53,7 @@ func RegisterIaCSourceRoutes(discovery gin.IRouter, ctl *CloudIaCSourceControlle
 	g.DELETE("/:sid", req("governance", "enforce"), ctl.Delete)
 }
 
-// Gate is the IGA_POLICY middleware (fail closed).
+// Gate is the policy middleware (fail closed).
 func (ctl *CloudIaCSourceController) Gate() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var gate *services.PolicyGate

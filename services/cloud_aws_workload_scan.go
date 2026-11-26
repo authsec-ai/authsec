@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/agentruntime"
 	"github.com/authsec-ai/authsec/internal/awsdiscovery"
 	"github.com/authsec-ai/authsec/internal/igagraph"
 	"github.com/authsec-ai/authsec/models"
@@ -57,6 +58,14 @@ type AWSWorkloadScanner struct {
 	activityAPI   awsdiscovery.ServiceLastAccessedAPI
 	// activitySleep replaces the polling delay, so a test does not wait.
 	activitySleep func(context.Context, time.Duration) error
+
+	// fence is the run's fence (WithFence), for the model-call evidence and
+	// CloudTrail cursor writes the repositories above do not make.
+	fence *repositories.ScanFence
+	// trailClock replaces the CloudTrail reader's clock (tests).
+	trailClock func() time.Time
+	// dns holds the DNS query-log read's test seams (agent_runtime_dns.go).
+	dns dnsScanConfig
 }
 
 // NewAWSWorkloadScanner constructs the scanner.
@@ -161,6 +170,22 @@ type WorkloadSnapshot struct {
 	// can fold it into the overall report instead of dropping it. Keyed
 	// "<surface>:<region>" per compute surface, plus "activity" globally.
 	Surfaces map[string]models.SurfaceCoverage
+	// ModelCallUsageWritten counts the cloud_usage model-call rows written
+	// (source cloudtrail, service bedrock; §5.1), across regions.
+	ModelCallUsageWritten int
+	// regions are the connector's selected regions for this scan.
+	regions []string
+	// trackedFrom is the oldest counted-event id kept for the connector,
+	// read once per scan (trackedKnown) before any region writes.
+	trackedFrom  *time.Time
+	trackedKnown bool
+	// DNSTrafficFindings counts the ai_network_traffic findings opened or
+	// refreshed from Route 53 Resolver query logs (§11), across regions.
+	DNSTrafficFindings int
+	// Warnings are failures that cost evidence but not the scan: the focused
+	// Bedrock CloudTrail pass, the model-call evidence write, the dispatch to
+	// agent-runtime sinks. Never a reason to fail or to mark coverage.
+	Warnings []string
 }
 
 // ScanFromSnapshot reads workloads and activity for the identities a
@@ -187,6 +212,7 @@ func (s *AWSWorkloadScanner) ScanFromSnapshot(
 	}
 	connAttrs := connector.AWSAttrs()
 	regions := connAttrs.Regions
+	out.regions = regions
 	// The scope a constructed ARN is built in (T3.6): the connector's own
 	// partition and account, never assumed.
 	scope := arnScope{partition: connAttrs.Partition, account: snapshot.AccountID}
@@ -448,6 +474,9 @@ func (s *AWSWorkloadScanner) scanRegion(
 	// its ARN, constructed in the connector's partition (T3.6).
 	bedrock := awsdiscovery.NewBedrockReader(b, ac).WithScope(scope.partition, region, scope.account)
 	trail := awsdiscovery.NewCloudTrailReader(ct)
+	if s.trailClock != nil {
+		trail = trail.WithClock(s.trailClock)
+	}
 
 	surfaces := []struct {
 		prefix      string
@@ -483,6 +512,8 @@ func (s *AWSWorkloadScanner) scanRegion(
 	s.scanCredentialProviders(ctx, workspaceID, snapshot, region, bedrock, out)
 	s.scanCloudTrail(ctx, workspaceID, snapshot, region, trail, out)
 	s.scanTrailStatus(ctx, workspaceID, snapshot, region, trail, out)
+	s.scanDNSQueryLogs(ctx, workspaceID, snapshot, scope, region, out)
+	s.scanAgentActivitySpans(ctx, workspaceID, snapshot, region, out) // agent_runtime_activity_spans.go
 }
 
 // scanGateways reads AgentCore Gateways and their targets. Gateways are
@@ -532,7 +563,7 @@ func (s *AWSWorkloadScanner) scanGateways(
 // regionalCoverage is surfaceResult for one compute surface in one region,
 // with one extra guard on "unsupported".
 //
-// An endpoint that does not resolve means the service is not offered there
+// AWS documents the service as absent there and the endpoint does not resolve
 // (ErrServiceNotInRegion), and unsupported blocks nothing. But if an earlier
 // scan COLLECTED this runtime kind in this region, the service evidently is
 // offered there, and a resolver failure is the likelier story; unsupported
@@ -641,8 +672,8 @@ func (s *AWSWorkloadScanner) scanCredentialProviders(
 	out.Surfaces[key] = surfaceResult(len(providers), err)
 }
 
-// scanCloudTrail reads recent management events and records each one it can
-// attribute as evidence against that identity (SPEC-iga-phase3-policy.md
+// scanCloudTrail reads the region's management events and records each one
+// it can attribute as evidence against that identity (SPEC-iga-phase3-policy.md
 // §8.6, T3.04). Attribution is by the record's own userIdentity -- a session
 // by its sessionContext.sessionIssuer (the role's ARN and RoleId), an IAM
 // user's call by its ARN -- never by matching a session name against role
@@ -651,6 +682,17 @@ func (s *AWSWorkloadScanner) scanCredentialProviders(
 // even where the match did not -- but are not written as evidence with no
 // subject, since evidence with nothing to be evidence FOR is not useful
 // evidence.
+//
+// Since P1a (SPEC-agent-runtime-visibility.md §5.1) the region is read in two
+// passes, each from its own high-water mark (cloud_trail_cursor): the general
+// pass (unfiltered, from the mark but always at least the last 48 hours, so
+// the cloudtrail-events surface still speaks for exactly what R1b reads it
+// as) and the focused Bedrock pass. Every event either pass returned is
+// recorded as before (deduplicated by event id), folded into model-call
+// evidence (cloud_usage, services/agent_runtime_evidence.go) and handed to the
+// agent-runtime sinks (agentruntime.Dispatch). The Bedrock pass, the evidence
+// write and the dispatch never fail the scan or change its coverage: a
+// failure is logged and becomes a warning.
 func (s *AWSWorkloadScanner) scanCloudTrail(
 	ctx context.Context, workspaceID uuid.UUID, snapshot *IAMSnapshot,
 	region string, trail *awsdiscovery.CloudTrailReader, out *WorkloadSnapshot,
@@ -659,16 +701,76 @@ func (s *AWSWorkloadScanner) scanCloudTrail(
 	// above: bonus evidence, no reconciled table, must not block
 	// Lambda/ECS/EC2's own otherwise-complete reconciliation.
 	key := models.SurfaceRegional(models.SurfaceCloudTrailEventsPrefix, region)
-	events, err := trail.RecentEvents(ctx)
-	if s.evidence != nil && len(events) > 0 {
-		resolve, rerr := s.trailAttribution(workspaceID, snapshot.ConnectorID, events)
+	warn := func(format string, args ...any) {
+		msg := fmt.Sprintf("cloudtrail %s: ", region) + fmt.Sprintf(format, args...)
+		log.Printf("aws workload scan: %s", msg)
+		out.Warnings = append(out.Warnings, msg)
+	}
+
+	// The marks. Without them nothing may be counted (a window would be
+	// counted twice): the general pass then reads its legacy 48 hours for
+	// the observations, and there is no Bedrock pass and no evidence write.
+	store := trailEvidenceStore{db: s.db, fence: s.fence}
+	evidenceOK := s.db != nil
+	var marks map[string]time.Time
+	if evidenceOK {
+		var cerr error
+		if marks, cerr = store.Cursors(ctx, workspaceID, snapshot.ConnectorID, region); cerr != nil {
+			warn("reading the CloudTrail cursors: %v; model-call evidence skipped this scan", cerr)
+			evidenceOK = false
+		}
+	}
+	generalSince := marks[awsdiscovery.TrailStreamGeneral]
+	if !evidenceOK {
+		generalSince = time.Now().Add(-awsdiscovery.TrailLegacyWindow)
+	}
+
+	reads := map[string]awsdiscovery.TrailWindowRead{}
+	readErrs := map[string]error{}
+	general, err := trail.ReadWindow(ctx, awsdiscovery.TrailWindowRequest{
+		Stream: awsdiscovery.TrailStreamGeneral, Since: generalSince})
+	reads[awsdiscovery.TrailStreamGeneral], readErrs[awsdiscovery.TrailStreamGeneral] = general, err
+	var bedrock awsdiscovery.TrailWindowRead
+	if evidenceOK {
+		var berr error
+		bedrock, berr = trail.ReadWindow(ctx, awsdiscovery.TrailWindowRequest{
+			Stream: awsdiscovery.TrailStreamBedrock, Since: marks[awsdiscovery.TrailStreamBedrock]})
+		reads[awsdiscovery.TrailStreamBedrock], readErrs[awsdiscovery.TrailStreamBedrock] = bedrock, berr
+		switch {
+		case berr != nil && !bedrock.Settled:
+			warn("bedrock pass failed: %v", berr)
+		case bedrock.Partial:
+			warn("bedrock pass partial: read back to %s of a window from %s",
+				bedrock.CoveredFrom.Format(time.RFC3339), bedrock.WindowFrom.Format(time.RFC3339))
+		}
+	}
+
+	records := awsdiscovery.MergeTrailRecords(general.Records, bedrock.Records)
+	events := make([]awsdiscovery.TrailEvent, 0, len(records))
+	for _, rec := range records {
+		events = append(events, rec.Trail)
+	}
+
+	var resolve func(awsdiscovery.Attribution) (*models.CloudIdentity, bool)
+	if (s.evidence != nil || evidenceOK) && len(events) > 0 {
+		var rerr error
+		resolve, rerr = s.trailAttribution(workspaceID, snapshot.ConnectorID, events)
 		if rerr != nil {
 			// Our own read failed: nothing is attributed this run rather than
 			// something attributed against a partial inventory. The surface's
 			// own state is AWS's, unchanged.
 			log.Printf("aws workload scan: cloudtrail attribution in %s: %v", region, rerr)
 			resolve = func(awsdiscovery.Attribution) (*models.CloudIdentity, bool) { return nil, false }
+			if evidenceOK {
+				// Counting now would advance the marks past events that were
+				// never attributed.
+				warn("attributing events: %v; model-call evidence skipped this scan", rerr)
+				evidenceOK = false
+			}
 		}
+	}
+
+	if s.evidence != nil && resolve != nil {
 		for _, e := range events {
 			att := e.Attribution()
 			identity, matched := resolve(att)
@@ -691,7 +793,78 @@ func (s *AWSWorkloadScanner) scanCloudTrail(
 			}
 		}
 	}
-	out.Surfaces[key] = surfaceResult(len(events), err)
+	out.Surfaces[key] = legacyTrailCoverage(general, err)
+
+	if evidenceOK {
+		// The reads overlap the previous ones by awsdiscovery.TrailLateLookback:
+		// events already counted are skipped by their id.
+		from := general.WindowFrom
+		if !bedrock.WindowFrom.IsZero() && (from.IsZero() || bedrock.WindowFrom.Before(from)) {
+			from = bedrock.WindowFrom
+		}
+		seen, serr := store.SeenEvents(ctx, workspaceID, snapshot.ConnectorID, from)
+		if serr != nil {
+			warn("reading counted events: %v; model-call evidence skipped this scan", serr)
+			evidenceOK = false
+		}
+		counting := unseenRecords(records, seen)
+		// Whether ids are tracked for this connector is decided once per scan,
+		// before any region writes, so every region sees the same answer.
+		if evidenceOK && !out.trackedKnown {
+			out.trackedFrom, serr = store.TrackedFrom(ctx, workspaceID, snapshot.ConnectorID)
+			if serr != nil {
+				warn("reading counted-event tracking: %v; model-call evidence skipped this scan", serr)
+				evidenceOK = false
+			}
+			out.trackedKnown = serr == nil
+		}
+		cgeneral, cbedrock := countFloored(general, out.trackedFrom), countFloored(bedrock, out.trackedFrom)
+		if evidenceOK {
+			w := modelCallWrite{
+				WorkspaceID: workspaceID, ConnectorID: snapshot.ConnectorID,
+				Generation: snapshot.Generation, Region: region,
+				Reads: reads, Errors: readErrs, CurrentRegions: out.regions,
+				Deltas: aggregateModelCalls(cgeneral, cbedrock, counting, modelCallResolverFrom(resolve)),
+				Root:   aggregateRootModelCalls(cgeneral, cbedrock, counting),
+			}
+			n, werr := store.Record(ctx, w)
+			if werr != nil {
+				warn("recording model-call evidence: %v", werr)
+			}
+			out.ModelCallUsageWritten += n
+		}
+	}
+
+	normalised := make([]agentruntime.Event, 0, len(records))
+	for _, rec := range records {
+		normalised = append(normalised, rec.Event)
+	}
+	// A sink that panics must not take the scan down with it (the dispatch is
+	// bonus evidence, never a reason to fail one).
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				warn("agent-runtime dispatch panicked: %v", r)
+			}
+		}()
+		if derr := agentruntime.Dispatch(ctx, workspaceID, snapshot.ConnectorID, normalised); derr != nil {
+			warn("agent-runtime dispatch: %v", derr)
+		}
+	}()
+}
+
+// legacyTrailCoverage is the cloudtrail-events surface as it has always read:
+// the general pass over the last 48 hours. Reached when the read covered all
+// of them (a cap hit further back than that leaves them whole); partial when
+// the cap stopped it inside them; the failure's own state otherwise. Count is
+// the events of those 48 hours. R1b reads the surface as exactly that window
+// (services/iga_gov_r1b_evidence.go).
+func legacyTrailCoverage(read awsdiscovery.TrailWindowRead, err error) models.SurfaceCoverage {
+	count := read.LegacyCount()
+	if err != nil && read.CapHit && read.LegacyReached() {
+		err = nil
+	}
+	return surfaceResult(count, err)
 }
 
 // trailAttribution resolves the events' attribution keys against the
@@ -713,7 +886,24 @@ func (s *AWSWorkloadScanner) trailAttribution(
 			names[att.UserName] = true
 		}
 	}
-	identities, err := s.identities.FindForAttribution(workspaceID, connectorID, sortedKeys(arns), sortedKeys(names))
+	return trailIdentityMatcher(s.identities, workspaceID, connectorID, sortedKeys(arns), sortedKeys(names))
+}
+
+// trailAttributionFinder is the one read trailIdentityMatcher needs
+// (repositories.CloudIdentityRepository.FindForAttribution).
+type trailAttributionFinder interface {
+	FindForAttribution(workspaceID, connectorID uuid.UUID, nativeIDs, iamUserNames []string) ([]models.CloudIdentity, error)
+}
+
+// trailIdentityMatcher reads the connector's identities named by arns (and
+// IAM users named by names) in ONE read and returns the matcher with the
+// incarnation check described on trailAttribution. Shared by the scan and the
+// live model-call sink (agent_runtime_live.go), so both attribute an event
+// to exactly the same identity.
+func trailIdentityMatcher(
+	find trailAttributionFinder, workspaceID, connectorID uuid.UUID, arns, names []string,
+) (func(awsdiscovery.Attribution) (*models.CloudIdentity, bool), error) {
+	identities, err := find.FindForAttribution(workspaceID, connectorID, arns, names)
 	if err != nil {
 		return nil, err
 	}
@@ -865,15 +1055,17 @@ func (s *AWSWorkloadScanner) recordWorkload(
 	}
 
 	attrs := models.AWSWorkloadAttrs{
-		ExecutionRoleARN:   w.ExecutionRoleARN,
-		InstanceProfileARN: w.InstanceProfileARN,
-		EnvVarNames:        w.EnvVarNames,
-		EnvVarsUnread:      w.EnvVarsUnread,
-		FoundationModel:    w.FoundationModel,
-		Status:             w.Status,
-		DetailIncomplete:   w.DetailIncomplete,
-		DetailError:        w.DetailError,
-		TargetsIncomplete:  w.TargetsIncomplete,
+		ExecutionRoleARN:    w.ExecutionRoleARN,
+		InstanceProfileARN:  w.InstanceProfileARN,
+		EnvVarNames:         w.EnvVarNames,
+		EnvVarsUnread:       w.EnvVarsUnread,
+		VPCSubnetIDs:        w.VPCSubnetIDs,
+		VPCSecurityGroupIDs: w.VPCSecurityGroupIDs,
+		FoundationModel:     w.FoundationModel,
+		Status:              w.Status,
+		DetailIncomplete:    w.DetailIncomplete,
+		DetailError:         w.DetailError,
+		TargetsIncomplete:   w.TargetsIncomplete,
 	}
 	for _, t := range w.Targets {
 		attrs.GatewayTargets = append(attrs.GatewayTargets, models.AWSGatewayTarget{
@@ -964,6 +1156,13 @@ func (s *AWSWorkloadScanner) WithEvidence(w *ObservationWriter) *AWSWorkloadScan
 // cannot land them (§2.10A, part 3).
 func (s *AWSWorkloadScanner) WithFence(f repositories.ScanFence) *AWSWorkloadScanner {
 	s.workloads = s.workloads.Fenced(f)
+	s.fence = &f
+	return s
+}
+
+// WithTrailClock replaces the CloudTrail reader's clock (tests).
+func (s *AWSWorkloadScanner) WithTrailClock(now func() time.Time) *AWSWorkloadScanner {
+	s.trailClock = now
 	return s
 }
 

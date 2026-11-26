@@ -19,7 +19,7 @@ func SCIMEventLogger() gin.HandlerFunc {
 		c.Next()
 
 		connIDStr, _ := c.Get("scim_connection_id")
-		wsIDStr, _ := c.Get("workspace_id")
+		wsIDStr, _ := WorkspaceValue(c)
 
 		connID, err := uuid.Parse(connIDStr.(string))
 		if err != nil {

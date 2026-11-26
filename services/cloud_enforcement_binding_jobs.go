@@ -79,6 +79,7 @@ func dueBindingSelfTests(ctx context.Context, db *gorm.DB, now time.Time) ([]Sch
 		WorkspaceID uuid.UUID
 		ID          uuid.UUID
 	}
+	// TENANT-EXEMPT: the verify_binding schedule's due scan spans workspaces; each binding becomes a job of its own workspace.
 	if err := db.Raw(`SELECT workspace_id, id FROM cloud_enforcement_binding
 		WHERE role_arn <> '' AND state IN ('verified','partial','error') AND updated_at < ?
 		ORDER BY workspace_id, id`, now.Add(-BindingSelfTestEvery)).Scan(&rows).Error; err != nil {
@@ -92,7 +93,10 @@ func dueBindingSelfTests(ctx context.Context, db *gorm.DB, now time.Time) ([]Sch
 	return out, nil
 }
 
-// VerifyBindingHandler runs the self-test of the job's binding.
+// VerifyBindingHandler runs the self-test of the job's binding. The
+// workspace is the job's: VerifyBinding acts under row-level security for
+// it, so a job naming another workspace's binding finds nothing (404) and
+// changes nothing.
 func VerifyBindingHandler(ctx context.Context, run *PolicyJobRun) error {
 	if run.Job.SubjectID == nil {
 		return PolicyJobAbandon("verify_binding job without a binding")
@@ -107,7 +111,7 @@ func VerifyBindingHandler(ctx context.Context, run *PolicyJobRun) error {
 	if errors.As(err, &ee) {
 		switch ee.Code {
 		case EnfCodeNotFound, EnfCodeNotBound:
-			log.Printf("[aws-enf] verify_binding %s: %s; nothing to test", *run.Job.SubjectID, ee.Code)
+			log.Printf("[aws-enf] verify_binding workspace %s binding %s: %s; nothing to test", run.Job.WorkspaceID, *run.Job.SubjectID, ee.Code)
 			return nil
 		case EnfCodeSelfTestInProgress:
 			return PolicyJobRetryLater(5*time.Minute, "a self-test is already running")

@@ -94,15 +94,34 @@ func CreateDynamicWebAuthnConfig(rpDisplayName, rpID, origin string) *webauthn.C
 	}
 }
 
+// TOTPEncryptionKey encrypts MFA secrets (TOTP seeds, backup codes, SMS codes).
 var TOTPEncryptionKey []byte
 
-func init() {
-	keyHex := os.Getenv("TOTP_ENCRYPTION_key")
-	if keyHex == "" {
-		log.Println("[WARN] TOTP_ENCRYPTION_KEY not set, using default dev key.")
-		keyHex = "6AB33320B8A8E177655F72CEDDAE56593D045BE5A47416FDE7C7CF983D5B80D6"
-	}
+// LegacyTOTPEncryptionKey is the key every deployment actually used until the
+// env var name was fixed: the code read the misspelled TOTP_ENCRYPTION_key, so
+// this hardcoded value encrypted all MFA secrets (AS-020). It is kept only to
+// decrypt existing ciphertexts and re-encrypt them under TOTPEncryptionKey;
+// nothing new is encrypted with it.
+var LegacyTOTPEncryptionKey = mustDecodeTOTPKey("6AB33320B8A8E177655F72CEDDAE56593D045BE5A47416FDE7C7CF983D5B80D6")
 
+func init() {
+	TOTPEncryptionKey = loadTOTPEncryptionKey()
+}
+
+// loadTOTPEncryptionKey reads TOTP_ENCRYPTION_KEY (64 hex chars).
+func loadTOTPEncryptionKey() []byte {
+	keyHex := os.Getenv("TOTP_ENCRYPTION_KEY")
+	if keyHex == "" {
+		if strings.EqualFold(os.Getenv("ENVIRONMENT"), "production") {
+			log.Fatal("TOTP_ENCRYPTION_KEY must be set in production")
+		}
+		log.Println("[WARN] TOTP_ENCRYPTION_KEY not set, using the legacy development key.")
+		return LegacyTOTPEncryptionKey
+	}
+	return mustDecodeTOTPKey(keyHex)
+}
+
+func mustDecodeTOTPKey(keyHex string) []byte {
 	key, err := hex.DecodeString(keyHex)
 	if err != nil {
 		log.Fatalf("Invalid TOTP_ENCRYPTION_KEY format: %v", err)
@@ -110,8 +129,7 @@ func init() {
 	if len(key) != 32 {
 		log.Fatalf("TOTP_ENCRYPTION_KEY must be 32 bytes (64 hex chars), got %d", len(key))
 	}
-
-	TOTPEncryptionKey = key
+	return key
 }
 
 // SetupWebAuthn configures and returns a WebAuthn instance

@@ -46,6 +46,18 @@ const (
 	LimSurfacePartial               = PreventsSurfacePartial
 	LimSurfaceDenied                = PreventsSurfaceDenied
 	LimActivityAttemptsNotOutcomes  = "activity_attempts_not_outcomes"
+	// LimAzureConditionsNotEvaluated: an Azure grant's condition (an ABAC
+	// condition on a role assignment, a scoped directory role, a compound
+	// Key Vault identity) is shown on its role assignment node, never
+	// evaluated. Stated once in an Azure traversal's meta, for every element
+	// (traverse_azure.go), as effective_access_not_evaluated is.
+	LimAzureConditionsNotEvaluated = "azure_conditions_not_evaluated"
+	// LimAzureScopeAccessNotDrawn: on an Azure resource node, an assignment
+	// at a broader scope (the tenant root, a management group, the
+	// subscription, the resource group, a parent resource) reaches the
+	// resource without naming it, and the graph does not draw it from the
+	// resource (D-114). The access-policy preview reads those live.
+	LimAzureScopeAccessNotDrawn = "azure_scope_access_not_drawn"
 )
 
 // limitationOrder ranks the codes by the §5.3 table. The three surface codes
@@ -67,6 +79,8 @@ var limitationOrder = map[string]int{
 	LimSurfacePartial:               12,
 	LimSurfaceDenied:                12,
 	LimActivityAttemptsNotOutcomes:  13,
+	LimAzureConditionsNotEvaluated:  14,
+	LimAzureScopeAccessNotDrawn:     15,
 }
 
 // FactFreeLimitations are the codes D-35 puts on every graph node, edge and

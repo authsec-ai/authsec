@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
+	"regexp"
 	"strings"
 	"time"
 
@@ -40,6 +42,27 @@ type ActuationManager interface {
 	// EnableActuation mints a per-connector actuation token, returning it ONCE. Only a
 	// hash is stored.
 	EnableActuation(workspaceID, sourceID uuid.UUID) (token string, err error)
+
+	// RequestActuation turns enforcement on without showing anyone a token: the
+	// cluster's agent (0.6.0+, actuation role) generates its own credential and
+	// hands it over on its next heartbeat (AcceptAgentToken). Until then the
+	// connector is pending: discovery still reports under the ingest token, so
+	// turning enforcement on never cuts discovery off. Calling it on a connector
+	// that is on rotates: the old credential stops working at once and the agent
+	// hands over a new one.
+	RequestActuation(workspaceID, sourceID uuid.UUID) error
+
+	// AcceptAgentToken takes the credential a pending connector's agent offers,
+	// returning whether it was taken. Only a pending connector takes one, and
+	// only once: after that, discovery for the connector needs the credential.
+	AcceptAgentToken(workspaceID, sourceID uuid.UUID, token string) (bool, error)
+
+	// DisableActuation turns a cluster's enforcement off: its token stops working
+	// and the cluster reports under its discovery ingest token again. Refused
+	// (*ActuationInUseError) while anything it enforces is still in force -- a
+	// quarantine, a live access policy, an open instruction -- because the agent
+	// could then no longer undo it.
+	DisableActuation(workspaceID, sourceID uuid.UUID) error
 
 	// AuthenticateAgent resolves a presented token to its connector. The token
 	// identifies WHICH cluster is calling, so an agent never asserts its own identity.
@@ -172,6 +195,103 @@ func (m *actuationManager) EnableActuation(workspaceID, sourceID uuid.UUID) (str
 	return token, nil
 }
 
+func (m *actuationManager) RequestActuation(workspaceID, sourceID uuid.UUID) error {
+	var src models.DiscoverySource
+	if err := m.db.First(&src, "id = ? AND workspace_id = ?", sourceID, workspaceID).Error; err != nil {
+		return err
+	}
+	if !src.SelfRegistered {
+		return errors.New("actuation can only be enabled on a self-registered connector: " +
+			"there must be an agent in the cluster to act")
+	}
+	now := time.Now()
+	return m.db.Model(&models.DiscoverySource{}).
+		Where("id = ? AND workspace_id = ?", sourceID, workspaceID).
+		Updates(map[string]interface{}{
+			"actuation_token_hash": "",
+			"actuation_enabled_at": now,
+			"updated_at":           now,
+		}).Error
+}
+
+// agentTokenBody is what follows "authsec_act_" in a credential an agent
+// generates: at least 32 random bytes, base64url without padding, as
+// EnableActuation mints them.
+var agentTokenBody = regexp.MustCompile(`^[A-Za-z0-9_-]{43,128}$`)
+
+func (m *actuationManager) AcceptAgentToken(workspaceID, sourceID uuid.UUID, token string) (bool, error) {
+	if !strings.HasPrefix(token, "authsec_act_") || !agentTokenBody.MatchString(strings.TrimPrefix(token, "authsec_act_")) {
+		return false, errors.New("an actuation credential is authsec_act_ and at least 32 random bytes, base64url")
+	}
+	// Conditional on still being pending, so two replicas offering at once (or
+	// an offer racing a Turn off) cannot replace a credential already taken.
+	res := m.db.Model(&models.DiscoverySource{}).
+		Where("id = ? AND workspace_id = ? AND actuation_enabled_at IS NOT NULL AND actuation_token_hash = ''",
+			sourceID, workspaceID).
+		Updates(map[string]interface{}{
+			"actuation_token_hash": hashActuationToken(token),
+			"updated_at":           time.Now(),
+		})
+	return res.RowsAffected == 1, res.Error
+}
+
+// ActuationInUseError is DisableActuation's refusal: what still needs the
+// cluster's agent to act, by kind.
+type ActuationInUseError struct {
+	Quarantined  int64 `json:"quarantined"`
+	AccessPolicy int64 `json:"access_policies"`
+	Instructions int64 `json:"open_instructions"`
+}
+
+func (e *ActuationInUseError) Error() string {
+	return fmt.Sprintf("enforcement is in use on this cluster: %d quarantined agent(s), %d live access-policy deployment(s), "+
+		"%d open instruction(s); release and end them first, or the agent could not undo them", e.Quarantined, e.AccessPolicy, e.Instructions)
+}
+
+func (m *actuationManager) DisableActuation(workspaceID, sourceID uuid.UUID) error {
+	var src models.DiscoverySource
+	if err := m.db.First(&src, "id = ? AND workspace_id = ?", sourceID, workspaceID).Error; err != nil {
+		return err
+	}
+	if src.ActuationTokenHash == "" && src.ActuationEnabledAt == nil {
+		return nil // already off
+	}
+	var use ActuationInUseError
+	if err := m.db.Model(&models.DiscoveredAgent{}).
+		Where("workspace_id = ? AND discovery_source_id = ? AND status = ?", workspaceID, sourceID, models.DiscoveredAgentQuarantined).
+		Count(&use.Quarantined).Error; err != nil {
+		return err
+	}
+	if err := m.db.Model(&models.ProvisioningInstruction{}).
+		Where("workspace_id = ? AND discovery_source_id = ? AND status IN ?", workspaceID, sourceID,
+			[]string{models.InstructionPending, models.InstructionLeased}).
+		Count(&use.Instructions).Error; err != nil {
+		return err
+	}
+	n, err := K8sAccessLiveOnSource(m.db, workspaceID, sourceID)
+	if err != nil {
+		return err
+	}
+	use.AccessPolicy = n
+	if use.Quarantined+use.Instructions+use.AccessPolicy > 0 {
+		return &use
+	}
+	// The token goes, and so does what the agent last reported it could do: the
+	// console must not show a power the cluster can no longer use.
+	return m.db.Model(&models.DiscoverySource{}).
+		Where("id = ? AND workspace_id = ?", sourceID, workspaceID).
+		Updates(map[string]interface{}{
+			"actuation_token_hash":    "",
+			"actuation_enabled_at":    nil,
+			"enforcement_mode":        "",
+			"enforcement_bindings":    false,
+			"enforcement_evict":       false,
+			"enforcement_delete":      false,
+			"enforcement_force_evict": false,
+			"updated_at":              time.Now(),
+		}).Error
+}
+
 func (m *actuationManager) AuthenticateAgent(token string) (*models.DiscoverySource, error) {
 	if token == "" {
 		return nil, errors.New("actuation token required")
@@ -214,7 +334,9 @@ func (m *actuationManager) Enqueue(workspaceID uuid.UUID,
 		in.DiscoverySourceID, workspaceID).Error; err != nil {
 		return nil, false, fmt.Errorf("unknown connector for this workspace: %w", err)
 	}
-	if src.ActuationTokenHash == "" {
+	// Pending counts: the agent takes the work up as soon as it has handed over
+	// its credential, within a heartbeat.
+	if src.ActuationEnabledAt == nil {
 		return nil, false, errors.New("actuation is not enabled for this cluster: enable it " +
 			"and install the agent with the actuation role before queuing work")
 	}
@@ -286,6 +408,7 @@ func (m *actuationManager) Lease(sourceID uuid.UUID, leasedBy string, max int,
 	// instruction. SKIP LOCKED rather than a plain UPDATE ... LIMIT: without it,
 	// concurrent pollers serialise behind each other's row locks and one blocks on work
 	// it will not get.
+	// TENANT-EXEMPT: leased by the authenticated collector's discovery source (unique id); only that source's rows
 	err := m.db.Raw(`
 		UPDATE provisioning_instructions
 		   SET status = 'leased', lease_expires_at = ?, leased_by = ?,
@@ -305,7 +428,9 @@ func (m *actuationManager) Lease(sourceID uuid.UUID, leasedBy string, max int,
 
 func (m *actuationManager) ReclaimExpiredLeases() (int, error) {
 	// Back to pending, unless it has already burned its attempts — at which point it
-	// becomes visibly failed rather than looping forever.
+	// becomes visibly failed rather than looping forever. leased_by is KEPT: it is
+	// the only record of who held the lease for attempts, so recordLateSuccess can
+	// tell the holder's late report from anyone else's; the next Lease overwrites it.
 	res := m.db.Exec(`
 		UPDATE provisioning_instructions
 		   SET status = CASE WHEN attempts >= ? THEN 'failed' ELSE 'pending' END,
@@ -314,7 +439,7 @@ func (m *actuationManager) ReclaimExpiredLeases() (int, error) {
 		                    THEN 'abandoned: the agent stopped responding after '
 		                         || attempts || ' attempt(s)'
 		                    ELSE error END,
-		       lease_expires_at = NULL, leased_by = '', updated_at = NOW()
+		       lease_expires_at = NULL, updated_at = NOW()
 		 WHERE status = 'leased' AND lease_expires_at < NOW()`,
 		maxActuationAttempts, maxActuationAttempts, maxActuationAttempts)
 	return int(res.RowsAffected), res.Error
@@ -342,9 +467,9 @@ func (m *actuationManager) Report(sourceID, instructionID uuid.UUID,
 	// current holder's, or reopen an instruction already failed or superseded.
 	//
 	// One exception (review fix R1a P2, see recordLateSuccess): a SUCCESS that
-	// arrives after the reporter's lease was reclaimed -- the instruction is
-	// back in the queue and nobody holds it -- is recorded, not refused, so
-	// the work is not re-run.
+	// arrives from the identity that held the reclaimed lease -- the
+	// instruction is back in the queue and nobody holds it now -- is recorded,
+	// not refused, so the work is not re-run.
 	if inst.Status == models.InstructionPending && in.Success && inst.Attempts > 0 {
 		return m.recordLateSuccess(&inst, in, "the lease was reclaimed and the instruction re-queued")
 	}
@@ -391,9 +516,9 @@ func (m *actuationManager) Report(sourceID, instructionID uuid.UUID,
 	// named itself the same as the old one. Expiry is judged by the database
 	// clock, as the reaper judges it.
 	res := m.db.Model(&models.ProvisioningInstruction{}).
-		Where(`id = ? AND discovery_source_id = ? AND status = ? AND leased_by = ?
+		Where(`workspace_id = ? AND id = ? AND discovery_source_id = ? AND status = ? AND leased_by = ?
 		       AND attempts = ? AND lease_expires_at > NOW()`,
-			instructionID, sourceID, models.InstructionLeased, inst.LeasedBy, inst.Attempts).
+			inst.WorkspaceID, instructionID, sourceID, models.InstructionLeased, inst.LeasedBy, inst.Attempts).
 		Updates(updates)
 	if res.Error != nil {
 		return nil, res.Error
@@ -414,14 +539,15 @@ func (m *actuationManager) Report(sourceID, instructionID uuid.UUID,
 		if err := m.applyToAgent(&inst, in, now); err != nil {
 			// The instruction outcome is already recorded; failing here would lose it.
 			// Surfaced through the instruction's error field instead.
-			_ = m.db.Model(&models.ProvisioningInstruction{}).Where("id = ?", instructionID).
+			_ = m.db.Model(&models.ProvisioningInstruction{}).
+				Where("workspace_id = ? AND id = ?", inst.WorkspaceID, instructionID).
 				Update("error", fmt.Sprintf("%s (could not update agent state: %v)",
 					in.Error, err)).Error
 		}
 	}
 
 	var out models.ProvisioningInstruction
-	if err := m.db.First(&out, "id = ?", instructionID).Error; err != nil {
+	if err := m.db.First(&out, "workspace_id = ? AND id = ?", inst.WorkspaceID, instructionID).Error; err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -437,10 +563,16 @@ func (m *actuationManager) Report(sourceID, instructionID uuid.UUID,
 // else holds the instruction:
 //
 //   - pending (reclaimed by the reaper, not re-leased), attempts > 0 (it was
-//     leased at least once): the write is fenced on status = pending AND the
-//     attempts read, so a re-lease in between (which increments attempts)
-//     makes it match nothing and the report is refused as before -- the new
-//     holder's run is the one recorded;
+//     leased at least once): only the identity that held the lease for that
+//     attempt may report late. The reaper keeps leased_by, so the row still
+//     names it, and the reporter must name itself (?pod=) the same. A source's
+//     credential is shared by every agent of the cluster, so an unnamed or
+//     differently named report is refused (ErrInstructionLeaseNotHeld) and the
+//     instruction stays queued; a row reclaimed before the reaper kept the
+//     holder names nobody and is refused too. The write is fenced on
+//     status = pending, the attempts read and that holder, so a re-lease in
+//     between (which increments attempts) makes it match nothing and the
+//     report is refused as before -- the new holder's run is the one recorded;
 //   - leased by the same holder with the lease expired, not yet reaped:
 //     fenced on (leased, leased_by, attempts) as the normal write.
 //
@@ -452,6 +584,11 @@ func (m *actuationManager) Report(sourceID, instructionID uuid.UUID,
 func (m *actuationManager) recordLateSuccess(read *models.ProvisioningInstruction, in ReportInput,
 	why string) (*models.ProvisioningInstruction, error) {
 
+	if read.Status == models.InstructionPending && (read.LeasedBy == "" || in.LeasedBy != read.LeasedBy) {
+		log.Printf("[actuation] instruction %s: late success refused: the reporter is not the holder of attempt %d",
+			read.ID, read.Attempts)
+		return nil, ErrInstructionLeaseNotHeld
+	}
 	result := map[string]interface{}{}
 	for k, v := range in.Result {
 		result[k] = v
@@ -464,11 +601,8 @@ func (m *actuationManager) recordLateSuccess(read *models.ProvisioningInstructio
 	}
 	now := time.Now()
 	q := m.db.Model(&models.ProvisioningInstruction{}).
-		Where("id = ? AND discovery_source_id = ? AND status = ? AND attempts = ?",
-			read.ID, read.DiscoverySourceID, read.Status, read.Attempts)
-	if read.Status == models.InstructionLeased {
-		q = q.Where("leased_by = ?", read.LeasedBy)
-	}
+		Where("workspace_id = ? AND id = ? AND discovery_source_id = ? AND status = ? AND attempts = ? AND leased_by = ?",
+			read.WorkspaceID, read.ID, read.DiscoverySourceID, read.Status, read.Attempts, read.LeasedBy)
 	res := q.Updates(map[string]interface{}{
 		"status": models.InstructionApplied, "applied_at": now, "error": "",
 		"result": json.RawMessage(resultJSON), "lease_expires_at": nil, "leased_by": "", "updated_at": now,
@@ -479,7 +613,7 @@ func (m *actuationManager) recordLateSuccess(read *models.ProvisioningInstructio
 	if res.RowsAffected == 0 {
 		// Re-leased (or closed) meanwhile: the current holder's run counts.
 		var cur models.ProvisioningInstruction
-		if err := m.db.First(&cur, "id = ?", read.ID).Error; err != nil {
+		if err := m.db.First(&cur, "workspace_id = ? AND id = ?", read.WorkspaceID, read.ID).Error; err != nil {
 			return nil, err
 		}
 		if cur.Status == models.InstructionApplied {
@@ -489,12 +623,13 @@ func (m *actuationManager) recordLateSuccess(read *models.ProvisioningInstructio
 	}
 	if read.DiscoveredAgentID != nil {
 		if err := m.applyToAgent(read, in, now); err != nil {
-			_ = m.db.Model(&models.ProvisioningInstruction{}).Where("id = ?", read.ID).
+			_ = m.db.Model(&models.ProvisioningInstruction{}).
+				Where("workspace_id = ? AND id = ?", read.WorkspaceID, read.ID).
 				Update("error", fmt.Sprintf("(could not update agent state: %v)", err)).Error
 		}
 	}
 	var out models.ProvisioningInstruction
-	if err := m.db.First(&out, "id = ?", read.ID).Error; err != nil {
+	if err := m.db.First(&out, "workspace_id = ? AND id = ?", read.WorkspaceID, read.ID).Error; err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -510,7 +645,7 @@ func (m *actuationManager) recordLateSuccess(read *models.ProvisioningInstructio
 // is a lease the reporter no longer holds.
 func (m *actuationManager) classifyRefusedReport(read *models.ProvisioningInstruction) (*models.ProvisioningInstruction, error) {
 	var now models.ProvisioningInstruction
-	if err := m.db.First(&now, "id = ?", read.ID).Error; err != nil {
+	if err := m.db.First(&now, "workspace_id = ? AND id = ?", read.WorkspaceID, read.ID).Error; err != nil {
 		return nil, err
 	}
 	switch {
@@ -563,7 +698,7 @@ func (m *actuationManager) applyToAgent(inst *models.ProvisioningInstruction,
 		return nil
 	}
 	return m.db.Model(&models.DiscoveredAgent{}).
-		Where("id = ?", *inst.DiscoveredAgentID).Updates(updates).Error
+		Where("workspace_id = ? AND id = ?", inst.WorkspaceID, *inst.DiscoveredAgentID).Updates(updates).Error
 }
 
 /* --------------------------------- reads --------------------------------- */
@@ -715,7 +850,7 @@ func enqueueEviction(db *gorm.DB, workspaceID uuid.UUID, agent *models.Discovere
 		return
 	}
 	var src models.DiscoverySource
-	if err := db.First(&src, "id = ?", *agent.DiscoverySourceID).Error; err != nil {
+	if err := db.First(&src, "workspace_id = ? AND id = ?", workspaceID, *agent.DiscoverySourceID).Error; err != nil {
 		return
 	}
 	if !src.EnforcementEvict {

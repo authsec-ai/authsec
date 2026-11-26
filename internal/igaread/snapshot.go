@@ -9,6 +9,8 @@ import (
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+
+	"github.com/authsec-ai/authsec/internal/tenancy"
 )
 
 // RequestBudget is the ONE deadline for a whole read request (§5.1). Every
@@ -116,12 +118,21 @@ type Query struct {
 // Because the revision check and every data query share the snapshot, and a
 // publication commits atomically with its graph, a response cannot straddle
 // two publications.
-func (r *Reader) Read(ctx context.Context, ws uuid.UUID, pin Pin, fn func(q *Query) error) error {
+//
+// The workspace is the one the tenant context of ctx carries (the token's,
+// set by AuthMiddleware; tenancy.WithContext for jobs), never a parameter.
+// The snapshot runs under Postgres row-level security for it, so a query
+// that forgot its own workspace predicate still cannot read another
+// workspace's rows.
+func (r *Reader) Read(ctx context.Context, pin Pin, fn func(q *Query) error) error {
+	if _, err := tenancy.FromContext(ctx); err != nil {
+		return Unauthenticated()
+	}
 	ctx, cancel := context.WithTimeout(ctx, r.budget)
 	defer cancel()
 	deadline, _ := ctx.Deadline()
 
-	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := tenancy.RLSTransaction(ctx, r.db, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true}, func(tx *gorm.DB, ws uuid.UUID) error {
 		// Backstop per statement: never longer than the whole budget. Optional
 		// work lowers it locally inside a savepoint and restores it after.
 		base := r.budget.Milliseconds()
@@ -143,7 +154,7 @@ func (r *Reader) Read(ctx context.Context, ws uuid.UUID, pin Pin, fn func(q *Que
 		}
 		q := &Query{tx: tx, ctx: ctx, deadline: deadline, WS: ws, Rev: cur, baseMS: base}
 		return fn(q)
-	}, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
+	})
 	if err == nil {
 		return nil
 	}
@@ -154,6 +165,17 @@ func (r *Reader) Read(ctx context.Context, ws uuid.UUID, pin Pin, fn func(q *Que
 		return QueryTimeout(err)
 	}
 	return AsError(err)
+}
+
+// workspaceIn is the workspace of the tenant context ctx carries: the
+// token's for a request, the processed row's for a job. uuid.Nil when there
+// is none, and then Read answers 401 before any query runs.
+func workspaceIn(ctx context.Context) uuid.UUID {
+	tc, err := tenancy.FromContext(ctx)
+	if err != nil {
+		return uuid.Nil
+	}
+	return tc.WorkspaceID
 }
 
 func currentRevision(tx *gorm.DB, ws uuid.UUID) (*Revision, error) {

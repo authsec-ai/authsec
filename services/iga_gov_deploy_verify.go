@@ -45,8 +45,12 @@ func (s *GovDeployments) VerifyHandler(ctx context.Context, run *PolicyJobRun) e
 		return PolicyJobAbandon("verify needs a deployment subject")
 	}
 	ws := run.Job.WorkspaceID
-	db := run.DB().WithContext(ctx)
-	d, err := s.loadDeployment(db, ws, *run.Job.SubjectID)
+	var d *models.IGAGovDeployment
+	err := runRead(ctx, run, func(db *gorm.DB) error {
+		var err error
+		d, err = s.loadDeployment(db, ws, *run.Job.SubjectID)
+		return err
+	})
 	if err != nil {
 		var ge *GovError
 		if errors.As(err, &ge) {
@@ -54,7 +58,7 @@ func (s *GovDeployments) VerifyHandler(ctx context.Context, run *PolicyJobRun) e
 		}
 		return err
 	}
-	plan, err := loadGovPlan(run.DB(), ws, d.PlanID)
+	plan, err := loadGovPlanRun(ctx, run, d.PlanID)
 	if err != nil {
 		return err
 	}
@@ -71,8 +75,12 @@ func (s *GovDeployments) VerifyHandler(ctx context.Context, run *PolicyJobRun) e
 	if d.AppliedAt == nil {
 		return PolicyJobAbandon("an applied deployment without applied_at")
 	}
-	ctl, err := s.loadControl(db, ws, d.ControlID)
-	if err != nil {
+	var ctl *models.IGAGovControl
+	if err := runRead(ctx, run, func(db *gorm.DB) error {
+		var err error
+		ctl, err = s.loadControl(db, ws, d.ControlID)
+		return err
+	}); err != nil {
 		return err
 	}
 	now := s.now().UTC()
@@ -84,12 +92,18 @@ func (s *GovDeployments) VerifyHandler(ctx context.Context, run *PolicyJobRun) e
 	if cl.Class == igagov.ClassAfter {
 		artifact = igagov.OutcomePassed
 	}
-	graph, graphEv, published, err := s.graphDimension(db, *d, plan, *ctl, now)
-	if err != nil {
+	var graph string
+	var graphEv map[string]any
+	var cr igagov.CanaryResult
+	if err := runRead(ctx, run, func(db *gorm.DB) error {
+		var published bool
+		var err error
+		if graph, graphEv, published, err = s.graphDimension(db, *d, plan, *ctl, now); err != nil {
+			return err
+		}
+		cr, err = s.canary(db, *d, plan, *ctl, now, artifact, published)
 		return err
-	}
-	cr, err := s.canary(db, *d, plan, *ctl, now, artifact, published)
-	if err != nil {
+	}); err != nil {
 		return err
 	}
 	if err := run.InTx(ctx, func(tx *gorm.DB) error {
@@ -129,21 +143,22 @@ func (s *GovDeployments) VerifyHandler(ctx context.Context, run *PolicyJobRun) e
 	} else if err := s.restrictionUpdate(ctx, run, *d, plan, *ctl, cr); err != nil {
 		return err
 	}
-	cur, err := s.loadDeployment(run.DB().WithContext(ctx), ws, d.ID)
-	if err != nil {
-		return err
-	}
-	if cur.State == models.GovDeployAppliedUnverified {
-		return PolicyJobRetryLater(DefaultVerifyEvery, "verification continues")
-	}
-	if cur.State == models.GovDeployVerified { // fix/p3-roll: until window_elapsed can be decided (§8.6)
-		open, err := govCanaryWindowUndecided(db, ws, ctl.ConnectorID, cur.AppliedAt.UTC(), s.canaryHours(db, *d), now, cr)
-		if err != nil {
+	var cur *models.IGAGovDeployment
+	open := false
+	if err := runRead(ctx, run, func(db *gorm.DB) error {
+		var err error
+		if cur, err = s.loadDeployment(db, ws, d.ID); err != nil {
 			return err
 		}
-		if open {
-			return PolicyJobRetryLater(DefaultVerifyEvery, "verification continues")
+		if cur.State == models.GovDeployVerified { // fix/p3-roll: until window_elapsed can be decided (§8.6)
+			open, err = govCanaryWindowUndecided(db, ws, ctl.ConnectorID, cur.AppliedAt.UTC(), s.canaryHours(db, *d), now, cr)
 		}
+		return err
+	}); err != nil {
+		return err
+	}
+	if cur.State == models.GovDeployAppliedUnverified || open {
+		return PolicyJobRetryLater(DefaultVerifyEvery, "verification continues")
 	}
 	return nil
 }
@@ -174,6 +189,16 @@ func (s *GovDeployments) readPlan(ctx context.Context, run *PolicyJobRun, d mode
 	env := s.envNow()
 	if env.AWS == nil {
 		return igagov.LiveRead{}, igagov.Classification{}, PolicyJobRetryLater(5*time.Minute, "AWS access is not configured")
+	}
+	if isDirectSplit(d, plan) {
+		// R2 (DECISION R2-20): a direct split is read as the IaC path reads
+		// one: source role, new role, and the migration evidence.
+		live, err := s.r2SplitLive(ctx, run, d, plan, ctl)
+		if err != nil {
+			return live, igagov.Classification{}, err
+		}
+		cl, err := igagov.Classify(plan, live)
+		return live, cl, err
 	}
 	var live igagov.LiveRead
 	err := run.External(ctx, 0, func(ctx context.Context) error {
@@ -309,6 +334,14 @@ func (s *GovDeployments) canary(db *gorm.DB, d models.IGAGovDeployment, p igagov
 	for _, r := range p.Impact.Removed {
 		in.Removed = append(in.Removed, r.Service)
 	}
+	if len(p.Impact.RemovedActions) > 0 {
+		// R1b: the plan removes actions within kept services; restriction
+		// and the denial classes are judged at action level too.
+		for _, x := range p.Impact.RemovedActions {
+			in.RemovedActions = append(in.RemovedActions, x.Action)
+		}
+		in.RemovesServices = d.Kind == igagov.PlanApply && p.DesiredAttachment == igagov.AttachmentPresent
+	}
 	for _, r := range p.Impact.Retained {
 		in.Retained = append(in.Retained, igagov.RetainedService{Service: r.Service, ActiveInQualifiedInterval: r.Basis == "observed"})
 	}
@@ -358,29 +391,41 @@ func (s *GovDeployments) canary(db *gorm.DB, d models.IGAGovDeployment, p igagov
 		return igagov.CanaryResult{}, err
 	}
 	for _, r := range runs {
-		var cov struct {
-			Surfaces map[string]struct {
-				State string `json:"state"`
-				Count int    `json:"count"`
-			} `json:"surfaces"`
-		}
-		_ = json.Unmarshal(r.Coverage, &cov)
-		at := r.RequestedAt
-		if r.StartedAt != nil {
-			at = *r.StartedAt
-		}
-		for k, sc := range cov.Surfaces {
-			if !strings.HasPrefix(k, models.SurfaceCloudTrailEventsPrefix+":") {
-				continue
-			}
-			if sc.State != models.CloudCoverageReached && sc.State != "partial" {
-				continue
-			}
-			in.Trail = append(in.Trail, igagov.TrailRead{From: at.Add(-igagov.MaxTrailScanGap).UTC(), To: at.UTC(),
-				CapHit: sc.State == "partial" || sc.Count >= 10000})
-		}
+		in.Trail = append(in.Trail, scanTrailReads(r.StartedAt, r.RequestedAt, r.Coverage)...)
 	}
 	return igagov.EvaluateCanary(in), nil
+}
+
+// scanTrailReads are the CloudTrail reads one published scan contributes to
+// the canary gates (no_unexpected_failures, window_elapsed): one
+// [scan start - 48 h, scan start] read per cloudtrail-events surface of its
+// coverage that was reached or partial, capped when the surface is partial
+// or counted >= 10,000 events. This is the ONE place a scan's coverage is
+// turned into trail coverage; govCanaryWindowUndecided reads it too.
+func scanTrailReads(startedAt *time.Time, requestedAt time.Time, coverage json.RawMessage) []igagov.TrailRead {
+	var cov struct {
+		Surfaces map[string]struct {
+			State string `json:"state"`
+			Count int    `json:"count"`
+		} `json:"surfaces"`
+	}
+	_ = json.Unmarshal(coverage, &cov)
+	at := requestedAt
+	if startedAt != nil {
+		at = *startedAt
+	}
+	var out []igagov.TrailRead
+	for k, sc := range cov.Surfaces {
+		if !strings.HasPrefix(k, models.SurfaceCloudTrailEventsPrefix+":") {
+			continue
+		}
+		if sc.State != models.CloudCoverageReached && sc.State != "partial" {
+			continue
+		}
+		out = append(out, igagov.TrailRead{From: at.Add(-igagov.MaxTrailScanGap).UTC(), To: at.UTC(),
+			CapHit: sc.State == "partial" || sc.Count >= 10000})
+	}
+	return out
 }
 
 func loadValidations(db *gorm.DB, d models.IGAGovDeployment) ([]models.IGAGovValidation, map[uuid.UUID][]models.IGAGovValidationItem, error) {
@@ -444,17 +489,21 @@ func (s *GovDeployments) markVerified(ctx context.Context, run *PolicyJobRun, d 
 		}
 	}
 	_, err := s.observe(ctx, run, func(ctx context.Context) (*govObservation, error) {
-		db := run.DB().WithContext(ctx)
-		seen, cstate, err := controlSeen(db, ws, d.ControlID)
-		if err != nil {
+		var seen int64
+		var cstate string
+		var ctl *models.IGAGovControl
+		if err := runRead(ctx, run, func(db *gorm.DB) error {
+			var err error
+			if seen, cstate, err = controlSeen(db, ws, d.ControlID); err != nil || cstate == "removed" {
+				return err
+			}
+			ctl, err = s.loadControl(db, ws, d.ControlID)
+			return err
+		}); err != nil {
 			return nil, err
 		}
 		if cstate == "removed" {
 			return nil, PolicyJobAbandon("the control is retired")
-		}
-		ctl, err := s.loadControl(db, ws, d.ControlID)
-		if err != nil {
-			return nil, err
 		}
 		if err := s.hook("before_read", d.ControlID, nil); err != nil {
 			return nil, err
@@ -524,7 +573,8 @@ func (s *GovDeployments) markVerified(ctx context.Context, run *PolicyJobRun, d 
 			}
 			if d.Kind == igagov.PlanUndo && p.DesiredAttachment == igagov.AttachmentAbsent && p.ArtifactDisposition == igagov.DispositionDelete {
 				// §8.9: no artifact in AWS any more; Re-apply possible.
-				if err := tx.Exec(`UPDATE iga_gov_control SET state = 'planned', updated_at = now() WHERE id = ? AND state = 'active'`, d.ControlID).Error; err != nil {
+				if err := tx.Exec(`UPDATE iga_gov_control SET state = 'planned', updated_at = now() WHERE workspace_id = ? AND id = ? AND state = 'active'`,
+					ws, d.ControlID).Error; err != nil {
 					return err
 				}
 			}
@@ -586,8 +636,10 @@ func (s *GovDeployments) restrictionUpdate(ctx context.Context, run *PolicyJobRu
 		Restriction         string
 		CurrentDeploymentID *uuid.UUID
 	}
-	if err := run.DB().WithContext(ctx).Raw(`SELECT service, restriction, current_deployment_id FROM iga_gov_service_posture
-		WHERE workspace_id = ? AND account_id = ? AND role_id = ?`, d.WorkspaceID, ctl.AccountID, ctl.RoleID).Scan(&rows).Error; err != nil {
+	if err := runRead(ctx, run, func(tx *gorm.DB) error {
+		return tx.Raw(`SELECT service, restriction, current_deployment_id FROM iga_gov_service_posture
+		WHERE workspace_id = ? AND account_id = ? AND role_id = ?`, d.WorkspaceID, ctl.AccountID, ctl.RoleID).Scan(&rows).Error
+	}); err != nil {
 		return err
 	}
 	want := map[string]string{}
@@ -601,7 +653,13 @@ func (s *GovDeployments) restrictionUpdate(ctx context.Context, run *PolicyJobRu
 		return nil
 	}
 	_, err := s.observe(ctx, run, func(ctx context.Context) (*govObservation, error) {
-		seen, cstate, err := controlSeen(run.DB().WithContext(ctx), d.WorkspaceID, d.ControlID)
+		var seen int64
+		var cstate string
+		err := runRead(ctx, run, func(tx *gorm.DB) error {
+			var err error
+			seen, cstate, err = controlSeen(tx, d.WorkspaceID, d.ControlID)
+			return err
+		})
 		if err != nil || cstate == "removed" {
 			return nil, err
 		}

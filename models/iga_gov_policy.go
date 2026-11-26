@@ -271,6 +271,10 @@ type IGAGovPolicy struct {
 	CreatedBy        uuid.UUID  `json:"created_by" gorm:"type:uuid;not null"`
 	CreatedAt        time.Time  `json:"created_at" gorm:"not null;default:now()"`
 	UpdatedAt        time.Time  `json:"updated_at" gorm:"not null;default:now()"`
+	// DeletedAt hides an ended access policy (138); its history is kept. Read-only
+	// here (->): only the delete writes it, in SQL, so creating any other policy
+	// never touches the column.
+	DeletedAt *time.Time `json:"deleted_at,omitempty" gorm:"column:deleted_at;->"`
 }
 
 func (IGAGovPolicy) TableName() string { return "iga_gov_policy" }
@@ -497,6 +501,11 @@ type IGAGovApproval struct {
 	RevokedAt      *time.Time     `json:"revoked_at,omitempty"`
 	RevokedReason  string         `json:"revoked_reason" gorm:"not null;default:''"`
 	DecidedAt      time.Time      `json:"decided_at" gorm:"not null;default:now()"`
+	// Scope is "version" for the approval of a proposal and "recovery" for the
+	// approval of one role-only recovery plan (RecoveryPlanID), which never
+	// marks the version approved (migration 060).
+	Scope          string     `json:"scope" gorm:"not null;default:'version'"`
+	RecoveryPlanID *uuid.UUID `json:"recovery_plan_id,omitempty" gorm:"type:uuid"`
 }
 
 func (IGAGovApproval) TableName() string { return "iga_gov_approval" }

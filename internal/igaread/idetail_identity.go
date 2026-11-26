@@ -37,6 +37,10 @@ type IdentityDetail struct {
 	// keys, and an absent list claims nothing about them.
 	Credentials *[]IdentityCredential `json:"credentials,omitempty"`
 	Sources     []SupportSource       `json:"sources"`
+	// AgentRuntime is the role's or user's agent-runtime picture, as its
+	// graph node carries it (agent_runtime.go): absent unless there is
+	// something to say.
+	AgentRuntime *GraphAgentRuntime `json:"agent_runtime,omitempty"`
 }
 
 // IdentityCredential is one access key of a user (§5.3, §1.4 iam_access_keys;
@@ -98,7 +102,7 @@ func CredentialStatusOf(lifecycle string) *string {
 // when nothing is published yet (D-4), when the id is malformed or another
 // type's reference (D-5), and when it is not a readable identity of this
 // workspace (D-6: a GitHub row, or an AWS row no pass supported).
-func (r *Reader) GetIdentity(ctx context.Context, ws uuid.UUID, rawID string, vals url.Values) (any, error) {
+func (r *Reader) GetIdentity(ctx context.Context, rawID string, vals url.Values) (any, error) {
 	rev, perr := idetailParams(vals, "rev")
 	if perr != nil {
 		return nil, perr
@@ -108,7 +112,7 @@ func (r *Reader) GetIdentity(ctx context.Context, ws uuid.UUID, rawID string, va
 		return nil, nerr
 	}
 	var out Envelope
-	err := r.Read(ctx, ws, Pin{Rev: rev}, func(q *Query) error {
+	err := r.Read(ctx, Pin{Rev: rev}, func(q *Query) error {
 		if !q.Published() {
 			return NotFound()
 		}
@@ -167,6 +171,12 @@ func (r *Reader) GetIdentity(ctx context.Context, ws uuid.UUID, rawID string, va
 				return err
 			}
 			detail.Credentials = &creds
+		}
+		if ident.Lifecycle == models.IGALifecycleActive {
+			// A retired identity's ARN may name its successor (idetailActivity).
+			if detail.AgentRuntime, err = identityAgentRuntime(q, id, ident.AccountKind, ident.SourceKey, ident.ImmutableKey); err != nil {
+				return err
+			}
 		}
 		meta := IdentityTabMeta{DetailMeta: NewDetailMeta(q)}
 		if meta.Coverage, err = idetailCoverage(q, accts, idetailSupportPairs, []any{q.WS, id},

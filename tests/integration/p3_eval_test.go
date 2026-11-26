@@ -72,7 +72,7 @@ func TestP3T306EvaluationInsideTheProjectionJob(t *testing.T) {
 // evaluation row and evaluates nothing.
 func TestP3T306GateOffSkipsEvaluation(t *testing.T) {
 	l := newP3eLab(t, "p3-t306-gate-off")
-	l.policy = services.NewPolicyGate(false, "", func() *services.GraphProjectionGate { return l.gate })
+	l.policy = services.NewPolicyGate(false, func() *services.GraphProjectionGate { return l.gate })
 	a := l.account(accountA)
 	arn := p3eOldRole(a, "RefundTaskRole", "AROAREFUND0002", 200*24*time.Hour, "RefundWork", p3eSQSS3)
 	a.lambda("us-east-1", "refund-agent", arn)

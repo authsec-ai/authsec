@@ -15,6 +15,7 @@ import (
 
 	"github.com/authsec-ai/authsec/internal/igagov"
 	"github.com/authsec-ai/authsec/internal/igagraph"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 )
@@ -223,11 +224,16 @@ const identityCols = `id, provider, account_kind, display_name, source_key, immu
 // resolves again once a publication projects the new incarnation).
 func (g *GovTargets) Resolve(ctx context.Context, ws uuid.UUID, keys []TargetKey) ([]ResolvedTarget, error) {
 	var out []ResolvedTarget
-	err := g.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	wctx, err := govWorkspaceContext(ctx, ws)
+	if err != nil {
+		return nil, err
+	}
+	// Under row-level security for ws (AS-108).
+	err = tenancy.RLSTransaction(wctx, g.db, repeatableRead, func(tx *gorm.DB, _ uuid.UUID) error {
 		var err error
-		out, err = g.resolveIn(ctx, tx, ws, keys)
+		out, err = g.resolveIn(wctx, tx, ws, keys)
 		return err
-	}, repeatableRead)
+	})
 	return out, err
 }
 
@@ -632,7 +638,7 @@ func (g *GovTargets) BuildEvidenceBundle(ctx context.Context, ws, identity uuid.
 // evidence_bundle_created event.
 func (g *GovTargets) storeBundle(ctx context.Context, ws, identity uuid.UUID, b igagov.Bundle, actorKind, actorID string) (*StoredBundle, error) {
 	sb := &StoredBundle{Hash: b.Hash, Trust: b.Trust, TrustReasons: b.TrustReasons, Facts: b.Facts, GapRefs: b.GapRefs}
-	err := g.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := tenancy.InWorkspace(ctx, g.db, ws, govAgreeing(ctx, ws, func(tx *gorm.DB) error {
 		var ids []uuid.UUID
 		if err := tx.Raw(`INSERT INTO iga_gov_evidence_bundle (workspace_id, provider, trust, bundle_hash, canonical, facts)
 		                   VALUES (?, 'aws', ?, ?, ?, ?::jsonb)
@@ -649,7 +655,7 @@ func (g *GovTargets) storeBundle(ctx context.Context, ws, identity uuid.UUID, b 
 		}
 		return tx.Raw(`SELECT id FROM iga_gov_evidence_bundle WHERE workspace_id = ? AND bundle_hash = ?`, ws, b.Hash).
 			Scan(&sb.ID).Error
-	})
+	}))
 	if err != nil {
 		return nil, err
 	}
@@ -680,13 +686,41 @@ type bundleBasis struct {
 
 // buildBasis is build, also returning the bundleBasis.
 func (g *GovTargets) buildBasis(ctx context.Context, ws, identity uuid.UUID, removed []string) (igagov.Bundle, igagov.BundleSource, *bundleBasis, error) {
-	return g.buildBasisIn(ctx, g.db, ws, identity, removed)
+	return g.buildBasisActions(ctx, ws, identity, removed, nil)
 }
 
-// buildBasisIn is buildBasis reading through dbIn: g.db, or the caller's
-// transaction (Resolve's one repeatable-read snapshot for every key; the
+// buildBasisActions is buildBasis for an R1b intent: the bundle also names
+// the removed actions with their frozen action evidence, and their
+// namespaces' resource-policy routes (nil actions: exactly buildBasis).
+func (g *GovTargets) buildBasisActions(ctx context.Context, ws, identity uuid.UUID, removed, removedActions []string) (igagov.Bundle, igagov.BundleSource, *bundleBasis, error) {
+	var b igagov.Bundle
+	var src igagov.BundleSource
+	var basis *bundleBasis
+	wctx, err := govWorkspaceContext(ctx, ws)
+	if err != nil {
+		return b, src, nil, err
+	}
+	// One repeatable-read transaction under row-level security for ws
+	// (AS-108): every read of the build sees ws's rows only, at one moment.
+	err = tenancy.RLSTransaction(wctx, g.db, repeatableRead, func(tx *gorm.DB, _ uuid.UUID) (e error) {
+		b, src, basis, e = g.buildBasisInActions(wctx, tx, ws, identity, removed, removedActions)
+		return e
+	})
+	if err != nil {
+		return igagov.Bundle{}, igagov.BundleSource{}, nil, err
+	}
+	return b, src, basis, nil
+}
+
+// buildBasisIn is buildBasis reading through dbIn: a transaction under
+// row-level security for ws: buildBasis's own, or the caller's
+// (Resolve's one repeatable-read snapshot for every key; the
 // role snapshot's own transaction then nests in it as a savepoint).
 func (g *GovTargets) buildBasisIn(ctx context.Context, dbIn *gorm.DB, ws, identity uuid.UUID, removed []string) (igagov.Bundle, igagov.BundleSource, *bundleBasis, error) {
+	return g.buildBasisInActions(ctx, dbIn, ws, identity, removed, nil)
+}
+
+func (g *GovTargets) buildBasisInActions(ctx context.Context, dbIn *gorm.DB, ws, identity uuid.UUID, removed, removedActions []string) (igagov.Bundle, igagov.BundleSource, *bundleBasis, error) {
 	fail := func(err error) (igagov.Bundle, igagov.BundleSource, *bundleBasis, error) {
 		return igagov.Bundle{}, igagov.BundleSource{}, nil, err
 	}
@@ -794,21 +828,52 @@ func (g *GovTargets) buildBasisIn(ctx context.Context, dbIn *gorm.DB, ws, identi
 		for _, svc := range removed {
 			analyses = append(analyses, igagov.AnalyzeRoutes(svc, ref, run.ResourcePolicy, run.EnabledRegions))
 		}
+		for _, ns := range actionNamespaces(removedActions, removed) {
+			analyses = append(analyses, igagov.AnalyzeRoutes(ns, ref, run.ResourcePolicy, run.EnabledRegions))
+		}
 	} else {
 		for _, svc := range removed {
 			analyses = append(analyses, igagov.AnalyzeRoutes(svc, igagov.RoleRef{}, nil, nil))
 		}
+		for _, ns := range actionNamespaces(removedActions, removed) {
+			analyses = append(analyses, igagov.AnalyzeRoutes(ns, igagov.RoleRef{}, nil, nil))
+		}
+	}
+	var actionActivity []igagov.BundleActionActivity
+	if len(removedActions) > 0 {
+		rows, err := actionEvidenceAt(db, ws, lc.Rev, identity)
+		if err != nil {
+			return fail(err)
+		}
+		actionActivity = bundleActionActivity(rows)
 	}
 	b, err := igagov.BuildBundle(igagov.BundleInput{
 		BuiltAt: g.now().UTC().Truncate(time.Microsecond), Sources: []igagov.BundleSourceInput{src},
 		Target:          igagov.BundleTarget{AccountID: role.AccountID, RoleID: role.RoleID, RoleARN: role.ARN},
 		RemovedServices: removed, Grants: grants, Consumers: impact, ConsumersUnresolved: len(unresolved),
 		Owners: ownerIDs, Activity: activity, RouteAnalyses: analyses,
+		RemovedActions: removedActions, ActionActivity: actionActivity,
 	}, g.rules)
 	if err != nil {
 		return fail(err)
 	}
 	return b, b.Facts.Sources[0], &bundleBasis{Rev: lc.Rev, Run: run, HasRun: hasRun && runID != "", Consumers: consumers, Role: role}, nil
+}
+
+// actionNamespaces are the namespaces of R1b's removed actions that are not
+// removed whole (their routes are analysed for the actions), sorted.
+func actionNamespaces(actions, removed []string) []string {
+	rm := map[string]bool{}
+	for _, s := range removed {
+		rm[s] = true
+	}
+	set := map[string]bool{}
+	for _, a := range actions {
+		if ns, _, ok := igagov.SplitAction(a); ok && !rm[ns] {
+			set[ns] = true
+		}
+	}
+	return stringKeys(set)
 }
 
 // consumersAsOf is consumersOf at a past instant, by the relationships'

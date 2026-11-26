@@ -9,6 +9,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 )
 
@@ -94,8 +95,12 @@ func (r *igaProjectionJobRepository) EnqueueTx(tx *gorm.DB, job *models.IGAProje
 	// holding the id GORM generated, which names no row -- and the publish
 	// transaction hands the barrier to job:<that id>, a holder no worker could
 	// ever match. The barrier would then wait out its whole lease.
-	return tx.Raw(`SELECT id FROM iga_projection_job WHERE workspace_id = ? AND scan_run_id = ?`,
-		job.WorkspaceID, job.ScanRunID).Row().Scan(&job.ID)
+	ctx, q, err := txTenant(tx, job.WorkspaceID)
+	if err != nil {
+		return err
+	}
+	return tenancy.QueryRowContext(ctx, q, `SELECT id FROM iga_projection_job WHERE workspace_id = $1 AND scan_run_id = $2`,
+		[]any{job.ScanRunID}, &job.ID)
 }
 
 // Claim takes one claimable job. Claimable is a queued job, or a running one
@@ -110,6 +115,7 @@ func (r *igaProjectionJobRepository) Claim(
 		return nil, errors.New("a claim needs an owner")
 	}
 	var out []models.IGAProjectionJob
+	// TENANT-EXEMPT: the projection worker's claim loop takes the oldest claimable job of any workspace; the job row names its workspace, and the projection that follows is scoped to it.
 	err := r.db.Raw(`
 		UPDATE iga_projection_job SET
 			status           = ?,
@@ -118,6 +124,7 @@ func (r *igaProjectionJobRepository) Claim(
 			lease_version    = lease_version + 1,
 			attempts         = attempts + 1
 		WHERE id = (
+			-- TENANT-EXEMPT: the claim picks the next job across every workspace (see above).
 			SELECT id FROM iga_projection_job
 			 WHERE attempts < ?
 			   AND (status = ?

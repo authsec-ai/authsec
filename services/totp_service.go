@@ -1,16 +1,20 @@
 package services
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha1"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/base32"
 	"encoding/binary"
 	"fmt"
 	"time"
 
+	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/database"
+	"github.com/authsec-ai/authsec/internal/lockout"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/google/uuid"
 )
@@ -146,7 +150,8 @@ func (s *TOTPService) RegisterDevice(userID uuid.UUID, workspaceID uuid.UUID, em
 	}
 
 	// Save to database (with is_active=false)
-	if err := s.totpRepo.CreateTOTPSecret(device); err != nil {
+	ctx := database.WithWorkspace(context.Background(), workspaceID)
+	if err := s.totpRepo.CreateTOTPSecret(ctx, device); err != nil {
 		return nil, fmt.Errorf("failed to save device: %w", err)
 	}
 
@@ -158,7 +163,7 @@ func (s *TOTPService) RegisterDevice(userID uuid.UUID, workspaceID uuid.UUID, em
 			Code:     s.HashBackupCode(code),
 			IsUsed:   false,
 		}
-		if err := s.totpRepo.CreateBackupCode(backupCode); err != nil {
+		if err := s.totpRepo.CreateBackupCode(ctx, backupCode); err != nil {
 			return nil, fmt.Errorf("failed to save backup code: %w", err)
 		}
 	}
@@ -176,7 +181,8 @@ func (s *TOTPService) RegisterDevice(userID uuid.UUID, workspaceID uuid.UUID, em
 // ConfirmRegistration confirms TOTP device registration after QR code scan
 func (s *TOTPService) ConfirmRegistration(deviceID uuid.UUID, userID uuid.UUID, workspaceID uuid.UUID, totpCode string) (*models.TOTPRegistrationConfirmResponse, error) {
 	// Get device
-	device, err := s.totpRepo.GetTOTPSecretByID(deviceID, userID, workspaceID)
+	ctx := database.WithWorkspace(context.Background(), workspaceID)
+	device, err := s.totpRepo.GetTOTPSecretByID(ctx, deviceID, userID)
 	if err != nil {
 		return nil, fmt.Errorf("device not found")
 	}
@@ -190,13 +196,13 @@ func (s *TOTPService) ConfirmRegistration(deviceID uuid.UUID, userID uuid.UUID, 
 	device.IsActive = true
 
 	// If user has no other active devices, make this primary
-	existingDevices, err := s.totpRepo.GetUserTOTPSecrets(userID, workspaceID)
+	existingDevices, err := s.totpRepo.GetUserTOTPSecrets(ctx, userID)
 	if err == nil && len(existingDevices) == 0 {
 		device.IsPrimary = true
 	}
 
 	// Update database
-	if err := s.totpRepo.UpdateTOTPSecret(device); err != nil {
+	if err := s.totpRepo.UpdateTOTPSecret(ctx, device); err != nil {
 		return nil, fmt.Errorf("failed to activate device: %w", err)
 	}
 
@@ -211,27 +217,52 @@ func (s *TOTPService) ConfirmRegistration(deviceID uuid.UUID, userID uuid.UUID, 
 // VerifyTOTP validates a TOTP code for authentication
 func (s *TOTPService) VerifyTOTP(userID uuid.UUID, workspaceID uuid.UUID, totpCode string) (bool, error) {
 	// Get user's TOTP devices
-	devices, err := s.totpRepo.GetUserTOTPSecrets(userID, workspaceID)
+	devices, err := s.totpRepo.GetUserTOTPSecrets(database.WithWorkspace(context.Background(), workspaceID), userID)
 	if err != nil {
 		return false, err
 	}
 
-	// Try validating against each device
-	for _, device := range devices {
-		if s.ValidateTOTPCode(device.Secret, totpCode) {
-			// Update last used timestamp
-			s.totpRepo.UpdateLastUsed(device.ID)
-			return true, nil
+	// Lockout and once-per-step replay protection (AS-004).
+	return s.guardedMatch(userID, workspaceID, devices, totpCode)
+}
+
+// guardedMatch checks a code against the user's devices under the lockout
+// and replay rules of internal/lockout: a locked account gets
+// lockout.ErrLocked, and a time step already accepted for the user is
+// refused.
+func (s *TOTPService) guardedMatch(userID, workspaceID uuid.UUID, devices []models.TOTPSecret, totpCode string) (bool, error) {
+	var db *sql.DB
+	if conn := config.GetDatabase(); conn != nil {
+		db = conn.DB
+	}
+	return lockout.GuardCode(context.Background(), db, workspaceID, userID, lockout.TOTP, func() (int64, bool) {
+		for _, device := range devices {
+			if step, ok := s.matchStep(device.Secret, totpCode); ok {
+				s.totpRepo.UpdateLastUsed(database.WithWorkspace(context.Background(), workspaceID), device.ID)
+				return step, true
+			}
+		}
+		return 0, false
+	})
+}
+
+// matchStep is ValidateTOTPCode that also returns the matched time step.
+func (s *TOTPService) matchStep(secret string, code string) (int64, bool) {
+	now := time.Now()
+	for _, offset := range []int64{0, -1, 1} {
+		t := now.Add(time.Duration(offset)*30*time.Second).Unix() / 30
+		if subtle.ConstantTimeCompare([]byte(code), []byte(s.generateTOTP(secret, t))) == 1 {
+			return t, true
 		}
 	}
-
-	return false, nil
+	return 0, false
 }
 
 // VerifyBackupCode validates a backup code for authentication
 func (s *TOTPService) VerifyBackupCode(userID uuid.UUID, workspaceID uuid.UUID, code string) (bool, error) {
 	// Get user's backup codes
-	codes, err := s.totpRepo.GetUserBackupCodes(userID, workspaceID)
+	ctx := database.WithWorkspace(context.Background(), workspaceID)
+	codes, err := s.totpRepo.GetUserBackupCodes(ctx, userID)
 	if err != nil {
 		return false, err
 	}
@@ -242,9 +273,12 @@ func (s *TOTPService) VerifyBackupCode(userID uuid.UUID, workspaceID uuid.UUID, 
 	// Check if code exists and is unused
 	for _, c := range codes {
 		if !c.IsUsed && subtle.ConstantTimeCompare([]byte(c.Code), []byte(hashedCode)) == 1 {
-			// Mark as used
-			s.totpRepo.UseBackupCode(c.ID)
-			return true, nil
+			// Mark as used; only the request that flips it may sign in.
+			used, err := s.totpRepo.UseBackupCode(ctx, c.ID)
+			if err != nil {
+				return false, err
+			}
+			return used, nil
 		}
 	}
 
@@ -253,29 +287,31 @@ func (s *TOTPService) VerifyBackupCode(userID uuid.UUID, workspaceID uuid.UUID, 
 
 // GetUserDevices retrieves user's registered TOTP devices
 func (s *TOTPService) GetUserDevices(userID uuid.UUID, workspaceID uuid.UUID) ([]models.TOTPSecret, error) {
-	return s.totpRepo.GetUserTOTPSecrets(userID, workspaceID)
+	return s.totpRepo.GetUserTOTPSecrets(database.WithWorkspace(context.Background(), workspaceID), userID)
 }
 
 // DeleteDevice deletes a TOTP device
 func (s *TOTPService) DeleteDevice(deviceID uuid.UUID, userID uuid.UUID, workspaceID uuid.UUID) error {
 	// Check if this is the only device
-	devices, err := s.totpRepo.GetUserTOTPSecrets(userID, workspaceID)
+	ctx := database.WithWorkspace(context.Background(), workspaceID)
+	devices, err := s.totpRepo.GetUserTOTPSecrets(ctx, userID)
 	if err == nil && len(devices) == 1 {
 		return fmt.Errorf("cannot delete the last device. Disable 2FA instead")
 	}
 
-	return s.totpRepo.DeleteTOTPSecret(deviceID, userID, workspaceID)
+	return s.totpRepo.DeleteTOTPSecret(ctx, deviceID, userID)
 }
 
 // SetPrimaryDevice sets a device as primary
 func (s *TOTPService) SetPrimaryDevice(deviceID uuid.UUID, userID uuid.UUID, workspaceID uuid.UUID) error {
-	return s.totpRepo.SetPrimaryTOTPSecret(deviceID, userID, workspaceID)
+	return s.totpRepo.SetPrimaryTOTPSecret(database.WithWorkspace(context.Background(), workspaceID), deviceID, userID)
 }
 
 // RegenerateBackupCodes regenerates backup codes for a user
 func (s *TOTPService) RegenerateBackupCodes(userID uuid.UUID, workspaceID uuid.UUID) ([]string, error) {
 	// Delete existing codes
-	if err := s.totpRepo.DeleteBackupCodes(userID, workspaceID); err != nil {
+	ctx := database.WithWorkspace(context.Background(), workspaceID)
+	if err := s.totpRepo.DeleteBackupCodes(ctx, userID); err != nil {
 		return nil, err
 	}
 
@@ -293,7 +329,7 @@ func (s *TOTPService) RegenerateBackupCodes(userID uuid.UUID, workspaceID uuid.U
 			Code:     s.HashBackupCode(code),
 			IsUsed:   false,
 		}
-		if err := s.totpRepo.CreateBackupCode(backupCode); err != nil {
+		if err := s.totpRepo.CreateBackupCode(ctx, backupCode); err != nil {
 			return nil, err
 		}
 	}
@@ -314,7 +350,7 @@ func (s *TOTPService) LoginWithTOTP(email string, totpCode string) (*uuid.UUID, 
 // Returns true if TOTP code is valid
 func (s *TOTPService) LoginWithTOTPWithUser(user *models.ExtendedUser, totpCode string) (bool, error) {
 	// Get user's TOTP devices
-	devices, err := s.totpRepo.GetUserTOTPSecrets(user.ID, user.WorkspaceID)
+	devices, err := s.totpRepo.GetUserTOTPSecrets(database.WithWorkspace(context.Background(), user.WorkspaceID), user.ID)
 	if err != nil {
 		return false, err
 	}
@@ -324,21 +360,13 @@ func (s *TOTPService) LoginWithTOTPWithUser(user *models.ExtendedUser, totpCode 
 		return false, fmt.Errorf("no TOTP devices registered")
 	}
 
-	// Try validating against each device
-	for _, device := range devices {
-		if s.ValidateTOTPCode(device.Secret, totpCode) {
-			// Update last used timestamp
-			s.totpRepo.UpdateLastUsed(device.ID)
-			return true, nil
-		}
-	}
-
-	return false, nil
+	// Lockout and once-per-step replay protection (AS-004, AS-034).
+	return s.guardedMatch(user.ID, user.WorkspaceID, devices, totpCode)
 }
 
 // HasTOTPEnabled checks if user has TOTP enabled
 func (s *TOTPService) HasTOTPEnabled(userID uuid.UUID, workspaceID uuid.UUID) (bool, error) {
-	devices, err := s.totpRepo.GetUserTOTPSecrets(userID, workspaceID)
+	devices, err := s.totpRepo.GetUserTOTPSecrets(database.WithWorkspace(context.Background(), workspaceID), userID)
 	if err != nil {
 		return false, err
 	}

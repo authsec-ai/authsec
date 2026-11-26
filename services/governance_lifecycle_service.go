@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 	"github.com/google/uuid"
@@ -505,11 +506,18 @@ func (m *lifecycleManager) grantBirthright(workspaceID uuid.UUID, u *userState,
 	}
 
 	return m.db.Transaction(func(tx *gorm.DB) error {
+		// Names for display only, so a miss leaves them empty. The role is the
+		// workspace's own or a global one, as the policy's validation allows.
+		ctx, q, err := txTenant(tx, workspaceID)
+		if err != nil {
+			return err
+		}
 		var rsName string
-		_ = tx.Raw(`SELECT name FROM resource_servers WHERE id = ?`, p.ResourceServerID).
-			Scan(&rsName).Error
+		_ = tenancy.QueryRowContext(ctx, q, `SELECT name FROM resource_servers WHERE workspace_id = $1 AND id = $2`,
+			[]any{p.ResourceServerID}, &rsName)
 		var roleName string
-		_ = tx.Raw(`SELECT name FROM roles WHERE id = ?`, p.RoleID).Scan(&roleName).Error
+		_ = tenancy.QueryRowContext(ctx, q, `SELECT name FROM roles WHERE (workspace_id = $1 OR workspace_id IS NULL) AND id = $2`,
+			[]any{p.RoleID}, &roleName)
 
 		scopeType := "resource_server"
 		rb := models.RoleBinding{
@@ -529,7 +537,7 @@ func (m *lifecycleManager) grantBirthright(workspaceID uuid.UUID, u *userState,
 		}
 
 		policyID := p.ID
-		_, err := m.provenance.OpenGrant(tx, workspaceID, OpenGrantInput{
+		_, err = m.provenance.OpenGrant(tx, workspaceID, OpenGrantInput{
 			EntitlementType: models.EntitlementRoleBinding,
 			RoleBindingID:   &rb.ID,
 			Snapshot: map[string]interface{}{
@@ -586,7 +594,7 @@ func (m *lifecycleManager) revokeBirthright(workspaceID uuid.UUID,
 		}); err != nil {
 			return err
 		}
-		tokens, err := m.repo.LiveTokenJTIsForSubject(prov.SubjectID, prov.SubjectType)
+		tokens, err := m.repo.LiveTokenJTIsForSubject(workspaceID, prov.SubjectID, prov.SubjectType)
 		if err != nil {
 			return err
 		}
@@ -595,7 +603,7 @@ func (m *lifecycleManager) revokeBirthright(workspaceID uuid.UUID,
 				return err
 			}
 		}
-		return m.repo.DeleteRoleBindingTx(tx, bindingID)
+		return m.repo.DeleteRoleBindingTx(tx, workspaceID, bindingID)
 	})
 }
 
@@ -665,7 +673,7 @@ func (m *lifecycleManager) processLeaver(workspaceID uuid.UUID, u *userState,
 			}); cerr != nil {
 				return cerr
 			}
-			return m.repo.DeleteRoleBindingTx(tx, bindingID)
+			return m.repo.DeleteRoleBindingTx(tx, workspaceID, bindingID)
 		})
 		if err != nil {
 			return fmt.Errorf("revoke binding %s: %w", bindingID, err)
@@ -676,7 +684,7 @@ func (m *lifecycleManager) processLeaver(workspaceID uuid.UUID, u *userState,
 	// Kill live tokens once, after the bindings are gone. Introspection treats
 	// revoked_tokens as authoritative, so this is what makes the revocation immediate
 	// rather than "when their current token expires".
-	tokens, err := m.repo.LiveTokenJTIsForSubject(u.ID, models.ProvenanceSubjectUser)
+	tokens, err := m.repo.LiveTokenJTIsForSubject(workspaceID, u.ID, models.ProvenanceSubjectUser)
 	if err != nil {
 		return err
 	}

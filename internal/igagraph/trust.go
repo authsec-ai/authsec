@@ -10,6 +10,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/authsec-ai/authsec/internal/awsdiscovery"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 )
 
@@ -204,22 +205,34 @@ func (p *Projector) trustSourceFor(tx *gorm.DB, snap *Snapshot, r *resolved,
 // aws_principal nodes can be named by an identity ARN, so no other kind is
 // read.
 func liveExternalPrincipals(tx *gorm.DB, ws uuid.UUID) (map[string]bool, error) {
-	var keys []string
-	if err := tx.Raw(`
+	ctx, q, err := txTenant(tx, ws)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := tenancy.QueryContext(ctx, q, `
 		SELECT ep.source_key
 		  FROM iga_external_principal ep
-		 WHERE ep.workspace_id = ? AND ep.issuer = ? AND ep.mechanism = ?
+		 WHERE ep.workspace_id = $1 AND ep.issuer = $2 AND ep.mechanism = $3
 		   AND EXISTS (SELECT 1 FROM iga_relationship r
 		                WHERE r.workspace_id = ep.workspace_id
 		                  AND r.source_external_principal_id = ep.id
-		                  AND r.relationship_type = ? AND r.state <> ?)`,
-		ws, awsdiscovery.IssuerAWS, models.ExternalPrincipalAWSPrincipal,
-		models.RelTypeCanAssume, models.RelEnded).Scan(&keys).Error; err != nil {
+		                  AND r.relationship_type = $4 AND r.state <> $5)`,
+		awsdiscovery.IssuerAWS, models.ExternalPrincipalAWSPrincipal,
+		models.RelTypeCanAssume, models.RelEnded)
+	if err != nil {
 		return nil, fmt.Errorf("load live external principals: %w", err)
 	}
-	out := make(map[string]bool, len(keys))
-	for _, k := range keys {
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			return nil, fmt.Errorf("load live external principals: %w", err)
+		}
 		out[k] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("load live external principals: %w", err)
 	}
 	return out, nil
 }

@@ -50,7 +50,16 @@ const (
 	GovCatDrift          = "drift"
 	GovCatUndo           = "undo"
 	GovCatControlRemoval = "control_removal"
-	GovCatLegacy         = "legacy_agent_policy"
+	// R2 (R2): temporary grants, session revocations and
+	// time-bound retention notices.
+	GovCatTimeBoundAccess = "time_bound_access"
+	// R3 (R3): agent runtime controls. Listed by the Logs kind
+	// filter only while the switch is on (GovEventCategories), so with it off
+	// the filter is exactly R2's.
+	GovCatRuntimeControls = "runtime_controls"
+	// Agent runtime alerts (SPEC-agent-runtime-visibility.md §10 Q3,
+	// agent_runtime_alerts.go): an alert opened and resolved.
+	GovCatAgentAlert = "agent_alert"
 )
 
 // Event names written by T3.12 / T3.20.
@@ -67,8 +76,7 @@ const (
 	GovEventNotificationFailed = "notification.failed"
 	GovEventNotificationDead   = "notification.dead"
 
-	GovEventSettingsUpdated        = "settings.updated"
-	GovEventSettingsChannelsCopied = "settings.notification_channels_copied"
+	GovEventSettingsUpdated = "settings.updated"
 )
 
 // GovEventKind is one vocabulary entry.
@@ -149,7 +157,6 @@ var GovEventVocabulary = []GovEventKind{
 	{"approval_revoked", GovCatRevalidation, GovObjVersion, "A version's approval was revoked by a material change."},
 	// T3.20 settings (iga_gov_settings_service.go).
 	{GovEventSettingsUpdated, GovCatSettings, "", "Workspace policy settings were changed (switching to enforce carries a reason)."},
-	{GovEventSettingsChannelsCopied, GovCatSettings, "", "Legacy notification channel addresses were copied into the Phase 3 settings."},
 	// T3.16 deployments, verification, drift, undo and control removal
 	// (iga_gov_deploy_*.go).
 	{GovEventDeploymentStarted, GovCatDeploymentAttempt, GovObjDeployment, "A deployment started (authority checked, binding fresh)."},
@@ -171,12 +178,15 @@ var GovEventVocabulary = []GovEventKind{
 	{GovEventValidationDeclared, GovCatVerification, GovObjDeployment, "A validation session and its expected outcomes were declared."},
 	{GovEventHealthReported, GovCatVerification, GovObjDeployment, "An owner reported a problem or that the workload works."},
 	{GovEventDeploymentDrifted, GovCatDrift, GovObjDeployment, "The deployed artifact changed outside AuthSec (never auto-reconciled)."},
+	{GovEventDriftAccepted, GovCatDrift, GovObjDeployment, "An operator accepted a drifted deployment; it is closed as drifted."},
+	{GovEventReapplyRequested, GovCatDrift, GovObjDeployment, "An operator opened a new proposal to re-apply a drifted deployment's policy."},
 	{GovEventDriftLateMutation, GovCatDrift, GovObjDeployment, "A change matching an earlier unknown request appeared after it."},
 	{GovEventControlRoleGone, GovCatDrift, GovObjDeployment, "The controlled role was deleted or recreated; the control was retired."},
 	{GovEventUndoRequested, GovCatUndo, GovObjDeployment, "An undo to the recorded before-state was requested."},
 	{GovEventEmergencyUndo, GovCatUndo, GovObjDeployment, "An emergency undo was requested without an approval reference."},
 	{GovEventDeploymentUndone, GovCatUndo, GovObjDeployment, "A deployment was undone (verified undo)."},
 	{GovEventRoleOnlyRecoveryPlan, GovCatUndo, GovObjDeployment, "A role-only recovery plan was compiled for a blocked undo."},
+	{GovEventRecoveryApproved, GovCatUndo, GovObjDeployment, "A role-only recovery plan was approved on its own."},
 	{GovEventControlRemovalReq, GovCatControlRemoval, GovObjPolicy, "Removing AuthSec control was requested (review, or emergency)."},
 	{GovEventControlRemoved, GovCatControlRemoval, GovObjPolicy, "AuthSec control of a role ended; the control is retired."},
 	// T3.14 Slack app (slack_integration_service.go, slack_integration_interactions.go).
@@ -224,6 +234,74 @@ var GovEventVocabulary = []GovEventKind{
 	{GovEventRolloutUndone, GovCatRollout, GovObjVersion, "The rollout's applied change was undone."},
 	{GovEventRolloutRefreshQueued, GovCatRollout, GovObjConnector, "A connector scan was queued so observation gets a fresh activity report."},
 	{GovEventRolloutRemoveControlStarted, GovCatControlRemoval, GovObjVersion, "An approved remove_control version was started (no observation or canary)."},
+	// R2 (R2, iga_gov_r2_grants.go, iga_gov_r2_timebound.go).
+	{GovEventAccessCreated, GovCatTimeBoundAccess, GovObjPolicy, "An access policy was created (its rule, name and reason)."},
+	{GovEventAccessApplied, GovCatTimeBoundAccess, GovObjPolicy, "An access policy version was applied by a workspace admin; its deployments were queued."},
+	{GovEventAccessConfirmed, GovCatTimeBoundAccess, GovObjPolicy, "An access policy is attached to a role and verified by readback."},
+	{GovEventAccessEdited, GovCatTimeBoundAccess, GovObjPolicy, "An access policy was edited: a new version replaces the current one once it is in place."},
+	{GovEventAccessPaused, GovCatTimeBoundAccess, GovObjPolicy, "An access policy was paused: it is removed from AWS for every role."},
+	{GovEventAccessResumed, GovCatTimeBoundAccess, GovObjPolicy, "A paused access policy was resumed: its current version is deployed again."},
+	{GovEventAccessEnded, GovCatTimeBoundAccess, GovObjPolicy, "An access policy was ended: it is removed from AWS and kept as a record."},
+	{GovEventAccessExpired, GovCatTimeBoundAccess, GovObjPolicy, "An access policy reached its end time and was removed from a role."},
+	{GovEventAccessRemoved, GovCatTimeBoundAccess, GovObjPolicy, "An access policy was removed from a role (paused, ended or superseded)."},
+	{GovEventAccessDrifted, GovCatTimeBoundAccess, GovObjPolicy, "An access policy was changed, detached or deleted outside AuthSec."},
+	{GovEventAccessReapplied, GovCatTimeBoundAccess, GovObjPolicy, "AuthSec re-applied an access policy that was detached or deleted outside AuthSec."},
+	{GovEventAccessFailed, GovCatTimeBoundAccess, GovObjPolicy, "An access policy could not be applied to a role, or could not be re-applied."},
+	{GovEventAccessUnknown, GovCatTimeBoundAccess, GovObjPolicy, "An access policy's AWS write had no answer; it is held until settle_after."},
+	{GovEventGrantRequested, GovCatTimeBoundAccess, GovObjTempGrant, "A temporary grant was requested (actions, resources, expiry)."},
+	{GovEventGrantApproved, GovCatTimeBoundAccess, GovObjTempGrant, "A temporary grant was approved (governance:grant, not the requester)."},
+	{GovEventGrantRejected, GovCatTimeBoundAccess, GovObjTempGrant, "A temporary grant was rejected."},
+	{GovEventGrantCancelled, GovCatTimeBoundAccess, GovObjTempGrant, "A pending temporary grant was cancelled."},
+	{GovEventGrantRevokeReq, GovCatTimeBoundAccess, GovObjTempGrant, "A temporary grant was revoked before its expiry."},
+	{GovEventGrantActive, GovCatTimeBoundAccess, GovObjTempGrant, "A temporary grant's policy is attached and verified by readback."},
+	{GovEventGrantEnded, GovCatTimeBoundAccess, GovObjTempGrant, "A temporary grant ended: its policy was detached and deleted (expired or revoked)."},
+	{GovEventGrantFailed, GovCatTimeBoundAccess, GovObjTempGrant, "A temporary grant could not be deployed."},
+	{GovEventGrantUnknown, GovCatTimeBoundAccess, GovObjTempGrant, "A temporary grant's AWS write had no answer; it is held until settle_after."},
+	{GovEventGrantDrifted, GovCatTimeBoundAccess, GovObjTempGrant, "A temporary grant's policy changed outside AuthSec (never auto-reconciled)."},
+	{GovEventRevocationReq, GovCatTimeBoundAccess, GovObjSessionRevocation, "A session revocation was requested."},
+	{GovEventRevocationEmerg, GovCatTimeBoundAccess, GovObjSessionRevocation, "An emergency session revocation was made without approval (governance:emergency)."},
+	{GovEventRevocationAppr, GovCatTimeBoundAccess, GovObjSessionRevocation, "A session revocation was approved; its cutoff was fixed."},
+	{GovEventRevocationRej, GovCatTimeBoundAccess, GovObjSessionRevocation, "A session revocation was rejected."},
+	{GovEventRevocationCancel, GovCatTimeBoundAccess, GovObjSessionRevocation, "A pending session revocation was cancelled."},
+	{GovEventRevocationLift, GovCatTimeBoundAccess, GovObjSessionRevocation, "A session revocation was lifted before its automatic removal."},
+	{GovEventRevocationActive, GovCatTimeBoundAccess, GovObjSessionRevocation, "Sessions issued before the cutoff are denied (policy attached and verified)."},
+	{GovEventRevocationEnded, GovCatTimeBoundAccess, GovObjSessionRevocation, "A session revocation's deny was removed."},
+	{GovEventRevocationFailed, GovCatTimeBoundAccess, GovObjSessionRevocation, "A session revocation could not be deployed."},
+	{GovEventRevocationUnk, GovCatTimeBoundAccess, GovObjSessionRevocation, "A session revocation's AWS write had no answer; it is held until settle_after."},
+	{GovEventRevocationDrift, GovCatTimeBoundAccess, GovObjSessionRevocation, "A session revocation's policy changed outside AuthSec (never auto-reconciled)."},
+	{GovEventTimeBoundExpiring, GovCatTimeBoundAccess, GovObjDeployment, "A service or action kept until a date expires within 7 days."},
+	{GovEventTimeBoundExpired, GovCatTimeBoundAccess, GovObjDeployment, "A service or action kept until a date expired; posture follows."},
+	// R3 (R3, iga_gov_r3_policy.go, iga_gov_r3_runtime.go).
+	{GovEventRuntimePolicyCreated, GovCatRuntimeControls, GovObjPolicy, "A runtime_controls policy was created with its first version in review."},
+	{GovEventRuntimeVersionCreated, GovCatRuntimeControls, GovObjVersion, "A runtime_controls version was created in review."},
+	{GovEventRuntimeVersionApproved, GovCatRuntimeControls, GovObjVersion, "A runtime_controls version was approved (governance:approve, not its author); the previous one was superseded."},
+	{GovEventRuntimeVersionRejected, GovCatRuntimeControls, GovObjVersion, "A runtime_controls version was rejected."},
+	{GovEventRuntimeVersionWithdrawn, GovCatRuntimeControls, GovObjPolicy, "A runtime_controls version in review was withdrawn or replaced."},
+	{GovEventRuntimeSettingsUpdated, GovCatRuntimeControls, "", "Runtime settings (argument retention, redaction, decision TTL, hold timeout) changed."},
+	{GovEventRoutingProofRecorded, GovCatRuntimeControls, "", "A gateway-only routing proof was recorded (asserted, not verified by AuthSec)."},
+	{GovEventRoutingProofRevoked, GovCatRuntimeControls, "", "A routing proof was revoked; the gateway's controls are advisory again."},
+	{GovEventAgentCorePushed, GovCatRuntimeControls, GovObjVersion, "The allow-list was pushed to an AgentCore policy engine and read back."},
+	{GovEventAgentCorePushFailed, GovCatRuntimeControls, GovObjVersion, "Pushing the allow-list to an AgentCore policy engine failed."},
+	{GovEventBrokerRoleBound, GovCatRuntimeControls, "", "A role was opted in to brokered AWS sessions."},
+	{GovEventBrokerRoleDisabled, GovCatRuntimeControls, "", "A role was opted out of brokered AWS sessions."},
+	{GovEventRuntimeDecided, GovCatRuntimeControls, GovObjVersion, "AuthSec decided an agent's tool call (allow, deny or hold), bound to its arguments digest, version and expiry."},
+	{GovEventRuntimeRedeemed, GovCatRuntimeControls, GovObjVersion, "An allow was redeemed (spent once) by the executing point."},
+	{GovEventRuntimeOutcome, GovCatRuntimeControls, GovObjVersion, "The agent reported the tool / AWS outcome (agent-reported, apart from AuthSec's decision); budgets settled."},
+	{GovEventRuntimeHoldOpened, GovCatRuntimeControls, GovObjVersion, "A designated tool call is held for human approval."},
+	{GovEventRuntimeHoldApproved, GovCatRuntimeControls, GovObjVersion, "A held call was approved (governance:approve, not the initiating human)."},
+	{GovEventRuntimeHoldRejected, GovCatRuntimeControls, GovObjVersion, "A held call was rejected."},
+	{GovEventRuntimeHoldExpired, GovCatRuntimeControls, GovObjVersion, "A hold (or its approval) timed out."},
+	{GovEventRuntimeHoldResumed, GovCatRuntimeControls, GovObjVersion, "An approved hold was resumed: exactly one decision was issued for it."},
+	{GovEventRuntimeBudgetSwept, GovCatRuntimeControls, "", "Reservations of unredeemed or unreported allows were released or settled."},
+	{GovEventRuntimeArgsPruned, GovCatRuntimeControls, "", "Retained (redacted) arguments past the retention period were deleted."},
+	{GovEventBrokerSessionRequested, GovCatRuntimeControls, GovObjVersion, "A brokered AWS session was requested for an allow (the allow was spent)."},
+	{GovEventBrokerSessionIssued, GovCatRuntimeControls, GovObjVersion, "sts:AssumeRole issued a brokered session (credentials returned once, never stored)."},
+	{GovEventBrokerSessionFailed, GovCatRuntimeControls, GovObjVersion, "A brokered session could not be issued."},
+	// Agent runtime alerts (agent_runtime_alerts.go).
+	{GovEventAgentAlertOpened, GovCatAgentAlert, GovObjAgentAlert, "A detection opened an alert on an AI workload or agent (detection, severity, identity)."},
+	{GovEventAgentAlertResolved, GovCatAgentAlert, GovObjAgentAlert, "An alert was resolved by a workspace member, or by retention (with the reason given)."},
+	{GovEventAgentAlertSIEMDelivered, GovCatAgentAlert, GovObjAgentAlert, "An alert was delivered to a SIEM endpoint."},
+	{GovEventAgentAlertSIEMFailed, GovCatAgentAlert, GovObjAgentAlert, "An alert's delivery to a SIEM endpoint failed for good (the error carries no URL)."},
 }
 
 // Object kinds the events API filters on.
@@ -243,25 +321,33 @@ const (
 	GovObjWorkload           = "workload"
 	GovObjIdentityAccount    = "identity_account"
 	GovObjWorkloadOrIdentity = "workload|identity_account"
+	// R2 objects (payload keys).
+	GovObjTempGrant         = "temporary_grant"
+	GovObjSessionRevocation = "session_revocation"
+	// Agent runtime alerts (payload key alert_id).
+	GovObjAgentAlert = "agent_alert"
 )
 
 // govEventObjectFilters maps an object_kind to how an event names it: a
 // column of iga_gov_event, or a payload key.
 var govEventObjectFilters = map[string]struct{ column, payloadKey string }{
-	GovObjPolicy:          {column: "policy_id"},
-	GovObjVersion:         {column: "version_id"},
-	GovObjDeployment:      {column: "deployment_id"},
-	GovObjFinding:         {column: "finding_id"},
-	GovObjReview:          {payloadKey: "review_id"},
-	GovObjOwner:           {payloadKey: "owner_id"},
-	GovObjOwnerRule:       {payloadKey: "rule_id"},
-	GovObjFindingRule:     {payloadKey: "finding_rule_id"},
-	GovObjBinding:         {payloadKey: "binding_id"},
-	GovObjConnector:       {payloadKey: "connector_id"},
-	GovObjEvidenceBundle:  {payloadKey: "bundle_id"},
-	GovObjNotification:    {payloadKey: "notification_id"},
-	GovObjWorkload:        {payloadKey: "object_id"},
-	GovObjIdentityAccount: {payloadKey: "object_id"},
+	GovObjPolicy:            {column: "policy_id"},
+	GovObjVersion:           {column: "version_id"},
+	GovObjDeployment:        {column: "deployment_id"},
+	GovObjFinding:           {column: "finding_id"},
+	GovObjReview:            {payloadKey: "review_id"},
+	GovObjOwner:             {payloadKey: "owner_id"},
+	GovObjOwnerRule:         {payloadKey: "rule_id"},
+	GovObjFindingRule:       {payloadKey: "finding_rule_id"},
+	GovObjBinding:           {payloadKey: "binding_id"},
+	GovObjConnector:         {payloadKey: "connector_id"},
+	GovObjEvidenceBundle:    {payloadKey: "bundle_id"},
+	GovObjNotification:      {payloadKey: "notification_id"},
+	GovObjWorkload:          {payloadKey: "object_id"},
+	GovObjIdentityAccount:   {payloadKey: "object_id"},
+	GovObjTempGrant:         {payloadKey: "grant_id"},
+	GovObjSessionRevocation: {payloadKey: "revocation_id"},
+	GovObjAgentAlert:        {payloadKey: "alert_id"},
 }
 
 // GovEventObjectKinds lists the object kinds the events API accepts.
@@ -272,6 +358,11 @@ func GovEventObjectKinds() []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// GovEventVocabularyServed is the vocabulary GET /events/kinds serves.
+func GovEventVocabularyServed() []GovEventKind {
+	return GovEventVocabulary
 }
 
 // GovEventCategory is the Logs category of an event name ("" when the name
@@ -296,7 +387,7 @@ type GovEventCategoryView struct {
 }
 
 var govUnrecordedCategories = []string{GovCatProposal, GovCatApproval, GovCatAcceptance, GovCatRevalidation,
-	GovCatRollout, GovCatVerification, GovCatDrift, GovCatUndo, GovCatControlRemoval, GovCatLegacy}
+	GovCatRollout, GovCatVerification, GovCatDrift, GovCatUndo, GovCatControlRemoval}
 
 // GovEventCategories is the Logs kind filter: every recorded category with
 // its event names, then the categories with no writer in this build.

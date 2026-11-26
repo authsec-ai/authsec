@@ -131,6 +131,12 @@ func (eic *EntraIDController) SyncEntraIDUsers(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	// The workspace comes from the token; users are written only there.
+	tc, tenantDB, ok := TenantScope(c)
+	if !ok {
+		return
+	}
+	input.WorkspaceID = tc.WorkspaceID.String()
 
 	// Determine which config to use
 	var entraConfig EntraIDConfig
@@ -179,9 +185,6 @@ func (eic *EntraIDController) SyncEntraIDUsers(c *gin.Context) {
 		c.JSON(http.StatusOK, result)
 		return
 	}
-
-	// Connect to tenant database
-	tenantDB := config.DB
 
 	// Sync users to database
 	for _, entraUser := range entraUsers {
@@ -310,9 +313,10 @@ func (eic *EntraIDController) NewEntraIDService(config *EntraIDConfig) *EntraIDS
 		client: &http.Client{
 			Timeout: 60 * time.Second,
 			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{
-					InsecureSkipVerify: config.SkipVerify,
-				},
+				// Microsoft's endpoints always present valid certificates;
+				// skip_verify is ignored so the client secret and bearer
+				// token never travel over an unverified connection.
+				TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
 			},
 		},
 	}
@@ -759,7 +763,7 @@ func (eic *EntraIDController) loadStoredEntraConfig(configID, workspaceID, clien
 
 	// Build EntraIDConfig
 	entraConfig := EntraIDConfig{
-		WorkspaceID:     syncConfig.EntraWorkspaceID,
+		WorkspaceID:     syncConfig.EntraTenantID,
 		ClientID:     syncConfig.EntraClientID,
 		ClientSecret: decryptedSecret,
 		Scopes:       scopes,

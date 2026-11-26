@@ -51,13 +51,6 @@ type CloudPermissionRepository interface {
 	// table depends on was reached.
 	ReconcileGeneration(workspaceID, connectorID uuid.UUID, generation int) (edgesRemoved, permissionsRemoved, resourcesRemoved int64, err error)
 
-	// CountPodIdentityEdges counts the connector's EKS Pod Identity edges, any
-	// generation, that may come from the given region: those whose attrs name
-	// it, and every one whose attrs name no region (written before edges
-	// carried one), which may come from anywhere. Whether an earlier scan ever
-	// recorded a binding there (T3.8, writePodIdentityEdges).
-	CountPodIdentityEdges(workspaceID, connectorID uuid.UUID, region string) (int64, error)
-
 	// ReconcileGenerationKeeping is ReconcileGeneration with named assume
 	// edges exempt: rows the scan did not see because it did not LOOK where
 	// they live (an EKS Pod Identity binding in a region deselected since),
@@ -323,7 +316,15 @@ func (r *cloudPermissionRepository) ListPermissions(workspaceID uuid.UUID, f Clo
 }
 
 func (r *cloudPermissionRepository) ListResources(workspaceID uuid.UUID, f CloudPermissionFilter) ([]models.CloudResource, int64, error) {
-	q := r.db.Model(&models.CloudResource{}).Where("workspace_id = ?", workspaceID)
+	// Azure writes its subscription inventory to cloud_resource too, under a
+	// different rule (every resource the Reader assignment reaches, not only
+	// those a permission statement names -- see services/azure_discovery.go).
+	// This list is the grant-target list, so it leaves those rows out; Azure's
+	// are listed by CloudAzureRepository.ListResources.
+	azureConnectors := r.db.Model(&models.CloudConnector{}).Select("id").
+		Where("workspace_id = ? AND provider = ?", workspaceID, models.CloudProviderAzure)
+	q := r.db.Model(&models.CloudResource{}).
+		Where("workspace_id = ? AND connector_id NOT IN (?)", workspaceID, azureConnectors)
 	if f.ConnectorID != nil {
 		q = q.Where("connector_id = ?", *f.ConnectorID)
 	}
@@ -356,17 +357,6 @@ func (r *cloudPermissionRepository) CountsForConnector(workspaceID, connectorID 
 		return 0, 0, 0, err
 	}
 	return edges, permissions, resources, nil
-}
-
-func (r *cloudPermissionRepository) CountPodIdentityEdges(
-	workspaceID, connectorID uuid.UUID, region string,
-) (int64, error) {
-	var n int64
-	err := r.db.Model(&models.CloudAssumeEdge{}).
-		Where("workspace_id = ? AND connector_id = ? AND mechanism = ? AND COALESCE(attrs->>'region', '') IN (?, '')",
-			workspaceID, connectorID, models.AssumeMechanismEKSPodIdentity, region).
-		Count(&n).Error
-	return n, err
 }
 
 // ReconcileGeneration removes what this connector did not see, in the order

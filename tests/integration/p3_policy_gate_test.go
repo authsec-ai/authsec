@@ -32,32 +32,11 @@ import (
 // p3GraphOn is a verified graph gate over the integration database.
 func p3GraphOn(t *testing.T, db *gorm.DB) func() *services.GraphProjectionGate {
 	t.Helper()
-	g := services.NewGraphProjectionGate(true, "")
+	g := services.NewGraphProjectionGate(true)
 	if err := g.Verify(db); err != nil {
 		t.Fatalf("the integration database must be at 036+ for the graph gate: %v", err)
 	}
 	return func() *services.GraphProjectionGate { return g }
-}
-
-// The switch is read like IGA_GRAPH_PROJECTION's: a typo is misconfigured,
-// never silently on or off.
-func TestP3T302PolicyEnvParsing(t *testing.T) {
-	graphOff := func() *services.GraphProjectionGate { return services.NewGraphProjectionGate(false, "") }
-	for v, want := range map[string]string{
-		"": services.PolicyOff, "off": services.PolicyOff, "FALSE": services.PolicyOff, "0": services.PolicyOff,
-		"on": services.PolicyMisconfigured, "true": services.PolicyMisconfigured, " 1 ": services.PolicyMisconfigured,
-		"maybe": services.PolicyMisconfigured,
-	} {
-		t.Setenv(services.PolicyEnv, v)
-		g := services.PolicyGateFromEnv(graphOff)
-		state, reason, _ := g.Status()
-		if state != want || reason == "" || g.Available() {
-			t.Errorf("%s=%q: state %q reason %q available %v, want %q with a reason, unavailable", services.PolicyEnv, v, state, reason, g.Available(), want)
-		}
-		if v == "maybe" && !strings.Contains(reason, "is not on or off") {
-			t.Errorf("a bad value's reason = %q", reason)
-		}
-	}
 }
 
 // Fail closed, every way: the graph gate off or misconfigured, the schema not
@@ -70,19 +49,19 @@ func TestP3T302PolicyEnvParsing(t *testing.T) {
 func TestP3T302PolicyGateFailsClosed(t *testing.T) {
 	db := igaDB(t)
 	graphOn := p3GraphOn(t, db)
-	graphGate := services.NewGraphProjectionGate(false, "")
+	graphGate := services.NewGraphProjectionGate(false)
 	graphNow := func() *services.GraphProjectionGate { return graphGate }
 
 	// Graph off: unavailable, naming IGA_GRAPH_PROJECTION, even once verified.
-	g := services.NewPolicyGate(true, "", graphNow)
+	g := services.NewPolicyGate(true, graphNow)
 	if err := g.Verify(db); err != nil {
 		t.Fatalf("verify: %v", err)
 	}
-	if state, reason, _ := g.Status(); state != services.PolicyMisconfigured || !strings.Contains(reason, services.GraphProjectionEnv) {
-		t.Fatalf("graph off: %q %q, want misconfigured naming %s", state, reason, services.GraphProjectionEnv)
+	if state, reason, _ := g.Status(); state != services.PolicyMisconfigured || !strings.Contains(reason, "graph") {
+		t.Fatalf("graph off: %q %q, want misconfigured naming the graph", state, reason)
 	}
 	// Graph switched on but its schema unverified: still unavailable.
-	graphGate = services.NewGraphProjectionGate(true, "")
+	graphGate = services.NewGraphProjectionGate(true)
 	if state, reason, _ := g.Status(); state != services.PolicyMisconfigured || !strings.Contains(reason, "misconfigured") {
 		t.Fatalf("graph unverified: %q %q, want misconfigured", state, reason)
 	}
@@ -93,7 +72,7 @@ func TestP3T302PolicyGateFailsClosed(t *testing.T) {
 	}
 
 	// Graph on, Phase 3 schema never verified: unavailable.
-	fresh := services.NewPolicyGate(true, "", graphOn)
+	fresh := services.NewPolicyGate(true, graphOn)
 	if state, reason, _ := fresh.Status(); state != services.PolicyMisconfigured || !strings.Contains(reason, "not been verified") {
 		t.Fatalf("unverified: %q %q, want misconfigured, not verified", state, reason)
 	}
@@ -122,15 +101,10 @@ func TestP3T302PolicyGateFailsClosed(t *testing.T) {
 		t.Fatalf("re-verify against the full schema: %v, available %v", err, fresh.Available())
 	}
 
-	// A bad switch value never verifies, whatever the graph and schema say.
-	bad := services.NewPolicyGate(true, `IGA_POLICY="maybe" is not on or off`, graphOn)
-	if err := bad.Verify(db); err == nil || bad.Available() {
-		t.Fatalf("a bad switch value verified (%v) or is available (%v)", err, bad.Available())
-	}
 	// Off is off, verified or not.
-	off := services.NewPolicyGate(false, "", graphOn)
+	off := services.NewPolicyGate(false, graphOn)
 	_ = off.Verify(db)
-	if state, reason, _ := off.Status(); state != services.PolicyOff || reason != services.PolicyEnv+" is off" {
+	if state, reason, _ := off.Status(); state != services.PolicyOff || reason != "policy is off" {
 		t.Fatalf("off: %q %q", state, reason)
 	}
 	var nilGate *services.PolicyGate
@@ -152,7 +126,7 @@ func p3PolicyEngine(t *testing.T, db *gorm.DB, gate *services.PolicyGate) (call 
 	t.Setenv("REQUIRE_SERVER_AUTH", "true")
 	ws := newWorkspace(t, db, "p3-t302-policy-gate")
 	eng := gin.New()
-	ctl := platform.NewIGAGraphReadControllerWith(db, services.NewGraphProjectionGate(false, ""), readTestCursorKey).WithPolicyGate(gate)
+	ctl := platform.NewIGAGraphReadControllerWith(db, services.NewGraphProjectionGate(false), readTestCursorKey).WithPolicyGate(gate)
 	routes.SetupIGARoutes(eng, platform.NewIGAController(db), ctl)
 	token = func(scope string) string {
 		claims := jwt.MapClaims{"iss": "authsec-ai/auth-manager", "exp": time.Now().Add(time.Hour).Unix(),
@@ -190,8 +164,8 @@ func p3PolicyEngine(t *testing.T, db *gorm.DB, gate *services.PolicyGate) (call 
 func TestP3T302PolicyRoutesAreGated(t *testing.T) {
 	db := igaDB(t)
 	graphOn := p3GraphOn(t, db)
-	unverified := services.NewPolicyGate(true, "", graphOn)
-	verified := services.NewPolicyGate(true, "", graphOn)
+	unverified := services.NewPolicyGate(true, graphOn)
+	verified := services.NewPolicyGate(true, graphOn)
 	if err := verified.Verify(db); err != nil {
 		t.Fatal(err)
 	}
@@ -199,10 +173,9 @@ func TestP3T302PolicyRoutesAreGated(t *testing.T) {
 		name string
 		gate *services.PolicyGate
 	}{
-		{"off", services.NewPolicyGate(false, "", graphOn)},
-		{"switch on, graph off", services.NewPolicyGate(true, "", func() *services.GraphProjectionGate { return nil })},
+		{"off", services.NewPolicyGate(false, graphOn)},
+		{"switch on, graph off", services.NewPolicyGate(true, func() *services.GraphProjectionGate { return nil })},
 		{"schema unverified", unverified},
-		{"bad value", services.NewPolicyGate(true, `IGA_POLICY="yes please" is not on or off`, graphOn)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			call, token := p3PolicyEngine(t, db, tc.gate)
@@ -249,7 +222,7 @@ func TestP3T302PolicyRoutesAreGated(t *testing.T) {
 func TestP3T302CapabilitiesPolicyBlock(t *testing.T) {
 	db := igaDB(t)
 	graphOn := p3GraphOn(t, db)
-	verified := services.NewPolicyGate(true, "", graphOn)
+	verified := services.NewPolicyGate(true, graphOn)
 	if err := verified.Verify(db); err != nil {
 		t.Fatal(err)
 	}
@@ -260,7 +233,7 @@ func TestP3T302CapabilitiesPolicyBlock(t *testing.T) {
 		state  string
 		reason any
 	}{
-		{"off", services.NewPolicyGate(false, "", graphOn), services.PolicyOff, services.PolicyEnv + " is off"},
+		{"off", services.NewPolicyGate(false, graphOn), services.PolicyOff, "policy is off"},
 		{"on", verified, services.PolicyOn, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -299,10 +272,10 @@ func TestP3T302CapabilitiesPolicyBlock(t *testing.T) {
 				if r == "" {
 					t.Errorf("policy.%s is false with no reason", f)
 				}
-				if tc.state == services.PolicyOff && r != services.PolicyEnv+" is off" {
+				if tc.state == services.PolicyOff && r != "policy is off" {
 					t.Errorf("off: reasons.%s = %q, want the gate's reason", f, r)
 				}
-				if tc.state == services.PolicyOn && r == services.PolicyEnv+" is off" {
+				if tc.state == services.PolicyOn && r == "policy is off" {
 					t.Errorf("on: reasons.%s still the gate's reason", f)
 				}
 			}
@@ -331,8 +304,10 @@ func TestP3T302CapabilitiesPolicyBlock(t *testing.T) {
 			}
 			// T3.14: Slack's routes are in this build; the flag follows the
 			// app's configuration on this server (not installed here).
-			if r, _ := reasons["slack"].(string); tc.state == services.PolicyOn && !strings.Contains(r, "not configured on this server") {
-				t.Errorf("on: reasons.slack = %q, want the configuration reason", r)
+			// The reason is for a console user: no server setting names (AS-166).
+			if r, _ := reasons["slack"].(string); tc.state == services.PolicyOn &&
+				(r != services.SlackNotSetUp || strings.Contains(r, services.SlackSigningSecretEnv) || strings.Contains(r, "Vault")) {
+				t.Errorf("on: reasons.slack = %q, want %q", r, services.SlackNotSetUp)
 			}
 			if tc.state == services.PolicyOn {
 				restore := services.InstallSlackApp(services.NewSlackIntegrationService(db, newMemVault(), nil, services.SlackConfig{SigningSecret: "x"}))
@@ -371,7 +346,7 @@ func TestP3PolicyGateVerifiesTriggersAndConstraints(t *testing.T) {
 		{"056 trigger", `DROP TRIGGER cloud_rpo_immutable ON cloud_resource_policy_observation`, "trigger cloud_resource_policy_observation.cloud_rpo_immutable"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			gate := services.NewPolicyGate(true, "", graphOn)
+			gate := services.NewPolicyGate(true, graphOn)
 			err := db.Transaction(func(tx *gorm.DB) error {
 				if err := tx.Exec(tc.ddl).Error; err != nil {
 					return err

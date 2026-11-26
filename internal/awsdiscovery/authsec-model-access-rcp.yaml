@@ -1,0 +1,122 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >-
+  AuthSec tag-gated model access (deny mode, AWS Organizations) - a resource
+  control policy on the IAM roles of the accounts it targets that refuses
+  setting the authsec:agent session tag when a role is assumed, whoever the
+  caller is (another account, a SAML or OIDC identity provider, or a
+  principal in your organization), except the administrator principals you
+  name. Deploy it with the SCP form: on its own it gates no model call.
+
+# Why (SPEC-agent-runtime-visibility.md section 5.4 as amended in section 10:
+# the gate must not be bypassable through session tags). Session tags are
+# authorized by the caller's policies and the role's TRUST policy. The SCP
+# form governs only principals inside the organization, and the policy form
+# (attached to the gated role) never sees the assumption at all. A resource
+# control policy applies to STS calls on your roles for ANY caller, so it is
+# the one place an outside assumer or an identity provider can be refused
+# sts:TagSession for authsec:agent.
+#
+# Limits, stated plainly:
+#   - RCPs never apply to the management account or to service-linked roles,
+#     and need the RESOURCE_CONTROL_POLICY policy type enabled on the root
+#     (aws organizations enable-policy-type --policy-type
+#     RESOURCE_CONTROL_POLICY --root-id r-...).
+#   - An RCP can only deny, with Principal '*'. A SAML or web-identity caller
+#     has no aws:PrincipalArn that AdminPrincipalArns can match, so an
+#     identity provider may never issue authsec:agent as a session tag: set
+#     the tag on the role instead.
+#   - Tagging the ROLE itself (iam:TagRole) is an IAM call, which RCPs do not
+#     cover; the SCP form refuses it to everyone but the administrators, and
+#     only principals of the role's own account can make it.
+#   - Actions and keys checked against the IAM service reference
+#     (servicereference.us-east-1.amazonaws.com/v1/sts/sts.json, 2026-11-05):
+#     sts:TagSession, AssumeRole, AssumeRoleWithSAML and
+#     AssumeRoleWithWebIdentity all take aws:TagKeys and aws:RequestTag on
+#     the role resource. That RCPs enforce each of them is AWS's documented
+#     STS support for RCPs; confirm with a lab call before relying on it.
+
+Metadata:
+  AuthSec:
+    TemplateVersion: '2026-11-05'
+    Kind: model-access-rcp
+
+Parameters:
+
+  TargetIds:
+    Type: CommaDelimitedList
+    Description: >-
+      The organization root (r-...), organizational units (ou-...) or accounts
+      (12 digits) to attach the policy to. Use the same targets as the SCP.
+
+  # At least one: with none, nobody can ever set authsec:agent as a session
+  # tag on these accounts' roles.
+  AdminPrincipalArns:
+    Type: CommaDelimitedList
+    Description: >-
+      ARNs (wildcards allowed, e.g. arn:aws:iam::*:role/PlatformAdmin) of the
+      principals that may set authsec:agent as a session tag when assuming a
+      role. Use the same list as the SCP.
+
+  PolicyName:
+    Type: String
+    Default: AuthSecModelAccessTagGuard
+    AllowedPattern: '^[A-Za-z0-9_-]{1,128}$'
+    Description: The name of the resource control policy.
+
+Resources:
+
+  AuthSecModelAccessTagGuard:
+    Type: AWS::Organizations::Policy
+    Properties:
+      Name: !Ref PolicyName
+      Description: AuthSec tag-gated model access - refuses the authsec:agent session tag on role assumption by any caller except named administrators
+      Type: RESOURCE_CONTROL_POLICY
+      TargetIds: !Ref TargetIds
+      Tags:
+        - Key: authsec:managed-by
+          Value: authsec
+      Content:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyAgentSessionTagByKey
+            Effect: Deny
+            Principal: '*'
+            Action:
+              - sts:TagSession
+              - sts:AssumeRole
+              - sts:AssumeRoleWithSAML
+              - sts:AssumeRoleWithWebIdentity
+            Resource: '*'
+            Condition:
+              ForAnyValue:StringEqualsIgnoreCase:
+                aws:TagKeys:
+                  - authsec:agent
+              ArnNotLike:
+                aws:PrincipalArn: !Ref AdminPrincipalArns
+              BoolIfExists:
+                aws:PrincipalIsAWSService: 'false'
+          - Sid: DenyAgentSessionTagByRequest
+            Effect: Deny
+            Principal: '*'
+            Action:
+              - sts:TagSession
+              - sts:AssumeRole
+              - sts:AssumeRoleWithSAML
+              - sts:AssumeRoleWithWebIdentity
+            Resource: '*'
+            Condition:
+              'Null':
+                aws:RequestTag/authsec:agent: 'false'
+              ArnNotLike:
+                aws:PrincipalArn: !Ref AdminPrincipalArns
+              BoolIfExists:
+                aws:PrincipalIsAWSService: 'false'
+
+Outputs:
+  TemplateVersion:
+    Description: The AuthSec template version of this stack.
+    Value: '2026-11-05'
+  PolicyId:
+    Description: The resource control policy of AuthSec's tag guard.
+    Value: !Ref AuthSecModelAccessTagGuard

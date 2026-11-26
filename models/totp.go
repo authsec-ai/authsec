@@ -97,8 +97,10 @@ type TOTPVerificationResponse struct {
 
 // TOTPLoginRequest represents a TOTP-only login (no password)
 type TOTPLoginRequest struct {
-	Email    string `json:"email" binding:"required,email"`     // User email
-	TOTPCode string `json:"totp_code" binding:"required,len=6"` // 6-digit TOTP code
+	Email           string `json:"email" binding:"required,email"`     // User email
+	TOTPCode        string `json:"totp_code" binding:"required,len=6"` // 6-digit TOTP code
+	WorkspaceID     string `json:"workspace_id,omitempty"`             // Optional: scopes the user lookup to this workspace
+	WorkspaceDomain string `json:"workspace_domain,omitempty"`         // Optional: scopes the user lookup to this workspace
 }
 
 // TOTPLoginResponse contains TOTP-only login result
@@ -131,6 +133,9 @@ type TOTPDeviceApprovalRequest struct {
 	UserCode string `json:"user_code" binding:"required"`       // Device user code to approve
 	Email    string `json:"email" binding:"required,email"`     // User email (to find user and validate TOTP)
 	TOTPCode string `json:"totp_code" binding:"required,len=6"` // 6-digit TOTP code from authenticator app
+	// Optional: scope the user lookup to this workspace
+	WorkspaceID     string `json:"workspace_id,omitempty"`
+	WorkspaceDomain string `json:"workspace_domain,omitempty"`
 }
 
 // TOTPDeviceApprovalResponse contains approval result

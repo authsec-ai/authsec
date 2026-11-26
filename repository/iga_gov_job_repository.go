@@ -41,13 +41,27 @@ const (
 	GovJobPruneEvidence      = "prune_evidence"
 	GovJobMetricsRollup      = "metrics_rollup"
 	GovJobResolveUnknown     = "resolve_unknown"
+	// R2 (061_r2_time_bound_access, R2): the temporary-grant and
+	// session-revocation lifecycles, and time-bound retention notices and
+	// the posture observation at expiry.
+	GovJobTempGrant     = "temp_grant"
+	GovJobSessionRevoke = "session_revoke"
+	GovJobTimeBound     = "time_bound"
+	// Access policies on Azure resources (144): role assignments created,
+	// or removed and restored, per principal.
+	GovJobAzureAccess = "azure_access"
+	GovJobK8sAccess   = "k8s_access"
+	// Agent containment (151): contain, verify and release one containment.
+	GovJobAgentContain = "agent_contain"
 )
 
-// GovJobKinds are the kinds 052 accepts (all of them).
+// GovJobKinds are the kinds 052 (widened by 061) accepts (all of them).
 var GovJobKinds = []string{
 	GovJobEvaluateOwnerRules, GovJobCompilePlans, GovJobNotify, GovJobRefreshActivity,
 	GovJobObserveTick, GovJobDeploy, GovJobVerify, GovJobDriftCheck, GovJobVerifyBinding,
 	GovJobIaCSync, GovJobPruneEvidence, GovJobMetricsRollup, GovJobResolveUnknown,
+	GovJobTempGrant, GovJobSessionRevoke, GovJobTimeBound, GovJobAzureAccess, GovJobK8sAccess,
+	GovJobAgentContain,
 }
 
 // MaxConcurrentDeploysPerWorkspace is §8.1's "at most 10 deployments per
@@ -223,6 +237,9 @@ func (r *igaGovJobRepository) Claim(owner string, lease time.Duration, now time.
 		kinds = GovJobKinds
 	}
 	var out []models.IGAGovJob
+	// TENANT-EXEMPT: the job queue is the platform's; a claim takes the next
+	// claimable job of ANY workspace (the job row then names its workspace,
+	// and every write the job makes runs under RLS for it: PolicyJobRun.InTx).
 	err := r.db.Raw(`
 		UPDATE iga_gov_job SET
 			status           = 'running',
@@ -262,11 +279,15 @@ func (r *igaGovJobRepository) Claim(owner string, lease time.Duration, now time.
 }
 
 func (r *igaGovJobRepository) Renew(f PolicyJobFence, lease time.Duration) error {
+	// TENANT-EXEMPT: queue lease bookkeeping, fenced by (id, lease_owner,
+	// lease_version) of the claim; the renewer has no workspace transaction.
 	return fencedJob(r.db, f, map[string]any{"lease_expires_at": time.Now().Add(lease)})
 }
 
 func (r *igaGovJobRepository) LeaseRemaining(f PolicyJobFence, now time.Time) (time.Duration, error) {
 	var exp []time.Time
+	// TENANT-EXEMPT: queue lease bookkeeping, fenced by (id, lease_owner,
+	// lease_version) of the claim.
 	err := r.db.Raw(`SELECT lease_expires_at FROM iga_gov_job
 		WHERE id = ? AND lease_owner = ? AND lease_version = ? AND status = 'running' AND lease_expires_at IS NOT NULL`,
 		f.JobID, f.Owner, f.Version).Scan(&exp).Error
@@ -290,7 +311,11 @@ func (r *igaGovJobRepository) AssertOwnedTx(tx *gorm.DB, f PolicyJobFence) error
 	return nil
 }
 
-func (r *igaGovJobRepository) Complete(f PolicyJobFence) error { return r.CompleteTx(r.db, f) }
+func (r *igaGovJobRepository) Complete(f PolicyJobFence) error {
+	// TENANT-EXEMPT: queue lease bookkeeping, fenced by (id, lease_owner,
+	// lease_version) of the claim.
+	return r.CompleteTx(r.db, f)
+}
 
 func (r *igaGovJobRepository) CompleteTx(tx *gorm.DB, f PolicyJobFence) error {
 	return fencedJob(tx, f, map[string]any{
@@ -307,6 +332,7 @@ func (r *igaGovJobRepository) Fail(f PolicyJobFence, reason string, retryAfter t
 	}
 	// One statement decides retry or terminal from the row's own counters, so
 	// no read-then-write window exists.
+	// TENANT-EXEMPT: queue lease bookkeeping, fenced by (id, lease_owner, lease_version).
 	res := r.db.Exec(`
 		UPDATE iga_gov_job SET
 			status           = CASE WHEN attempts < max_attempts THEN 'queued' ELSE 'failed' END,
@@ -321,6 +347,8 @@ func (r *igaGovJobRepository) Fail(f PolicyJobFence, reason string, retryAfter t
 }
 
 func (r *igaGovJobRepository) Abandon(f PolicyJobFence, reason string) error {
+	// TENANT-EXEMPT: queue lease bookkeeping, fenced by (id, lease_owner,
+	// lease_version) of the claim.
 	return fencedJob(r.db, f, map[string]any{
 		"status":           models.GovJobAbandoned,
 		"last_error":       truncateError(reason),
@@ -334,6 +362,8 @@ func (r *igaGovJobRepository) Requeue(f PolicyJobFence, after time.Duration) err
 	if after < 0 {
 		after = 0
 	}
+	// TENANT-EXEMPT: queue lease bookkeeping, fenced by (id, lease_owner,
+	// lease_version) of the claim.
 	return fencedJob(r.db, f, map[string]any{
 		"status":           models.GovJobQueued,
 		"lease_owner":      "",
@@ -351,6 +381,8 @@ func (r *igaGovJobRepository) FailExhausted(now time.Time) (int64, error) {
 
 func (r *igaGovJobRepository) FailExhaustedJobs(now time.Time) ([]models.IGAGovJob, error) {
 	var out []models.IGAGovJob
+	// TENANT-EXEMPT: the queue's sweep: jobs of every workspace whose lease
+	// lapsed at the attempt ceiling; each returned job names its workspace.
 	err := r.db.Raw(`
 		UPDATE iga_gov_job SET status = 'failed', completed_at = now(), lease_owner = '', lease_expires_at = NULL,
 		       last_error = CASE WHEN last_error = '' THEN 'lease expired with no attempts left'
@@ -362,12 +394,15 @@ func (r *igaGovJobRepository) FailExhaustedJobs(now time.Time) ([]models.IGAGovJ
 }
 
 func (r *igaGovJobRepository) PruneFinished(before time.Time) (int64, error) {
+	// TENANT-EXEMPT: the queue's retention prune, across every workspace.
 	res := r.db.Exec(`DELETE FROM iga_gov_job WHERE status IN ('complete','abandoned') AND completed_at < ?`, before)
 	return res.RowsAffected, res.Error
 }
 
 func (r *igaGovJobRepository) Get(id uuid.UUID) (*models.IGAGovJob, error) {
 	var job models.IGAGovJob
+	// TENANT-EXEMPT: a queue read by job id (the worker and tests inspect the
+	// job they claimed); the row carries its workspace.
 	if err := r.db.First(&job, "id = ?", id).Error; err != nil {
 		return nil, err
 	}

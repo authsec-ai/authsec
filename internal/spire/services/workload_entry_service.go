@@ -2,346 +2,189 @@ package services
 
 import (
 	"context"
-	"fmt"
 	"path/filepath"
 	"strings"
 
-	"github.com/authsec-ai/authsec/internal/spire/domain/models"
-	"github.com/authsec-ai/authsec/internal/spire/infrastructure/database"
-	infrarepos "github.com/authsec-ai/authsec/internal/spire/infrastructure/repositories"
-
 	"github.com/sirupsen/logrus"
+
+	"github.com/authsec-ai/authsec/internal/spire/domain/models"
+	"github.com/authsec-ai/authsec/internal/spire/domain/repositories"
+	"github.com/authsec-ai/authsec/internal/spire/errors"
+	"github.com/authsec-ai/authsec/internal/spire/utils"
 )
 
-// WorkloadEntryService handles workload entry management operations
+// WorkloadEntryService manages registration entries of the workspace carried
+// by ctx.
 type WorkloadEntryService struct {
-	connManager *database.ConnectionManager
-	logger      *logrus.Entry
+	repo          repositories.WorkloadEntryRepository
+	workspaceRepo repositories.WorkspaceRepository
+	logger        *logrus.Entry
 }
 
-// NewWorkloadEntryService creates a new workload entry service
-func NewWorkloadEntryService(
-	connManager *database.ConnectionManager,
-	logger *logrus.Entry,
-) *WorkloadEntryService {
-	return &WorkloadEntryService{
-		connManager: connManager,
-		logger:      logger,
+// NewWorkloadEntryService creates the workload entry service.
+func NewWorkloadEntryService(repo repositories.WorkloadEntryRepository, workspaceRepo repositories.WorkspaceRepository, logger *logrus.Entry) *WorkloadEntryService {
+	return &WorkloadEntryService{repo: repo, workspaceRepo: workspaceRepo, logger: logger}
+}
+
+// validateEntrySpiffeID requires a well-formed SPIFFE ID inside one of the
+// workspace's trust domains (its id, or its domain), so an entry cannot name
+// another workspace's identities.
+func (s *WorkloadEntryService) validateEntrySpiffeID(ctx context.Context, workspaceID, spiffeID string) error {
+	if err := utils.ValidateSpiffeID(spiffeID); err != nil {
+		return errors.NewBadRequestError("Invalid spiffe_id: "+err.Error(), err)
 	}
+	if TrustDomainOf(spiffeID) == workspaceID {
+		return nil
+	}
+	if s.workspaceRepo != nil {
+		if ws, err := s.workspaceRepo.GetByID(ctx, workspaceID); err == nil && ws.Domain != "" &&
+			strings.EqualFold(TrustDomainOf(spiffeID), ws.Domain) {
+			return nil
+		}
+	}
+	return errors.NewBadRequestError("spiffe_id must be in the workspace's trust domain (spiffe://"+workspaceID+"/...)", nil)
 }
 
-// CreateEntry creates a new workload entry
+// TrustDomainOf returns the trust domain of a SPIFFE ID, or "".
+func TrustDomainOf(spiffeID string) string { return utils.TrustDomainOf(spiffeID) }
+
+// CreateEntry creates an entry in ctx's workspace.
 func (s *WorkloadEntryService) CreateEntry(ctx context.Context, entry *models.WorkloadEntry) (*models.WorkloadEntry, error) {
-	s.logger.WithFields(logrus.Fields{
-		"workspace_id": entry.WorkspaceID,
-		"spiffe_id": entry.SpiffeID,
-		"parent_id": entry.ParentID,
-	}).Info("Creating workload entry")
-
-	// Validate entry
+	ws, err := workspaceFromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	entry.WorkspaceID = ws
 	if err := entry.Validate(); err != nil {
-		return nil, fmt.Errorf("validation failed: %w", err)
+		return nil, errors.NewBadRequestError(err.Error(), err)
 	}
-
-	// Get tenant-specific database connection
-	tenantDB, err := s.connManager.GetWorkspaceDB(ctx, entry.WorkspaceID)
-	if err != nil {
-		s.logger.WithField("workspace_id", entry.WorkspaceID).WithError(err).Error("Failed to connect to tenant database")
-		return nil, fmt.Errorf("failed to connect to tenant database: %w", err)
+	if err := s.validateEntrySpiffeID(ctx, ws, entry.SpiffeID); err != nil {
+		return nil, err
 	}
-
-	// Create repository for tenant database
-	repo := infrarepos.NewPostgresWorkloadEntryRepository(tenantDB, s.logger)
-
-	// Check if entry with same SPIFFE ID already exists
-	existing, err := repo.GetBySpiffeID(ctx, entry.WorkspaceID, entry.SpiffeID)
+	existing, err := s.repo.GetBySpiffeID(ctx, entry.SpiffeID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to check existing entry: %w", err)
+		return nil, errors.NewInternalError("Failed to check existing entry", err)
 	}
 	if existing != nil {
-		return nil, fmt.Errorf("workload entry with SPIFFE ID %s already exists", entry.SpiffeID)
+		return nil, errors.NewConflictError("A workload entry with this SPIFFE ID already exists", nil)
 	}
-
-	// Create entry
-	if err := repo.Create(ctx, entry); err != nil {
-		return nil, fmt.Errorf("failed to create workload entry: %w", err)
+	if err := s.repo.Create(ctx, entry); err != nil {
+		return nil, asAppError(err, "Failed to create workload entry")
 	}
-
-	s.logger.WithFields(logrus.Fields{
-		"id":        entry.ID,
-		"spiffe_id": entry.SpiffeID,
-	}).Info("Workload entry created successfully")
-
 	return entry, nil
 }
 
-// GetEntry retrieves a workload entry by ID
-func (s *WorkloadEntryService) GetEntry(ctx context.Context, workspaceID, entryID string) (*models.WorkloadEntry, error) {
-	// Get tenant-specific database connection
-	tenantDB, err := s.connManager.GetWorkspaceDB(ctx, workspaceID)
+// GetEntry returns an entry of ctx's workspace; another workspace's is 404.
+func (s *WorkloadEntryService) GetEntry(ctx context.Context, entryID string) (*models.WorkloadEntry, error) {
+	entry, err := s.repo.GetByID(ctx, entryID)
 	if err != nil {
-		s.logger.WithField("workspace_id", workspaceID).WithError(err).Error("Failed to connect to tenant database")
-		return nil, fmt.Errorf("failed to connect to tenant database: %w", err)
+		return nil, errors.NewInternalError("Failed to get workload entry", err)
 	}
-
-	// Create repository for tenant database
-	repo := infrarepos.NewPostgresWorkloadEntryRepository(tenantDB, s.logger)
-
-	// Get entry
-	entry, err := repo.GetByID(ctx, entryID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get workload entry: %w", err)
-	}
-
 	if entry == nil {
-		return nil, fmt.Errorf("workload entry not found: %s", entryID)
+		return nil, errors.NewNotFoundError("Workload entry not found", nil)
 	}
-
-	// Verify entry belongs to tenant
-	if entry.WorkspaceID != workspaceID {
-		return nil, fmt.Errorf("workload entry does not belong to tenant")
-	}
-
 	return entry, nil
 }
 
-// ListEntries retrieves workload entries based on filter
+// GetBySpiffeID returns the entry of ctx's workspace with this SPIFFE ID, or
+// (nil, nil).
+func (s *WorkloadEntryService) GetBySpiffeID(ctx context.Context, spiffeID string) (*models.WorkloadEntry, error) {
+	return s.repo.GetBySpiffeID(ctx, spiffeID)
+}
+
+// ListEntries lists ctx's workspace's entries.
 func (s *WorkloadEntryService) ListEntries(ctx context.Context, filter *models.WorkloadEntryFilter) ([]*models.WorkloadEntry, error) {
-	s.logger.WithFields(logrus.Fields{
-		"workspace_id": filter.WorkspaceID,
-		"parent_id": filter.ParentID,
-	}).Info("Listing workload entries")
-
-	// Get tenant-specific database connection
-	tenantDB, err := s.connManager.GetWorkspaceDB(ctx, filter.WorkspaceID)
+	entries, err := s.repo.List(ctx, filter)
 	if err != nil {
-		s.logger.WithField("workspace_id", filter.WorkspaceID).WithError(err).Error("Failed to connect to tenant database")
-		return nil, fmt.Errorf("failed to connect to tenant database: %w", err)
+		return nil, errors.NewInternalError("Failed to list workload entries", err)
 	}
-
-	// Create repository for tenant database
-	repo := infrarepos.NewPostgresWorkloadEntryRepository(tenantDB, s.logger)
-
-	// List entries
-	entries, err := repo.List(ctx, filter)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list workload entries: %w", err)
-	}
-
-	s.logger.WithFields(logrus.Fields{
-		"workspace_id": filter.WorkspaceID,
-		"count":     len(entries),
-	}).Info("Workload entries retrieved")
-
 	return entries, nil
 }
 
-// ListEntriesByParent retrieves all workload entries for a specific parent (agent)
-func (s *WorkloadEntryService) ListEntriesByParent(ctx context.Context, workspaceID, parentID string) ([]*models.WorkloadEntry, error) {
-	s.logger.WithFields(logrus.Fields{
-		"workspace_id": workspaceID,
-		"parent_id": parentID,
-	}).Info("Listing workload entries by parent")
+// CountEntries counts ctx's workspace's entries (for paging).
+func (s *WorkloadEntryService) CountEntries(ctx context.Context, filter *models.WorkloadEntryFilter) (int, error) {
+	return s.repo.Count(ctx, filter)
+}
 
-	// Get tenant-specific database connection
-	tenantDB, err := s.connManager.GetWorkspaceDB(ctx, workspaceID)
+// ListEntriesByParent lists the entries an agent of ctx's workspace serves.
+func (s *WorkloadEntryService) ListEntriesByParent(ctx context.Context, parentID string) ([]*models.WorkloadEntry, error) {
+	entries, err := s.repo.ListByParent(ctx, parentID)
 	if err != nil {
-		s.logger.WithField("workspace_id", workspaceID).WithError(err).Error("Failed to connect to tenant database")
-		return nil, fmt.Errorf("failed to connect to tenant database: %w", err)
+		return nil, errors.NewInternalError("Failed to list workload entries", err)
 	}
-
-	// Create repository for tenant database
-	repo := infrarepos.NewPostgresWorkloadEntryRepository(tenantDB, s.logger)
-
-	// List entries matching this agent's parent_id OR entries with empty parent_id
-	// (unassigned entries are shared across all agents in the tenant)
-	entries, err := repo.ListByParent(ctx, workspaceID, parentID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list workload entries by parent: %w", err)
-	}
-
 	return entries, nil
 }
 
-// UpdateEntry updates an existing workload entry
+// UpdateEntry rewrites an entry of ctx's workspace.
 func (s *WorkloadEntryService) UpdateEntry(ctx context.Context, entry *models.WorkloadEntry) (*models.WorkloadEntry, error) {
-	s.logger.WithFields(logrus.Fields{
-		"id":        entry.ID,
-		"workspace_id": entry.WorkspaceID,
-	}).Info("Updating workload entry")
-
-	// Validate entry
+	ws, err := workspaceFromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	entry.WorkspaceID = ws
 	if err := entry.Validate(); err != nil {
-		return nil, fmt.Errorf("validation failed: %w", err)
+		return nil, errors.NewBadRequestError(err.Error(), err)
 	}
-
-	// Get tenant-specific database connection
-	tenantDB, err := s.connManager.GetWorkspaceDB(ctx, entry.WorkspaceID)
-	if err != nil {
-		s.logger.WithField("workspace_id", entry.WorkspaceID).WithError(err).Error("Failed to connect to tenant database")
-		return nil, fmt.Errorf("failed to connect to tenant database: %w", err)
+	if err := s.validateEntrySpiffeID(ctx, ws, entry.SpiffeID); err != nil {
+		return nil, err
 	}
-
-	// Create repository for tenant database
-	repo := infrarepos.NewPostgresWorkloadEntryRepository(tenantDB, s.logger)
-
-	// Verify entry exists and belongs to tenant
-	existing, err := repo.GetByID(ctx, entry.ID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get existing entry: %w", err)
+	if err := s.repo.Update(ctx, entry); err != nil {
+		return nil, asAppError(err, "Failed to update workload entry")
 	}
-	if existing == nil {
-		return nil, fmt.Errorf("workload entry not found: %s", entry.ID)
-	}
-	if existing.WorkspaceID != entry.WorkspaceID {
-		return nil, fmt.Errorf("workload entry does not belong to tenant")
-	}
-
-	// Update entry
-	if err := repo.Update(ctx, entry); err != nil {
-		return nil, fmt.Errorf("failed to update workload entry: %w", err)
-	}
-
-	s.logger.WithField("id", entry.ID).Info("Workload entry updated successfully")
-
-	return entry, nil
+	return s.GetEntry(ctx, entry.ID)
 }
 
-// DeleteEntry deletes a workload entry
-func (s *WorkloadEntryService) DeleteEntry(ctx context.Context, workspaceID, entryID string) error {
-	s.logger.WithFields(logrus.Fields{
-		"id":        entryID,
-		"workspace_id": workspaceID,
-	}).Info("Deleting workload entry")
-
-	// Get tenant-specific database connection
-	tenantDB, err := s.connManager.GetWorkspaceDB(ctx, workspaceID)
-	if err != nil {
-		s.logger.WithField("workspace_id", workspaceID).WithError(err).Error("Failed to connect to tenant database")
-		return fmt.Errorf("failed to connect to tenant database: %w", err)
+// DeleteEntry deletes an entry of ctx's workspace.
+func (s *WorkloadEntryService) DeleteEntry(ctx context.Context, entryID string) error {
+	if err := s.repo.Delete(ctx, entryID); err != nil {
+		return asAppError(err, "Failed to delete workload entry")
 	}
-
-	// Create repository for tenant database
-	repo := infrarepos.NewPostgresWorkloadEntryRepository(tenantDB, s.logger)
-
-	// Verify entry exists and belongs to tenant
-	existing, err := repo.GetByID(ctx, entryID)
-	if err != nil {
-		return fmt.Errorf("failed to get existing entry: %w", err)
-	}
-	if existing == nil {
-		return fmt.Errorf("workload entry not found: %s", entryID)
-	}
-	if existing.WorkspaceID != workspaceID {
-		return fmt.Errorf("workload entry does not belong to tenant")
-	}
-
-	// Delete entry
-	if err := repo.Delete(ctx, entryID); err != nil {
-		return fmt.Errorf("failed to delete workload entry: %w", err)
-	}
-
-	s.logger.WithField("id", entryID).Info("Workload entry deleted successfully")
-
 	return nil
 }
 
-// CountEntries returns the total count of workload entries matching the filter
-// This is used for pagination to show accurate total count
-func (s *WorkloadEntryService) CountEntries(ctx context.Context, filter *models.WorkloadEntryFilter) (int, error) {
-	s.logger.WithField("workspace_id", filter.WorkspaceID).Debug("Counting workload entries")
-
-	// Get tenant-specific database connection
-	tenantDB, err := s.connManager.GetWorkspaceDB(ctx, filter.WorkspaceID)
-	if err != nil {
-		s.logger.WithField("workspace_id", filter.WorkspaceID).WithError(err).Error("Failed to connect to tenant database")
-		return 0, fmt.Errorf("failed to connect to tenant database: %w", err)
-	}
-
-	// Create repository for tenant database
-	repo := infrarepos.NewPostgresWorkloadEntryRepository(tenantDB, s.logger)
-
-	// Count entries (without limit/offset)
-	count, err := repo.Count(ctx, filter)
-	if err != nil {
-		return 0, fmt.Errorf("failed to count workload entries: %w", err)
-	}
-
-	return count, nil
+// FindMatchingEntries returns entries of ctx's workspace whose selectors the
+// given ones satisfy.
+func (s *WorkloadEntryService) FindMatchingEntries(ctx context.Context, selectors map[string]string) ([]*models.WorkloadEntry, error) {
+	return s.repo.FindMatchingEntries(ctx, selectors)
 }
 
-// FindMatchingEntries finds workload entries matching the given selectors
-// Used during workload attestation to determine which SPIFFE ID to issue
-func (s *WorkloadEntryService) FindMatchingEntries(ctx context.Context, workspaceID string, selectors map[string]string) ([]*models.WorkloadEntry, error) {
-	s.logger.WithFields(logrus.Fields{
-		"workspace_id": workspaceID,
-		"selectors": selectors,
-	}).Info("Finding matching workload entries")
-
-	// Get tenant-specific database connection
-	tenantDB, err := s.connManager.GetWorkspaceDB(ctx, workspaceID)
-	if err != nil {
-		s.logger.WithField("workspace_id", workspaceID).WithError(err).Error("Failed to connect to tenant database")
-		return nil, fmt.Errorf("failed to connect to tenant database: %w", err)
-	}
-
-	// Create repository for tenant database
-	repo := infrarepos.NewPostgresWorkloadEntryRepository(tenantDB, s.logger)
-
-	// Find matching entries
-	entries, err := repo.FindMatchingEntries(ctx, workspaceID, selectors)
-	if err != nil {
-		return nil, fmt.Errorf("failed to find matching entries: %w", err)
-	}
-
-	return entries, nil
-}
-
-// MatchSelectorsWithWildcard matches workload selectors against entry selectors with wildcard support
-// Entry selectors must be a SUBSET of collected selectors
-// Supports wildcard matching for values containing '*'
-func (s *WorkloadEntryService) MatchSelectorsWithWildcard(
-	collectedSelectors map[string]string,
-	entrySelectors map[string]string,
-) bool {
-	// Entry selectors must be a SUBSET of collected selectors
-	for entryKey, entryValue := range entrySelectors {
-		// Check if selector exists in collected
-		collectedValue, exists := collectedSelectors[entryKey]
-		if !exists {
+// MatchSelectorsWithWildcard reports whether every entry selector is among
+// the collected ones; values containing '*' match as a glob.
+func (s *WorkloadEntryService) MatchSelectorsWithWildcard(collected, entrySelectors map[string]string) bool {
+	for k, v := range entrySelectors {
+		got, ok := collected[k]
+		if !ok {
 			return false
 		}
-
-		// Support wildcard matching for certain selectors
-		if strings.Contains(entryValue, "*") {
-			matched, err := filepath.Match(entryValue, collectedValue)
-			if err != nil || !matched {
+		if strings.Contains(v, "*") {
+			if matched, err := filepath.Match(v, got); err != nil || !matched {
 				return false
 			}
-		} else {
-			// Exact match
-			if collectedValue != entryValue {
-				return false
-			}
+		} else if got != v {
+			return false
 		}
 	}
-
 	return true
 }
 
-// FilterEntriesWithWildcard filters entries using wildcard selector matching
-// This can be used as a post-processing step after FindMatchingEntries
-func (s *WorkloadEntryService) FilterEntriesWithWildcard(
-	entries []*models.WorkloadEntry,
-	collectedSelectors map[string]string,
-) []*models.WorkloadEntry {
-	var matchedEntries []*models.WorkloadEntry
-
-	for _, entry := range entries {
-		if s.MatchSelectorsWithWildcard(collectedSelectors, entry.Selectors) {
-			matchedEntries = append(matchedEntries, entry)
+// FilterEntriesWithWildcard keeps the entries whose selectors match.
+func (s *WorkloadEntryService) FilterEntriesWithWildcard(entries []*models.WorkloadEntry, collected map[string]string) []*models.WorkloadEntry {
+	var out []*models.WorkloadEntry
+	for _, e := range entries {
+		if s.MatchSelectorsWithWildcard(collected, e.Selectors) {
+			out = append(out, e)
 		}
 	}
+	return out
+}
 
-	return matchedEntries
+// asAppError keeps an *errors.AppError and wraps anything else as 500.
+func asAppError(err error, message string) error {
+	if appErr, ok := err.(*errors.AppError); ok {
+		return appErr
+	}
+	if _, ok := err.(*models.ValidationError); ok {
+		return errors.NewBadRequestError(err.Error(), err)
+	}
+	return errors.NewInternalError(message, err)
 }

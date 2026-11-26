@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -17,6 +16,7 @@ import (
 	"gorm.io/gorm/clause"
 
 	"github.com/authsec-ai/authsec/internal/igagov"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 )
 
@@ -44,7 +44,7 @@ import (
 //     stores a rule the evaluator would skip. scope is
 //     {runtime_kinds, stages, classifications} (each list optional; empty
 //     matches anything); stages and classifications are the iga_workload
-//     CHECK vocabularies; runtime_kinds are lower-case identifiers.
+//     CHECK vocabularies; runtime_kinds are the canonical AWS collector kinds.
 //     require_review_date takes no params; unused_window takes
 //     {window_days} in igagov.MinWindowDays..MaxWindowDays.
 //   - kind is immutable (PATCH may not change it): a different kind is a
@@ -97,7 +97,6 @@ const (
 var (
 	govRuleStages          = map[string]bool{"production": true, "non_production": true, "unknown": true}
 	govRuleClassifications = map[string]bool{"unclassified": true, "provider_native_agent": true, "classified_agent": true}
-	govRuleRuntimeKind     = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
 )
 
 const govRuleMaxScopeItems = 20
@@ -111,6 +110,16 @@ type GovFindingRules struct {
 // NewGovFindingRules builds the service over db.
 func NewGovFindingRules(db *gorm.DB) *GovFindingRules {
 	return &GovFindingRules{db: db, now: time.Now}
+}
+
+// inWS and readWS run fn in one transaction under row-level security for
+// ws (AS-108); ctx carrying another workspace is refused.
+func (s *GovFindingRules) inWS(ctx context.Context, ws uuid.UUID, fn func(tx *gorm.DB) error) error {
+	return tenancy.InWorkspace(ctx, s.db, ws, govAgreeing(ctx, ws, fn))
+}
+
+func (s *GovFindingRules) readWS(ctx context.Context, ws uuid.UUID, fn func(tx *gorm.DB) error) error {
+	return tenancy.InWorkspaceRead(ctx, s.db, ws, govAgreeing(ctx, ws, fn))
 }
 
 // WithClock replaces the clock (tests).
@@ -180,6 +189,18 @@ func normList(field string, in []string, ok func(string) bool) ([]string, error)
 
 // normalizeRule validates kind, scope and params and returns their canonical
 // stored forms. The final check is the evaluator's own parser.
+// Only vocabulary emitted by the AWS collector is accepted. A syntactically
+// valid but unknown value silently matches no workloads and defeats the rule.
+func validGovRuntimeKind(kind string) bool {
+	switch kind {
+	case models.WorkloadLambdaFunction, models.WorkloadECSTaskDefinition, models.WorkloadEC2Instance,
+		models.WorkloadBedrockAgent, models.WorkloadBedrockAgentCoreRT, models.WorkloadBedrockAgentCoreGW:
+		return true
+	default:
+		return false
+	}
+}
+
 func normalizeRule(kind string, scope, params json.RawMessage) (json.RawMessage, json.RawMessage, error) {
 	if kind != igagov.RuleRequireReviewDate && kind != igagov.RuleUnusedWindow {
 		return nil, nil, GovBadParam("kind", "kind must be require_review_date or unused_window.")
@@ -191,7 +212,7 @@ func normalizeRule(kind string, scope, params json.RawMessage) (json.RawMessage,
 		}
 	}
 	var err error
-	if sc.RuntimeKinds, err = normList("scope.runtime_kinds", sc.RuntimeKinds, govRuleRuntimeKind.MatchString); err != nil {
+	if sc.RuntimeKinds, err = normList("scope.runtime_kinds", sc.RuntimeKinds, validGovRuntimeKind); err != nil {
 		return nil, nil, err
 	}
 	if sc.Stages, err = normList("scope.stages", sc.Stages, func(v string) bool { return govRuleStages[v] }); err != nil {
@@ -242,11 +263,13 @@ func (s *GovFindingRules) ListRules(ctx context.Context, ws, after uuid.UUID, li
 		limit = MaxGovPage
 	}
 	var rows []models.IGAGovFindingRule
-	q := s.db.WithContext(ctx).Where("workspace_id = ?", ws)
-	if after != uuid.Nil {
-		q = q.Where("id > ?", after)
-	}
-	if err := q.Order("id").Limit(limit + 1).Find(&rows).Error; err != nil {
+	if err := s.readWS(ctx, ws, func(tx *gorm.DB) error {
+		q := tx.Where("workspace_id = ?", ws)
+		if after != uuid.Nil {
+			q = q.Where("id > ?", after)
+		}
+		return q.Order("id").Limit(limit + 1).Find(&rows).Error
+	}); err != nil {
 		return nil, nil, err
 	}
 	var next *string
@@ -264,7 +287,8 @@ func (s *GovFindingRules) ListRules(ctx context.Context, ws, after uuid.UUID, li
 
 // GetRule is one rule of the workspace, or GovNotFound.
 func (s *GovFindingRules) GetRule(ctx context.Context, ws, id uuid.UUID) (*GovFindingRuleView, error) {
-	r, err := s.rule(s.db.WithContext(ctx), ws, id, false)
+	var r *models.IGAGovFindingRule
+	err := s.readWS(ctx, ws, func(tx *gorm.DB) (e error) { r, e = s.rule(tx, ws, id, false); return e })
 	if err != nil {
 		return nil, err
 	}
@@ -311,7 +335,7 @@ func (s *GovFindingRules) CreateRule(ctx context.Context, ws, actor uuid.UUID, r
 	}
 	r := &models.IGAGovFindingRule{ID: uuid.New(), WorkspaceID: ws, Kind: strings.TrimSpace(req.Kind), Scope: scope, Params: params,
 		Enabled: enabled, CreatedBy: actor, CreatedAt: s.now().UTC()}
-	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = s.inWS(ctx, ws, func(tx *gorm.DB) error {
 		if err := tx.Create(r).Error; err != nil {
 			return err
 		}
@@ -331,7 +355,7 @@ func (s *GovFindingRules) UpdateRule(ctx context.Context, ws, actor, id uuid.UUI
 	if req.Scope == nil && req.Params == nil && req.Enabled == nil {
 		return nil, nil, GovBadParam("body", "Nothing to change: give scope, params or enabled.")
 	}
-	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = s.inWS(ctx, ws, func(tx *gorm.DB) error {
 		cur, err := s.rule(tx, ws, id, true)
 		if err != nil {
 			return err
@@ -377,7 +401,7 @@ func (s *GovFindingRules) UpdateRule(ctx context.Context, ws, actor, id uuid.UUI
 // DeleteRule is DELETE /finding-rules/:id. It returns the deleted rule.
 func (s *GovFindingRules) DeleteRule(ctx context.Context, ws, actor, id uuid.UUID) (*GovFindingRuleView, error) {
 	var out *GovFindingRuleView
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := s.inWS(ctx, ws, func(tx *gorm.DB) error {
 		cur, err := s.rule(tx, ws, id, true)
 		if err != nil {
 			return err
@@ -458,7 +482,7 @@ func (s *GovFindingRules) RecordException(ctx context.Context, ws, actor, id uui
 		return nil, nil, GovBadParam("until", fmt.Sprintf("An exception may run at most %d days.", GovMaxFindingExceptionDays))
 	}
 	until = until.UTC().Truncate(time.Second)
-	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = s.inWS(ctx, ws, func(tx *gorm.DB) error {
 		f, err := s.lockFinding(tx, ws, id)
 		if err != nil {
 			return err
@@ -498,7 +522,7 @@ func (s *GovFindingRules) ClearException(ctx context.Context, ws, actor, id uuid
 		return nil, nil, GovBadParam("reason", "reason may be at most 2000 characters.")
 	}
 	now := s.now().UTC()
-	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = s.inWS(ctx, ws, func(tx *gorm.DB) error {
 		f, err := s.lockFinding(tx, ws, id)
 		if err != nil {
 			return err

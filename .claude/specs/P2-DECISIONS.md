@@ -1337,3 +1337,89 @@ Numbered on merge after the Wave C entries (D-104, D-105).
     and under `EXPLAIN ANALYZE` (statistics as autovacuum keeps them) every
     scan of a per-identity table produces <= 40 rows, against >= 400 membership
     rows for the whole list.
+
+## Added for Azure parity (feat/policy-azure)
+
+- **D-114 Azure on `/graph`, `/graph/expand`, `/graph/path`
+  (`internal/igaread/traverse_azure.go`).** *Built 2026-10-22
+  (`feat/policy-azure-backend`); notes on the build at the end.* The
+  traversal routes read the Azure projection's rows (`internal/azuregraph`,
+  provider `azure`, the same tables) as they read Kubernetes' (D-107), so the
+  console draws an Azure object with the graph it draws an AWS one with, and
+  `/authsec/discovery/azure/graph/*` stops being a second graph. Additive:
+  every AWS and Kubernetes response is unchanged.
+  - *One provider per traversal* (D-107): the slot renders `'azure'`; no
+    edge across providers is walked. The AKS federation join
+    (`resolveAKSServiceAccounts`) is not followed (as D-108 was before it was
+    built): an external principal it resolved shows, unwalked.
+  - *Why the middle node is the assignment, not the role.* An AWS statement
+    states its resources, so identity -> statement -> resource is exact. An
+    Azure role definition does not: the scope is on each assignment, and the
+    projection shares one `iga_entitlements` row per role content across
+    every assignment of it. Walking identity -> role -> resource through that
+    shared row would draw a path from A's Reader on X to B's Y. So the node
+    between an identity and what it reaches is the ASSIGNMENT -- the
+    `iga_access_edges` row -- and the shared role is its content.
+  - *Nodes.* `workload`, `identity` (the `entra_*` kinds), `external_principal`
+    (federation), `resource` (`iga_resources`, provider `azure`: ARM resources,
+    application permissions and delegated scopes), and two Azure-only shapes:
+    - **assignment**: ref `role_assignment:<iga_access_edges.id>`, kind
+      `statement` (it takes the statement's place and column), `label` the
+      role's name, `policy` the role's name, `effect: allow`, `sid: ""`,
+      `exclusions: []`, `group_key` `azure:<role>@<scope>`, and `azure_role
+      {role_name, grant_kind, actions, not_actions, condition}` from the
+      entitlement's `native_rights` (`grant_kind` is the access edge's
+      `path_kind`: `azure_rbac | entra_directory_role | entra_app_permission
+      | entra_delegated_permission | key_vault_access_policy`). Its state and
+      `last_confirmed_at` are the access edge's own.
+    - **scope**: kind `scope`, ref `scope:<uuid v5 of the lower-cased
+      native_scope>`, for what an assignment reaches when it names no
+      resource row: the Entra directory, the tenant root, a management group,
+      a subscription (labelled by its connection's display name), a resource
+      group. A scope is a LEAF: never a root, no frontier, no expansion --
+      "who holds Owner on this subscription" stays the inventory's question.
+    Nodes keep the AWS shape without `account` or `arn` and add `provider:
+    "azure"`, `scope {kind: azure_tenant, id, label}`, `sub_scope` (the
+    subscription's name, null for a tenant-level object) and `native_id` --
+    the unified inventory's own expressions, as D-107. `restrictions` is
+    always `{0, false}`: deny assignments are not read.
+  - *Edges.* `grant`: claim `grant:<access edge>`, identity -> its
+    assignment. `target`: claim `target:<access edge>`, assignment -> the
+    resource (`resource_id`) or the scope (`native_scope`); for provider
+    `azure` a target claim names the access edge, not an
+    `iga_entitlement_target` row. `member_of`, `can_assume` (owner,
+    blueprint, agent user, app registration, federation) and `executes_as`
+    (workload -> managed identity) are the `iga_relationship` rows, as AWS's.
+    No `task_execution_role`. Grants carry `provider` and `policy_kind` (the
+    grant kind).
+  - *Reverse from a resource* walks target then grant: the assignments on it
+    and their holders. An assignment at a broader scope reaches the resource
+    without naming it and is not drawn from it; the resource node carries
+    `azure_scope_access_not_drawn` saying so. The access-policy preview reads
+    those live (`azure_inherited_access`), so a block never relies on the
+    picture.
+  - *Meta.* `graph_state: "unrevisioned"` (Azure rows are written straight
+    from a scan, D-111's reasoning); `limitations:
+    [effective_access_not_evaluated, azure_conditions_not_evaluated]` -- ABAC
+    conditions and deny assignments are not evaluated, and group-derived
+    access is drawn only through `member_of`. Element limitations: none yet
+    (per-partition Azure coverage is not done); a stale element's
+    `stale_reason` is `{surface: azure_scan, state: stale}`.
+  - *Not done.* `/evidence` for Azure claims; following the AKS join;
+    per-partition coverage limitations; scope roots.
+  - *As built (2026-10-22).* `scope:` is not a parseable ref: `root=scope:`
+    and `node=scope:` are 400. Scope labels beyond the four named:
+    "Management group X", "Resource <name>" (a resource path with no
+    resource row), "Entra directory scope <rest>", otherwise the path. The
+    v5 id is of the lower-cased path alone, so two tenants of one workspace
+    share a "/" or directory scope node (one walk stays in one tenant).
+    `azure_role.grant_kind` is the access edge's `path_kind`; role name,
+    actions, not_actions and condition come from the entitlement's
+    `native_rights`, read, never walked. `stale_reason` is
+    `[{account_id: <tenant>, surface: azure_scan, state: stale}]` (the tenant
+    where k8s puts the cluster). `azure_scope_access_not_drawn` is the one
+    element limitation: on an Azure resource node, in either direction, when a
+    live assignment in its tenant sits at the tenant root, any management
+    group, or a path above its ARM id. A root is looked up in AWS, then k8s,
+    then Azure. A `/graph/path` with an Azure end and an AWS or k8s end reads
+    `graph_state: "mixed"` with both sets of limitations (not tested).

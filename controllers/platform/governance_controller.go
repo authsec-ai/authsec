@@ -47,7 +47,7 @@ func (ctl *GovernanceController) provenance() services.ProvenanceManager {
 // workspace resolves the caller's workspace from the token. Never from the body — a
 // caller must not be able to grant authority in someone else's workspace.
 func (ctl *GovernanceController) workspace(c *gin.Context) (uuid.UUID, error) {
-	raw := c.GetString("workspace_id")
+	raw := middlewares.WorkspaceIDString(c)
 	if raw == "" {
 		return uuid.Nil, errors.New("workspace_id not found in token")
 	}
@@ -673,11 +673,21 @@ func (ctl *GovernanceController) actuation() services.ActuationManager {
 	return services.NewActuationManager(ctl.db)
 }
 
+// EnableActuationRequest is the optional body of POST .../actuation.
+type EnableActuationRequest struct {
+	// Delivery "agent" lets the cluster's agent generate its credential and hand
+	// it over on its next heartbeat, so nobody copies a token into a Secret.
+	// Empty mints a token and returns it once, for an agent configured by hand.
+	Delivery string `json:"delivery"`
+}
+
 // EnableActuation handles POST /authsec/governance/connectors/:id/actuation.
 //
-// Mints the per-connector actuation token and returns it ONCE. Only a hash is stored,
-// so a leaked database backup yields nothing usable — and re-calling this rotates the
-// credential, invalidating the previous one.
+// With {"delivery":"agent"} the connector turns pending and its agent hands
+// over the credential it generated (RequestActuation). Otherwise it mints the
+// per-connector actuation token and returns it ONCE. Only a hash is stored,
+// so a leaked database backup yields nothing usable — and re-calling either
+// rotates the credential, invalidating the previous one.
 func (ctl *GovernanceController) EnableActuation(c *gin.Context) {
 	wsID, err := ctl.workspace(c)
 	if err != nil {
@@ -687,6 +697,28 @@ func (ctl *GovernanceController) EnableActuation(c *gin.Context) {
 	id, err := pathID(c)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	var req EnableActuationRequest
+	if c.Request.ContentLength != 0 {
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	switch req.Delivery {
+	case "":
+	case "agent":
+		if err := ctl.actuation().RequestActuation(wsID, id); err != nil {
+			governanceError(c, err)
+			return
+		}
+		auditAdminMutation(c, wsID.String(), "enable_actuation", "discovery_source",
+			id.String(), http.StatusOK, nil, gin.H{"actuation_enabled": true, "delivery": "agent"})
+		c.JSON(http.StatusOK, gin.H{"actuation_enabled": true, "actuation_state": models.ActuationPending})
+		return
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"error": `delivery is "agent" or empty`})
 		return
 	}
 
@@ -705,6 +737,35 @@ func (ctl *GovernanceController) EnableActuation(c *gin.Context) {
 		"note": "Shown once and never stored in plaintext. Install the agent with " +
 			"--set roles='{discovery,actuation}' --set actuation.token=<this value>",
 	})
+}
+
+// DisableActuation handles DELETE /authsec/governance/connectors/:id/actuation:
+// the cluster's token stops working and it reports under its discovery ingest
+// token again. 409 enforcement_in_use, with what is still in force, while a
+// quarantine, a live access policy or an open instruction needs the agent.
+func (ctl *GovernanceController) DisableActuation(c *gin.Context) {
+	wsID, err := ctl.workspace(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	id, err := pathID(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := ctl.actuation().DisableActuation(wsID, id); err != nil {
+		var inUse *services.ActuationInUseError
+		if errors.As(err, &inUse) {
+			c.JSON(http.StatusConflict, gin.H{"error": "enforcement_in_use", "message": inUse.Error(), "in_use": inUse})
+			return
+		}
+		governanceError(c, err)
+		return
+	}
+	auditAdminMutation(c, wsID.String(), "disable_actuation", "discovery_source",
+		id.String(), http.StatusOK, nil, gin.H{"actuation_enabled": false})
+	c.JSON(http.StatusOK, gin.H{"actuation_enabled": false})
 }
 
 // ListInstructions handles GET /authsec/governance/instructions?open=true — the
@@ -893,186 +954,6 @@ func (ctl *GovernanceController) ForceEvictAgent(c *gin.Context) {
 	c.JSON(http.StatusOK, out)
 }
 
-/* --------------------------- pre-deadline warnings ----------------------- */
-
-func (ctl *GovernanceController) warnings() services.PolicyWarningManager {
-	return services.NewPolicyWarningManager(ctl.db)
-}
-
-// GetNotificationSettings handles GET /authsec/governance/notification-settings.
-//
-// Always answers, even for a workspace that has never configured anything: the
-// defaults are what it will actually get, and returning 404 would suggest warnings
-// are off when they are on.
-func (ctl *GovernanceController) GetNotificationSettings(c *gin.Context) {
-	wsID, err := ctl.workspace(c)
-	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
-		return
-	}
-	s, err := ctl.warnings().Settings(wsID)
-	if err != nil {
-		governanceError(c, err)
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{
-		"workspace_id":         s.WorkspaceID,
-		"warning_lead_seconds": int64(s.Lead().Seconds()),
-		"webhook_url":          s.WebhookURL,
-		// Never the secret itself, only whether one is set. Same reasoning as the
-		// actuation token: a console read must not be able to exfiltrate a
-		// credential somebody typed once.
-		"webhook_secret_set": s.WebhookSecret != "",
-		"email_enabled":      s.EmailEnabled,
-	})
-}
-
-// UpdateNotificationSettingsRequest is the console's update body.
-type UpdateNotificationSettingsRequest struct {
-	// WarningLead is a Go duration ("168h"). Between 1h and 90 days.
-	WarningLead   *string `json:"warning_lead,omitempty"`
-	WebhookURL    *string `json:"webhook_url,omitempty"`
-	WebhookSecret *string `json:"webhook_secret,omitempty"`
-	EmailEnabled  *bool   `json:"email_enabled,omitempty"`
-}
-
-// UpdateNotificationSettings handles PUT /authsec/governance/notification-settings.
-func (ctl *GovernanceController) UpdateNotificationSettings(c *gin.Context) {
-	wsID, err := ctl.workspace(c)
-	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
-		return
-	}
-	var req UpdateNotificationSettingsRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	in := services.NotificationSettingsInput{
-		WebhookURL: req.WebhookURL, WebhookSecret: req.WebhookSecret,
-		EmailEnabled: req.EmailEnabled,
-	}
-	if req.WarningLead != nil {
-		d, derr := time.ParseDuration(*req.WarningLead)
-		if derr != nil {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"error": "invalid warning_lead (use a Go duration, e.g. 168h)"})
-			return
-		}
-		in.WarningLead = &d
-	}
-
-	mgr := ctl.warnings()
-	// The previous settings, for the audit record's old values. Best-effort: an
-	// unreadable "before" must not block the change, it only leaves old values
-	// out of the record.
-	var before gin.H
-	if prev, perr := mgr.Settings(wsID); perr == nil {
-		before = notificationSettingsView(prev)
-	}
-	out, err := mgr.SaveSettings(wsID, in)
-	if err != nil {
-		governanceError(c, err)
-		return
-	}
-	after := notificationSettingsView(out)
-	// Redirecting warnings is indistinguishable from silencing them, so the
-	// change is audited. The redacted view, never the webhook secret: an audit
-	// log holding credentials is a credential store.
-	auditAdminMutation(c, wsID.String(), "update", "governance_notification_settings",
-		wsID.String(), http.StatusOK, before, after)
-	c.JSON(http.StatusOK, after)
-}
-
-// notificationSettingsView is the console's view of the settings: whether a
-// webhook secret is set, never the secret.
-func notificationSettingsView(s *models.GovernanceNotificationSettings) gin.H {
-	return gin.H{
-		"workspace_id":         s.WorkspaceID,
-		"warning_lead_seconds": int64(s.Lead().Seconds()),
-		"webhook_url":          s.WebhookURL,
-		"webhook_secret_set":   s.WebhookSecret != "",
-		"email_enabled":        s.EmailEnabled,
-	}
-}
-
-// ListPolicyWarnings handles GET /authsec/governance/policy-warnings.
-//
-// The delivery record behind the lookahead: which warnings were scheduled, which
-// were sent, and which failed. Read permission, because a warning that never
-// arrived is something anyone watching governance needs to be able to see.
-func (ctl *GovernanceController) ListPolicyWarnings(c *gin.Context) {
-	wsID, err := ctl.workspace(c)
-	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
-		return
-	}
-	var policyID *uuid.UUID
-	if raw := c.Query("policy_id"); raw != "" {
-		id, perr := uuid.Parse(raw)
-		if perr != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid policy_id"})
-			return
-		}
-		policyID = &id
-	}
-	limit, _ := strconv.Atoi(c.Query("limit"))
-
-	rows, err := ctl.warnings().List(wsID, policyID, limit)
-	if err != nil {
-		governanceError(c, err)
-		return
-	}
-
-	// Undelivered warnings are counted separately rather than left for the console
-	// to filter: a warning stuck in 'failed' or exhausted at 'dead' is the thing
-	// standing between an operator and an unannounced deletion.
-	var undelivered int
-	for i := range rows {
-		if rows[i].State != models.WarningSent {
-			undelivered++
-		}
-	}
-	c.JSON(http.StatusOK, gin.H{
-		"warnings":    rows,
-		"undelivered": undelivered,
-	})
-}
-
-// RunPolicyWarnings handles POST /authsec/governance/policy-warnings/run.
-//
-// Schedules and delivers immediately instead of waiting for the worker's tick.
-// Exists because "did my policy actually warn anyone" is a question an operator
-// asks while setting one up, and a five-minute wait to find out is the difference
-// between trusting the feature and not.
-func (ctl *GovernanceController) RunPolicyWarnings(c *gin.Context) {
-	wsID, err := ctl.workspace(c)
-	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
-		return
-	}
-	mgr := ctl.warnings()
-	scheduled, err := mgr.Schedule(wsID)
-	if err != nil {
-		governanceError(c, err)
-		return
-	}
-	out, err := mgr.Deliver(50)
-	if err != nil {
-		governanceError(c, err)
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{
-		"scheduled": scheduled,
-		"attempted": out.Attempted,
-		"sent":      out.Sent,
-		"failed":    out.Failed,
-		"dead":      out.Dead,
-		"errors":    out.Errors,
-	})
-}
-
 /* ---------------------------- the enforcement plan ----------------------- */
 
 func (ctl *GovernanceController) enforcementPlans() services.EnforcementPlanManager {
@@ -1128,6 +1009,10 @@ func (ctl *GovernanceController) GetEnforcementPlan(c *gin.Context) {
 	if v := c.Query("force_evict"); v != "" {
 		b := v == "true" || v == "1"
 		rep.ForceEvict = &b
+	}
+	if v := c.Query("bindings"); v != "" {
+		b := v == "true" || v == "1"
+		rep.Bindings = &b
 	}
 	if err := ctl.enforcementPlans().RecordReport(src.ID, rep); err != nil {
 		// Never fatal to the fetch. Refusing to serve a plan because the agent's
@@ -1499,210 +1384,3 @@ func (ctl *GovernanceController) DecideAgentIGALink(c *gin.Context) {
 //
 // PHASE 1: reconciliation is dry-run only. These endpoints let a policy be authored,
 // expanded and previewed; nothing acts on a cluster yet.
-
-func (ctl *GovernanceController) agentPolicies() services.AgentPolicyManager {
-	return services.NewAgentPolicyManager(ctl.db)
-}
-
-// CreateAgentPolicyRequest is the body for POST /authsec/governance/agent-policies.
-type CreateAgentPolicyRequest struct {
-	Name        string `json:"name" binding:"required"`
-	Description string `json:"description,omitempty"`
-
-	// Exactly one target.
-	DiscoveredAgentID *uuid.UUID                  `json:"discovered_agent_id,omitempty"`
-	Selector          *models.AgentPolicySelector `json:"selector,omitempty"`
-
-	// Entitlement arm — a ceiling, never a grant.
-	ScopeCeiling  []string   `json:"scope_ceiling,omitempty"`
-	RoleCeilingID *uuid.UUID `json:"role_ceiling_id,omitempty"`
-
-	// Cluster arm.
-	DesiredState string `json:"desired_state,omitempty"` // active | quarantined
-
-	Duration  string     `json:"duration,omitempty"` // XOR expires_at
-	ExpiresAt *time.Time `json:"expires_at,omitempty"`
-	OnExpiry  string     `json:"on_expiry,omitempty"` // revoke (default) | quarantine | evict
-
-	// Required when on_expiry is destructive. ConfirmAgentIDs binds the confirmation
-	// to a concrete expansion so one confirmation cannot authorize deleting workloads
-	// nobody enumerated.
-	Reason          string      `json:"reason,omitempty"`
-	ConfirmAgentIDs []uuid.UUID `json:"confirm_agent_ids,omitempty"`
-}
-
-// CreateAgentPolicy handles POST /authsec/governance/agent-policies.
-func (ctl *GovernanceController) CreateAgentPolicy(c *gin.Context) {
-	wsID, err := ctl.workspace(c)
-	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
-		return
-	}
-	var req CreateAgentPolicyRequest
-	if err = c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	actor, actorLabel := ctl.actingUser(c)
-	out, err := ctl.agentPolicies().Create(wsID, actorLabel, services.AgentPolicyInput{
-		Name:              req.Name,
-		Description:       req.Description,
-		DiscoveredAgentID: req.DiscoveredAgentID,
-		Selector:          req.Selector,
-		ScopeCeiling:      req.ScopeCeiling,
-		RoleCeilingID:     req.RoleCeilingID,
-		DesiredState:      req.DesiredState,
-		Duration:          req.Duration,
-		ExpiresAt:         req.ExpiresAt,
-		OnExpiry:          req.OnExpiry,
-		Reason:            req.Reason,
-		ConfirmedBy:       actor,
-		ConfirmAgentIDs:   req.ConfirmAgentIDs,
-	})
-	if err != nil {
-		governanceError(c, err)
-		return
-	}
-
-	auditAdminMutation(c, wsID.String(), "create", "agent_policy", out.ID.String(),
-		http.StatusCreated, nil, out)
-	c.JSON(http.StatusCreated, out)
-}
-
-// ListAgentPolicies handles GET /authsec/governance/agent-policies.
-func (ctl *GovernanceController) ListAgentPolicies(c *gin.Context) {
-	wsID, err := ctl.workspace(c)
-	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
-		return
-	}
-	out, err := ctl.agentPolicies().List(wsID, c.Query("enabled") == "true")
-	if err != nil {
-		governanceError(c, err)
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"policies": out, "total": len(out)})
-}
-
-// GetAgentPolicy handles GET /authsec/governance/agent-policies/:id, including the
-// agents its selector currently expands to — a policy is only as clear as the set it
-// actually covers.
-func (ctl *GovernanceController) GetAgentPolicy(c *gin.Context) {
-	wsID, err := ctl.workspace(c)
-	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
-		return
-	}
-	id, err := pathID(c)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	mgr := ctl.agentPolicies()
-	p, err := mgr.Get(wsID, id)
-	if err != nil {
-		governanceError(c, err)
-		return
-	}
-	agents, _ := mgr.Expand(wsID, p)
-	c.JSON(http.StatusOK, gin.H{"policy": p, "expands_to": agents})
-}
-
-// DeleteAgentPolicy handles DELETE /authsec/governance/agent-policies/:id.
-func (ctl *GovernanceController) DeleteAgentPolicy(c *gin.Context) {
-	wsID, err := ctl.workspace(c)
-	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
-		return
-	}
-	id, err := pathID(c)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	if err := ctl.agentPolicies().Delete(wsID, id); err != nil {
-		governanceError(c, err)
-		return
-	}
-	auditAdminMutation(c, wsID.String(), "delete", "agent_policy", id.String(),
-		http.StatusOK, nil, nil)
-	c.JSON(http.StatusOK, gin.H{
-		"deleted": true,
-		"note": "already-applied effects are NOT undone; the actions this policy took " +
-			"remain in agent_policy_actions",
-	})
-}
-
-// GetAgentPolicyEffective handles GET /authsec/discovery/agents/:id/effective-policy —
-// what every matching policy adds up to for one agent, and which policies caused it.
-func (ctl *GovernanceController) GetAgentPolicyEffective(c *gin.Context) {
-	wsID, err := ctl.workspace(c)
-	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
-		return
-	}
-	id, err := pathID(c)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	out, err := ctl.agentPolicies().Effective(wsID, id)
-	if err != nil {
-		governanceError(c, err)
-		return
-	}
-	c.JSON(http.StatusOK, out)
-}
-
-// ReconcileAgentPolicies handles POST /authsec/governance/agent-policies/reconcile.
-//
-// dry_run defaults to TRUE — a live run must be asked for explicitly.
-//
-// A live run executes the ENTITLEMENT arm only: role narrowing and revoke-on-expiry.
-// Those are control-plane effects, reversible by editing the policy, and invisible to
-// the cluster. The CLUSTER arm is still computed and recorded as refused, so a live
-// reconcile can never look like it quarantined something it did not.
-func (ctl *GovernanceController) ReconcileAgentPolicies(c *gin.Context) {
-	wsID, err := ctl.workspace(c)
-	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
-		return
-	}
-	dryRun := c.Query("dry_run") != "false"
-	out, err := ctl.agentPolicies().Reconcile(wsID, dryRun)
-	if err != nil {
-		governanceError(c, err)
-		return
-	}
-	if !dryRun {
-		auditAdminMutation(c, wsID.String(), "reconcile", "agent_policy", "",
-			http.StatusOK, nil, out)
-	}
-	c.JSON(http.StatusOK, out)
-}
-
-// ListUpcomingPolicyActions handles GET /authsec/governance/policies/upcoming?days=7 —
-// the lookahead. What will this system do to the cluster this week.
-func (ctl *GovernanceController) ListUpcomingPolicyActions(c *gin.Context) {
-	wsID, err := ctl.workspace(c)
-	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
-		return
-	}
-	days, _ := strconv.Atoi(c.Query("days"))
-	out, err := ctl.agentPolicies().Upcoming(wsID, days)
-	if err != nil {
-		governanceError(c, err)
-		return
-	}
-	destructive := 0
-	for _, a := range out {
-		if a.Destructive {
-			destructive++
-		}
-	}
-	c.JSON(http.StatusOK, gin.H{
-		"upcoming": out, "total": len(out), "destructive": destructive,
-	})
-}

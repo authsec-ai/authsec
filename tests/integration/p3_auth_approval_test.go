@@ -142,8 +142,8 @@ func TestP3T311ProposeCompileApprove(t *testing.T) {
 		t.Fatalf("events approved=%d acceptances=%d proposed=%d", l.events("version_approved"), l.events("acceptance_recorded"), l.events("version_proposed"))
 	}
 	for _, a := range []string{"create_proposal", "propose", "approve"} {
-		if l.audits(a) != 1 {
-			t.Fatalf("audit %s: %d rows", a, l.audits(a))
+		if l.awaitAudits(a, 1) != 1 {
+			t.Fatalf("audit %s: %d rows", a, l.awaitAudits(a, 1))
 		}
 	}
 

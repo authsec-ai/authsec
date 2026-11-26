@@ -592,36 +592,14 @@ func (h *EndUserWebAuthnHandler) FinishRegistration(c *gin.Context) {
 		log.Printf("[%s] FinishRegistration: WebAuthn finish failed - %v", reqID, err)
 		log.Printf("[%s] FinishRegistration: Error type: %T", reqID, err)
 
-		if strings.Contains(err.Error(), "attestation") ||
-			strings.Contains(err.Error(), "Invalid attestation") ||
-			strings.Contains(err.Error(), "format") ||
-			strings.Contains(err.Error(), "validation") {
-
-			log.Printf("[%s] FinishRegistration: Attempting fallback credential creation", reqID)
-
-			var container CredentialContainer
-			if unmarshalErr := json.Unmarshal(req.Credential, &container); unmarshalErr != nil {
-				log.Printf("[%s] FinishRegistration: Failed to parse credential payload for fallback: %v", reqID, unmarshalErr)
-				c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid credential payload"})
-				return
-			}
-
-			fallbackCred, fbErr := buildFallbackCredentialFromContainer(&container)
-			if fbErr != nil {
-				log.Printf("[%s] FinishRegistration: Fallback credential creation failed: %v", reqID, fbErr)
-				c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid attestation/public key"})
-				return
-			}
-
-			log.Printf("[%s] FinishRegistration: Fallback credential created successfully", reqID)
-			credential = fallbackCred
-		} else {
-			if protoErr, ok := err.(*protocol.Error); ok {
-				log.Printf("[%s] FinishRegistration: Protocol error type: %s, details: %s", reqID, protoErr.Type, protoErr.Details)
-			}
-			c.JSON(http.StatusBadRequest, ErrorResponse{Error: "registration failed"})
-			return
+		// A credential whose attestation, challenge or origin did not verify is
+		// rejected. The old fallback stored such a credential's public key
+		// anyway, which accepted forged registrations (AS-003).
+		if protoErr, ok := err.(*protocol.Error); ok {
+			log.Printf("[%s] FinishRegistration: Protocol error type: %s, details: %s", reqID, protoErr.Type, protoErr.Details)
 		}
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "registration failed"})
+		return
 	}
 
 	if credential == nil {

@@ -95,11 +95,11 @@ func graphDirect(t *testing.T, r *igaread.Reader, b igaread.GraphBudgets, ws uui
 	var err error
 	switch route {
 	case "/graph":
-		res, err = tr.Graph(context.Background(), ws, vals)
+		res, err = tr.Graph(wsCtx(context.Background(), ws), vals)
 	case "/graph/expand":
-		res, err = tr.Expand(context.Background(), ws, vals)
+		res, err = tr.Expand(wsCtx(context.Background(), ws), vals)
 	case "/graph/path":
-		res, err = tr.Path(context.Background(), ws, vals)
+		res, err = tr.Path(wsCtx(context.Background(), ws), vals)
 	default:
 		t.Fatalf("no traversal route %s", route)
 	}

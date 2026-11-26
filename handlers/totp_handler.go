@@ -17,6 +17,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/internal/lockout"
 	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
 	middleware "github.com/authsec-ai/authsec/middlewares"
 	appmodels "github.com/authsec-ai/authsec/models"
@@ -524,6 +525,10 @@ func (h *TOTPHandler) VerifyTOTP(c *gin.Context) {
 		}
 
 		log.Printf("Invalid backup code provided for: %s", req.Email)
+		// A wrong backup code counts towards the account lockout (AS-004).
+		if _, handled := guardSecondFactor(c, req.WorkspaceID, client.ID, lockout.TOTP, func() (int64, bool) { return -1, false }); handled {
+			return
+		}
 		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid backup code"})
 		return
 	}
@@ -555,8 +560,14 @@ func (h *TOTPHandler) VerifyTOTP(c *gin.Context) {
 		return
 	}
 
-	// Validate TOTP code
-	if !h.Service.ValidateCode(secret, req.Code) {
+	// Validate TOTP code: once per time step, under the account lockout (AS-004).
+	valid, handled := guardSecondFactor(c, req.WorkspaceID, client.ID, lockout.TOTP, func() (int64, bool) {
+		return lockout.MatchTOTPStep(secret, req.Code, 1)
+	})
+	if handled {
+		return
+	}
+	if !valid {
 		log.Printf("Invalid TOTP code provided for: %s", req.Email)
 		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid TOTP code"})
 		return
@@ -641,7 +652,18 @@ func (h *TOTPHandler) VerifyLoginTOTP(c *gin.Context) {
 
 	// First, check if it's a backup code
 	if len(req.Code) == 8 || len(req.Code) == 9 { // 8 chars or with dash
-		if err := h.verifyBackupCode(mfaRepo, client.ID.String(), req.Code, method.BackupCodes); err == nil {
+		// Backup codes count towards the same lockout as TOTP codes (AS-004).
+		backupOK, handled := guardSecondFactor(c, req.WorkspaceID, client.ID, lockout.TOTP, func() (int64, bool) {
+			return -1, h.verifyBackupCode(mfaRepo, client.ID.String(), req.Code, method.BackupCodes) == nil
+		})
+		if handled {
+			return
+		}
+		if !backupOK {
+			c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid TOTP code"})
+			return
+		}
+		{
 			log.Printf("Backup code verified for: %s", req.Email)
 
 			// Update MFA verified status for backup code
@@ -678,8 +700,14 @@ func (h *TOTPHandler) VerifyLoginTOTP(c *gin.Context) {
 		return
 	}
 
-	// Validate TOTP code
-	if h.Service.ValidateCodeWithWindow(secret, req.Code, 1) {
+	// Validate TOTP code: once per time step, under the account lockout (AS-004).
+	valid, handled := guardSecondFactor(c, req.WorkspaceID, client.ID, lockout.TOTP, func() (int64, bool) {
+		return lockout.MatchTOTPStep(secret, req.Code, 1)
+	})
+	if handled {
+		return
+	}
+	if valid {
 		// Update last used timestamp
 		mfaRepo.UpdateLastUsed(client.ID.String(), "totp")
 

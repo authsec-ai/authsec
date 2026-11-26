@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/authsec-ai/authsec/internal/sessiontoken"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
@@ -207,35 +208,15 @@ func (ctrl *SpiffeDelegateController) DelegateSVID(c *gin.Context) {
 
 // validateUserJWT parses and validates the HS256 user JWT using the same
 // environment-based secrets that AuthMiddleware uses.
+//
+// Only user session classes are accepted, each under its own key (AS-033).
 func validateUserJWT(tokenString string) (jwt.MapClaims, error) {
-	secrets := []string{
-		os.Getenv("JWT_DEF_SECRET"),
-		os.Getenv("JWT_SDK_SECRET"),
-		os.Getenv("JWT_SECRET"),
+	claims, _, err := sessiontoken.Verify(tokenString,
+		sessiontoken.Admin, sessiontoken.EndUser, sessiontoken.Legacy)
+	if err != nil {
+		return nil, fmt.Errorf("invalid user token: %w", err)
 	}
-
-	var lastErr error
-	for _, secret := range secrets {
-		if secret == "" {
-			continue
-		}
-		token, err := jwt.Parse(tokenString, func(t *jwt.Token) (interface{}, error) {
-			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-				return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
-			}
-			return []byte(secret), nil
-		})
-		if err == nil && token.Valid {
-			if claims, ok := token.Claims.(jwt.MapClaims); ok {
-				return claims, nil
-			}
-		}
-		lastErr = err
-	}
-	if lastErr != nil {
-		return nil, lastErr
-	}
-	return nil, fmt.Errorf("no valid signing secret found")
+	return claims, nil
 }
 
 // claimString safely extracts a string claim, returning fallback if absent.

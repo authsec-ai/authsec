@@ -14,6 +14,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/authsec-ai/authsec/internal/githubhost"
 )
 
 // The pull-request adapter (§8.11 J2) over the customer's GitHub App
@@ -132,23 +134,20 @@ type GitHub interface {
 	ClosePullRequest(ctx context.Context, repo RepoRef, number int, comment string) error
 }
 
-// APIBase is the REST API root of a GitHub host: api.github.com for
-// github.com, https://<host>/api/v3 for GitHub Enterprise Server. fallback
-// (REST.BaseURL) is used for github.com only, so an integration on a GHES
-// host never talks to github.com.
-func APIBase(providerHost, fallback string) string {
-	h := strings.TrimRight(strings.TrimSpace(providerHost), "/")
-	switch strings.ToLower(h) {
-	case "", "github.com", "api.github.com", "https://github.com", "https://api.github.com":
-		if fallback != "" {
-			return strings.TrimRight(fallback, "/")
-		}
-		return "https://api.github.com"
+// APIBase is the REST API root of a GitHub host (githubhost.APIBase):
+// api.github.com for github.com, https://<host>/api/v3 for GitHub Enterprise
+// Server; an invalid host is an error, never a root. fallback (REST.BaseURL)
+// is used for github.com only, so an integration on a GHES host never talks
+// to github.com.
+func APIBase(providerHost, fallback string) (string, error) {
+	base, err := githubhost.APIBase(providerHost)
+	if err != nil {
+		return "", err
 	}
-	if !strings.HasPrefix(h, "https://") && !strings.HasPrefix(h, "http://") {
-		h = "https://" + h
+	if githubhost.IsDotCom(providerHost) && fallback != "" {
+		return strings.TrimRight(fallback, "/"), nil
 	}
-	return h + "/api/v3"
+	return base, nil
 }
 
 // Permissions the App needs for J2 (requested when an IaC source is mapped).
@@ -543,7 +542,11 @@ func (g *REST) do(ctx context.Context, repo RepoRef, method, p string, body any,
 		}
 		rd = bytes.NewReader(b)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, APIBase(repo.ProviderHost, g.BaseURL)+p, rd)
+	base, err := APIBase(repo.ProviderHost, g.BaseURL)
+	if err != nil {
+		return 0, err
+	}
+	req, err := http.NewRequestWithContext(ctx, method, base+p, rd)
 	if err != nil {
 		return 0, err
 	}

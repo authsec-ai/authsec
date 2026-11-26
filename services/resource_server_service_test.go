@@ -25,6 +25,7 @@ func newRSServiceTestDB(t *testing.T) *gorm.DB {
 			id                          TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
 			workspace_id                TEXT NOT NULL,
 			application_type            TEXT NOT NULL DEFAULT 'mcp_server',
+			agent_type                  TEXT,
 			legacy_client_id            TEXT,
 			name                        TEXT NOT NULL,
 			public_base_url             TEXT NOT NULL,

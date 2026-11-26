@@ -22,6 +22,7 @@ package integration
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -948,9 +949,9 @@ func TestP3T315ManualExpandRunsTheCanaryHealthCheck(t *testing.T) {
 	if st := l.deployment(dep).State; st != models.GovDeployDrifted {
 		t.Fatalf("after the drift check: %s", st)
 	}
-	if l.gateOf(dep, igagov.GateArtifactVerified) != igagov.OutcomePassed {
-		t.Fatal("the last verify run's artifact gate should still read passed")
-	}
+	// (The verify job is still re-checking -- no scan has covered the window
+	// -- so its next run may already read the artifact gate failed; the
+	// refusal below names the deployment's state either way.)
 	if v := l.rollout(policy); p3rStage(v) != models.GovRolloutCanary {
 		t.Fatalf("stage %s before the expand", p3rStage(v))
 	}
@@ -1074,6 +1075,51 @@ func TestP3T315VerifyKeepsCheckingUntilTheWindowIsCovered(t *testing.T) {
 	l.tick()
 	if v := l.rollout(policy); p3rStage(v) != models.GovRolloutComplete {
 		t.Fatalf("rollout %v %v", v["rollout"], dig(v, "results", "canary", "gates"))
+	}
+}
+
+// The first scan after the window's end has NO CloudTrail coverage (the read
+// is denied): it is published, but it cannot decide window_elapsed, so the
+// verify job keeps re-checking until a scan that covers the window arrives.
+//
+// Fails on the version that stopped at any scan started after the window's
+// end: the job completed with window_elapsed frozen at not_available.
+func TestP3T315VerifyIgnoresAScanWithoutTrailCoverage(t *testing.T) {
+	l := newP3rLab(t, "p3-t315-window-nocov", true)
+	const rid = "AROAWINDOWNOCOV1"
+	arn := l.role("WindowNoCov", rid, map[string]*time.Time{"s3": p3eTime(time.Hour), "sqs": nil})
+	l.publish()
+	policy := l.prepare(rid)
+	l.observed(policy)
+	dep := l.toCanary(policy, 1)
+	at := l.applied(dep)
+	l.mirror(rid)
+	l.trail.add(p3rEvent(arn, rid, "workload", "s3", "ListBuckets", at.Add(5*time.Minute), ""))
+	l.advance(30 * time.Minute)
+	l.scan() // started inside the window
+	l.drain()
+	if st := l.deployment(dep).State; st != models.GovDeployVerified {
+		t.Fatalf("canary %s", st)
+	}
+	l.advance(40 * time.Minute) // past the 1 h window
+	l.trail.err = enforcetest.APIError("AccessDenied", "cloudtrail:LookupEvents denied")
+	l.scan() // published after the window's end, without trail coverage
+	l.drain()
+	if g := l.gateOf(dep, igagov.GateWindowElapsed); g != igagov.OutcomeNotAvailable {
+		t.Fatalf("window_elapsed after a scan without CloudTrail coverage: %q", g)
+	}
+	if st := l.jobStatus("verify", dep); st != "queued" {
+		t.Fatalf("verify job %s after a published scan that has no trail coverage, want still re-checking", st)
+	}
+	l.trail.err = nil
+	l.advance(10 * time.Minute)
+	l.scan() // covers the window's end
+	l.drain()
+	if g := l.gateOf(dep, igagov.GateWindowElapsed); g != igagov.OutcomePassed {
+		t.Fatalf("window_elapsed after a covering scan: %q", g)
+	}
+	if st := l.jobStatus("verify", dep); st != "complete" {
+		t.Fatalf("verify job %s once window_elapsed is decided", st)
 	}
 }
 
@@ -1363,5 +1409,80 @@ func TestP3T315RemoveControlStarter(t *testing.T) {
 	}
 	if n := l.count(`SELECT count(*) FROM iga_gov_rollout WHERE workspace_id = ? AND version_id = ?`, l.ws, v2); n != 0 {
 		t.Fatal("a remove_control version got a rollout row")
+	}
+}
+
+// AS-108: the rollout runs under row-level security for the caller's
+// workspace. Workspace B naming A's policy (or A's rollout id) on every
+// rollout route is 404 and changes nothing; an observe_tick job of B naming
+// A's rollout finds no rollout and leaves A's untouched.
+func TestP3T315CrossWorkspaceRolloutIsolation(t *testing.T) {
+	l := newP3rLab(t, "p3-t315-xws", true)
+	const rid = "AROAXWSROLE0001"
+	l.role("XwsRole", rid, map[string]*time.Time{"s3": p3eTime(time.Hour), "sqs": nil})
+	l.publish()
+	policy := l.prepare(rid)
+	l.observed(policy)
+	l.toCanary(policy, 1)
+	wsB := newWorkspace(t, l.db, "p3-t315-xws-b")
+	enfPurgeOnCleanup(t, l.db, wsB)
+	actorB := uuid.New()
+	ctx := context.Background()
+	pid := uuid.MustParse(policy)
+
+	type snap struct {
+		Stage       string
+		UpdatedAt   time.Time
+		GateResults string
+		ID          uuid.UUID
+	}
+	read := func() (snap, int64, int64) {
+		t.Helper()
+		var s snap
+		if err := l.db.Raw(`SELECT id, stage, updated_at, gate_results::text AS gate_results FROM iga_gov_rollout WHERE workspace_id = ?`, l.ws).
+			Scan(&s).Error; err != nil {
+			t.Fatal(err)
+		}
+		return s, l.count(`SELECT count(*) FROM iga_gov_event WHERE workspace_id = ?`, l.ws),
+			l.count(`SELECT count(*) FROM iga_gov_deployment WHERE workspace_id = ?`, l.ws)
+	}
+	before, evA, depA := read()
+	if before.ID == uuid.Nil || before.Stage != models.GovRolloutCanary {
+		t.Fatalf("A's rollout = %+v", before)
+	}
+	want404 := func(what string, err error) {
+		t.Helper()
+		var ge *services.GovError
+		if !errors.As(err, &ge) || ge.Status != http.StatusNotFound {
+			t.Fatalf("%s from workspace B: %v, want 404", what, err)
+		}
+	}
+	for _, id := range []uuid.UUID{pid, before.ID} {
+		_, err := l.ro.Get(ctx, wsB, id, nil)
+		want404("get", err)
+		_, err = l.ro.Start(ctx, wsB, actorB, id, services.GovRolloutStartInput{Reason: "x"})
+		want404("start", err)
+		_, err = l.ro.Pause(ctx, wsB, actorB, id, "freeze")
+		want404("pause", err)
+		_, err = l.ro.Resume(ctx, wsB, actorB, id, "go")
+		want404("resume", err)
+		_, err = l.ro.Expand(ctx, wsB, actorB, id, services.GovRolloutExpandInput{Reason: "go"})
+		want404("expand", err)
+	}
+	// B's job naming A's rollout.
+	err := l.ro.ObserveTickHandler(ctx, services.NewPolicyJobRun(l.db, models.IGAGovJob{ID: uuid.New(), WorkspaceID: wsB,
+		Kind: "observe_tick", SubjectID: &before.ID}, "p3r-xws"))
+	if err == nil || !strings.Contains(err.Error(), "no longer exists") {
+		t.Fatalf("B's observe_tick on A's rollout: %v, want abandoned (not found)", err)
+	}
+	after, evA2, depA2 := read()
+	if after != before || evA2 != evA || depA2 != depA {
+		t.Fatalf("A changed: %+v -> %+v, events %d -> %d, deployments %d -> %d", before, after, evA, evA2, depA, depA2)
+	}
+	for _, q := range []string{`SELECT count(*) FROM iga_gov_rollout WHERE workspace_id = ?`, `SELECT count(*) FROM iga_gov_event WHERE workspace_id = ?`,
+		`SELECT count(*) FROM iga_gov_deployment WHERE workspace_id = ?`} {
+		if n := l.count(q, wsB); n != 0 {
+			t.Fatalf("%s for B = %d", q, n)
+		}
 	}
 }

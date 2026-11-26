@@ -74,9 +74,9 @@ const (
 const InventoryDefaultLimit = 50
 
 // InventoryProviders are the providers the inventory lists.
-var InventoryProviders = []string{models.ProviderAWS, models.ProviderK8s, models.ProviderGitHub}
+var InventoryProviders = []string{models.ProviderAWS, models.ProviderK8s, models.ProviderGitHub, models.ProviderAzure}
 
-// The provider_attrs keys a k8s or github row states its scope and native id
+// The provider_attrs keys a k8s, github or azure row states its scope and native id
 // in. They are the row's scope, sub_scope and native_id, never its attrs.
 var inventoryScopeKeys = []string{"scope_kind", "scope_id", "scope_label", "sub_scope", "native_id"}
 
@@ -86,7 +86,8 @@ const inventoryScopeAWSAccount = "aws_account"
 // inventoryParams are every parameter the inventory lists accept; anything
 // else is 400 invalid_parameter.
 var inventoryParams = map[string]bool{
-	"provider": true, "kind": true, "scope": true, "q": true, "lifecycle": true,
+	"provider": true, "kind": true, "exclude_kind": true, "scope": true, "q": true, "lifecycle": true,
+	"subscription": true, "resource_group": true,
 	"limit": true, "cursor": true, "facets": true, "sort": true,
 }
 
@@ -94,28 +95,29 @@ var inventoryParams = map[string]bool{
 // the filters that apply to all three classes. kind is class-specific, and
 // paging, sort and facets have no meaning for counts.
 var inventorySummaryParams = map[string]bool{
-	"provider": true, "scope": true, "q": true, "lifecycle": true,
+	"provider": true, "exclude_kind": true, "scope": true, "q": true, "lifecycle": true,
+	"subscription": true, "resource_group": true,
 }
 
 // inventorySorts are the sort values: by name (then id), or most recently
 // seen first (then id, descending).
 var inventorySorts = []string{"name", "-last_seen"}
 
-var inventoryFacetNames = []string{"provider", "kind", "scope"}
+var inventoryFacetNames = []string{"provider", "kind", "scope", "subscription", "resource_group"}
 
 // ListInventoryWorkloads serves GET /api/iga/v1/inventory/workloads.
-func (r *Reader) ListInventoryWorkloads(ctx context.Context, ws uuid.UUID, vals url.Values) (any, error) {
-	return inventoryRun(ctx, r, ws, vals, inventoryWorkloads)
+func (r *Reader) ListInventoryWorkloads(ctx context.Context, vals url.Values) (any, error) {
+	return inventoryRun(ctx, r, vals, inventoryWorkloads)
 }
 
 // ListInventoryIdentities serves GET /api/iga/v1/inventory/identities.
-func (r *Reader) ListInventoryIdentities(ctx context.Context, ws uuid.UUID, vals url.Values) (any, error) {
-	return inventoryRun(ctx, r, ws, vals, inventoryIdentities)
+func (r *Reader) ListInventoryIdentities(ctx context.Context, vals url.Values) (any, error) {
+	return inventoryRun(ctx, r, vals, inventoryIdentities)
 }
 
 // ListInventoryResources serves GET /api/iga/v1/inventory/resources.
-func (r *Reader) ListInventoryResources(ctx context.Context, ws uuid.UUID, vals url.Values) (any, error) {
-	return inventoryRun(ctx, r, ws, vals, inventoryResources)
+func (r *Reader) ListInventoryResources(ctx context.Context, vals url.Values) (any, error) {
+	return inventoryRun(ctx, r, vals, inventoryResources)
 }
 
 /* --------------------------------- the rows -------------------------------- */
@@ -352,6 +354,9 @@ func newInventoryClass(c inventoryClass) *inventoryClass {
 			// id ␟ kind ␟ label, so the chip can be labelled; finalized per id.
 			"scope": {expr: c.scopeIDSQL() + " || chr(31) || " + c.scopeKindSQL() + " || chr(31) || " + c.scopeLabelSQL(),
 				finalize: inventoryScopeFacet},
+			// value ␟ label: a subscription by its name, a resource group as written.
+			"subscription":   {expr: c.subscriptionSQL() + " || chr(31) || " + c.attr("sub_scope"), finalize: inventoryNamedFacet},
+			"resource_group": {expr: c.resourceGroupSQL() + " || chr(31) || " + c.attr("resource_group"), finalize: inventoryNamedFacet},
 		},
 	}
 	return &c
@@ -367,10 +372,11 @@ func newInventoryClass(c inventoryClass) *inventoryClass {
 // row; the count and facet statements do not join it.
 func (c *inventoryClass) asOfLateral() string {
 	return `LEFT JOIN LATERAL (
-	        SELECT max(COALESCE(sw.observed_at, gr.completed_at, gr.started_at)) AS as_of
+	        SELECT max(COALESCE(sw.observed_at, gr.completed_at, gr.started_at, cr.published_at, cr.started_at)) AS as_of
 	          FROM iga_object_support s2
 	          LEFT JOIN iga_k8s_sweep sw ON sw.workspace_id = s2.workspace_id AND sw.id = s2.last_confirmed_sweep_id
 	          LEFT JOIN iga_scan_runs gr ON gr.workspace_id = s2.workspace_id AND gr.id = s2.last_confirmed_scan_run_id
+	          LEFT JOIN cloud_scan_run cr ON cr.workspace_id = s2.workspace_id AND cr.id = s2.last_confirmed_run_id
 	         WHERE ` + c.alias + `.provider <> 'aws' AND s2.workspace_id = ` + c.alias + `.workspace_id
 	           AND s2.` + c.supportCol + ` = ` + c.alias + `.id AND s2.state <> 'ended') asof ON true`
 }
@@ -401,6 +407,21 @@ func (c *inventoryClass) scopeLabelSQL() string {
 
 func (c *inventoryClass) subScopeSQL() string {
 	return `(CASE WHEN ` + c.isAWS() + ` THEN ` + c.awsSubScope + ` ELSE ` + c.attr("sub_scope") + ` END)`
+}
+
+// subscriptionSQL is an Azure resource's or workload's subscription id,
+// lowercased; empty for a row with none (an Entra object, any other provider).
+func (c *inventoryClass) subscriptionSQL() string {
+	return `lower(` + c.attr("subscription_id") + `)`
+}
+
+// resourceGroupSQL is an Azure row's resource group as the filter takes it:
+// "<subscription id>/<resource group>", lowercased, since a resource group's
+// name is unique only within its subscription and Azure compares names without
+// case. Empty for a row with none.
+func (c *inventoryClass) resourceGroupSQL() string {
+	return `(CASE WHEN ` + c.attr("resource_group") + ` <> '' AND ` + c.subscriptionSQL() + ` <> ''
+	              THEN ` + c.subscriptionSQL() + ` || '/' || lower(` + c.attr("resource_group") + `) ELSE '' END)`
 }
 
 // nativeSQL is the row's native id, computed in SQL so q matches exactly what
@@ -440,7 +461,8 @@ func (c *inventoryClass) readable(ws uuid.UUID) listsFilter {
 
 // inventoryRun is one inventory list request. Parameters (400) are checked,
 // and the cursor opened, before the snapshot is.
-func inventoryRun(ctx context.Context, r *Reader, ws uuid.UUID, vals url.Values, c *inventoryClass) (any, error) {
+func inventoryRun(ctx context.Context, r *Reader, vals url.Values, c *inventoryClass) (any, error) {
+	ws := workspaceIn(ctx)
 	for name := range vals {
 		if !inventoryParams[name] {
 			return nil, InvalidParameter(name, fmt.Sprintf("%s is not a parameter of this list", name))
@@ -478,7 +500,7 @@ func inventoryRun(ctx context.Context, r *Reader, ws uuid.UUID, vals url.Values,
 	var out Envelope
 	// No publication pin: Kubernetes and GitHub publish no revisions, so the
 	// snapshot is the consistency unit.
-	err := r.Read(ctx, ws, Pin{}, func(q *Query) error {
+	err := r.Read(ctx, Pin{}, func(q *Query) error {
 		meta := InventoryMeta{Limit: p.Limit}
 		accts, err := q.LoadAccounts()
 		if err != nil {
@@ -589,7 +611,16 @@ func (c *inventoryClass) filters(p *ListParams, ws uuid.UUID) ([]listsFilter, *i
 	req := &inventoryRequest{providers: providers, scopes: inventoryValues(p, "scope"), kinds: inventoryValues(p, "kind")}
 	fs = append(fs, listsIn("provider", c.alias+".provider", providers)...)
 	fs = append(fs, listsIn("kind", c.kindCol, req.kinds)...)
+	// exclude_kind leaves kinds out (UI-056: Azure's Resources list without
+	// Entra permissions). Tagged as the kind facet, so the kind chips still
+	// count what it leaves out and one click shows them.
+	if ex := inventoryValues(p, "exclude_kind"); len(ex) > 0 {
+		fs = append(fs, listsFilter{facet: "kind", sql: c.kindCol + " NOT IN ?", args: []any{ex}})
+	}
 	fs = append(fs, listsIn("scope", c.scopeIDSQL(), req.scopes)...)
+	// Azure's subscription and resource group (as their facets give them).
+	fs = append(fs, listsIn("subscription", c.subscriptionSQL(), inventoryLower(p, "subscription"))...)
+	fs = append(fs, listsIn("resource_group", c.resourceGroupSQL(), inventoryLower(p, "resource_group"))...)
 	return fs, req, nil
 }
 
@@ -605,12 +636,25 @@ func inventoryValues(p *ListParams, param string) []string {
 	return out
 }
 
+// inventoryLower is inventoryValues lowercased, for values compared without
+// case (Azure's ids and names).
+func inventoryLower(p *ListParams, param string) []string {
+	var out []string
+	for _, v := range inventoryValues(p, param) {
+		if v = strings.ToLower(v); !contains(out, v) {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
 /* ---------------------------------- facets --------------------------------- */
 
 var inventoryProviderLabels = map[string]string{
 	models.ProviderAWS:    "AWS",
 	models.ProviderK8s:    "Kubernetes",
 	models.ProviderGitHub: "GitHub",
+	models.ProviderAzure:  "Microsoft Azure",
 }
 
 // inventoryKindLabels names the kinds the contract lists; any other kind is
@@ -641,6 +685,16 @@ var inventoryKindLabels = map[string]string{
 	"github_app_installation":           "GitHub App installation",
 	"github_deploy_key":                 "GitHub deploy key",
 	"github_repository":                 "GitHub repository",
+	// Microsoft Entra ID and Azure (internal/azuregraph).
+	models.CloudIdentityEntraUser:             "Microsoft Entra user",
+	models.CloudIdentityEntraGroup:            "Microsoft Entra group",
+	models.CloudIdentityEntraApplication:      "Microsoft Entra application",
+	models.CloudIdentityEntraServicePrincipal: "Service principal",
+	models.CloudIdentityEntraManagedIdentity:  "Managed identity",
+	models.CloudIdentityEntraAgentIdentity:    "Agent identity",
+	models.CloudIdentityEntraAgentUser:        "Agent's user account",
+	models.CloudResourceEntraAppRole:          "Application permission",
+	models.CloudResourceEntraDelegatedScope:   "Delegated permission",
 }
 
 // inventoryScopeFacet folds the scope facet's id ␟ kind ␟ label groups into one
@@ -677,6 +731,36 @@ func inventoryScopeFacet(counts map[string]int64, accts *Accounts) []FacetValue 
 	return listsFacetOrder(out, "")
 }
 
+// inventoryNamedFacet folds a value ␟ label facet into one chip per value,
+// labelled by the row's name for it (the value when no row names it). Rows
+// with no value have no chip.
+func inventoryNamedFacet(counts map[string]int64, _ *Accounts) []FacetValue {
+	byValue := map[string]*FacetValue{}
+	for v, n := range counts {
+		value, label, _ := strings.Cut(v, "\x1f")
+		if value == "" {
+			continue
+		}
+		fv := byValue[value]
+		if fv == nil {
+			fv = &FacetValue{Value: value}
+			byValue[value] = fv
+		}
+		fv.Count += n
+		if fv.Label == "" || (label != "" && label < fv.Label) {
+			fv.Label = label // deterministic when two rows disagree
+		}
+	}
+	out := make([]FacetValue, 0, len(byValue))
+	for _, fv := range byValue {
+		if fv.Label == "" {
+			fv.Label = fv.Value
+		}
+		out = append(out, *fv)
+	}
+	return listsFacetOrder(out, "")
+}
+
 /* --------------------------------- summary --------------------------------- */
 
 // InventorySummary is GET /api/iga/v1/inventory/summary (B2): one count per
@@ -697,7 +781,8 @@ type InventorySummary struct {
 // exact value up to TotalCap, {value: TotalCap, exact: false} above it, and
 // {value: null, exact: false} when that one count timed out -- the other two
 // are unaffected. One REPEATABLE READ snapshot, one request deadline.
-func (r *Reader) InventorySummary(ctx context.Context, ws uuid.UUID, vals url.Values) (any, error) {
+func (r *Reader) InventorySummary(ctx context.Context, vals url.Values) (any, error) {
+	ws := workspaceIn(ctx)
 	for name := range vals {
 		if !inventorySummaryParams[name] {
 			return nil, InvalidParameter(name, fmt.Sprintf("%s is not a parameter of this route", name))
@@ -717,7 +802,7 @@ func (r *Reader) InventorySummary(ctx context.Context, ws uuid.UUID, vals url.Va
 	}
 
 	var out Envelope
-	err := r.Read(ctx, ws, Pin{}, func(q *Query) error {
+	err := r.Read(ctx, Pin{}, func(q *Query) error {
 		accts, err := q.LoadAccounts()
 		if err != nil {
 			return err

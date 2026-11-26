@@ -4,272 +4,112 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	stderrors "errors"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/authsec-ai/authsec/internal/spire/domain/models"
 	"github.com/authsec-ai/authsec/internal/spire/domain/repositories"
 	"github.com/authsec-ai/authsec/internal/spire/errors"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 )
 
-// PostgresCertificateRepository implements the CertificateRepository interface
+// PostgresCertificateRepository stores certificates issued to attested
+// workloads (spire_certificates) of the workspace carried by ctx.
 type PostgresCertificateRepository struct {
 	db *sql.DB
 }
 
-// NewPostgresCertificateRepository creates a new certificate repository
+// NewPostgresCertificateRepository creates the certificate repository.
 func NewPostgresCertificateRepository(db *sql.DB) repositories.CertificateRepository {
 	return &PostgresCertificateRepository{db: db}
 }
 
-// GetByID retrieves a certificate by ID
-func (r *PostgresCertificateRepository) GetByID(ctx context.Context, workspaceID, id string) (*models.Certificate, error) {
-	query := `
-		SELECT id, workspace_id, workload_id, serial_number, COALESCE(sha256_fingerprint, '') as sha256_fingerprint, spiffe_id, cert_pem, ca_chain,
-			issued_at, expires_at, revoked_at, status, issue_type, created_at
-		FROM certificates
-		WHERE id = $1 AND workspace_id = $2
-	`
+const certificateColumns = `id::text, workspace_id::text, workload_id::text, serial_number,
+	COALESCE(sha256_fingerprint, ''), spiffe_id, cert_pem, ca_chain, issued_at, expires_at,
+	revoked_at, status, issue_type, created_at`
 
-	return r.scanCertificate(ctx, query, id, workspaceID)
+// GetBySerialNumber returns a certificate of ctx's workspace.
+func (r *PostgresCertificateRepository) GetBySerialNumber(ctx context.Context, serialNumber string) (*models.Certificate, error) {
+	return r.getOne(ctx, `SELECT `+certificateColumns+` FROM spire_certificates
+		WHERE workspace_id = $1 AND serial_number = $2`, serialNumber)
 }
 
-// GetBySerialNumber retrieves a certificate by serial number
-func (r *PostgresCertificateRepository) GetBySerialNumber(ctx context.Context, workspaceID, serialNumber string) (*models.Certificate, error) {
-	query := `
-		SELECT id, workspace_id, workload_id, serial_number, COALESCE(sha256_fingerprint, '') as sha256_fingerprint, spiffe_id, cert_pem, ca_chain,
-			issued_at, expires_at, revoked_at, status, issue_type, created_at
-		FROM certificates
-		WHERE serial_number = $1 AND workspace_id = $2
-	`
-
-	return r.scanCertificate(ctx, query, serialNumber, workspaceID)
+// GetActiveByWorkload returns the newest active certificate of a workload of
+// ctx's workspace.
+func (r *PostgresCertificateRepository) GetActiveByWorkload(ctx context.Context, workloadID string) (*models.Certificate, error) {
+	if _, err := uuid.Parse(workloadID); err != nil {
+		return nil, errors.NewNotFoundError("Certificate not found", nil)
+	}
+	return r.getOne(ctx, `SELECT `+certificateColumns+` FROM spire_certificates
+		WHERE workspace_id = $1 AND workload_id = $2 AND status = 'active'
+		ORDER BY issued_at DESC LIMIT 1`, workloadID)
 }
 
-// GetActiveByWorkload retrieves the active certificate for a workload
-func (r *PostgresCertificateRepository) GetActiveByWorkload(ctx context.Context, workspaceID, workloadID string) (*models.Certificate, error) {
-	query := `
-		SELECT id, workspace_id, workload_id, serial_number, COALESCE(sha256_fingerprint, '') as sha256_fingerprint, spiffe_id, cert_pem, ca_chain,
-			issued_at, expires_at, revoked_at, status, issue_type, created_at
-		FROM certificates
-		WHERE workload_id = $1 AND workspace_id = $2 AND status = 'active'
-		ORDER BY issued_at DESC
-		LIMIT 1
-	`
-
-	return r.scanCertificate(ctx, query, workloadID, workspaceID)
-}
-
-// Create creates a new certificate record
-func (r *PostgresCertificateRepository) Create(ctx context.Context, cert *models.Certificate) error {
-	query := `
-		INSERT INTO certificates (id, workspace_id, workload_id, serial_number, sha256_fingerprint, spiffe_id, cert_pem, ca_chain,
-			issued_at, expires_at, status, issue_type, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-	`
-
-	cert.CreatedAt = time.Now()
-
-	caChainJSON, err := json.Marshal(cert.CAChain)
-	if err != nil {
-		return errors.NewInternalError("Failed to marshal CA chain", err)
-	}
-
-	_, err = r.db.ExecContext(ctx, query,
-		cert.ID,
-		cert.WorkspaceID,
-		cert.WorkloadID,
-		cert.SerialNumber,
-		cert.SHA256Fingerprint,
-		cert.SpiffeID,
-		cert.CertPEM,
-		caChainJSON,
-		cert.IssuedAt,
-		cert.ExpiresAt,
-		cert.Status,
-		cert.IssueType,
-		cert.CreatedAt,
-	)
-
-	if err != nil {
-		return errors.NewInternalError("Failed to create certificate", err)
-	}
-
-	return nil
-}
-
-// Update updates a certificate record
-func (r *PostgresCertificateRepository) Update(ctx context.Context, cert *models.Certificate) error {
-	query := `
-		UPDATE certificates
-		SET status = $3, revoked_at = $4
-		WHERE id = $1 AND workspace_id = $2
-	`
-
-	result, err := r.db.ExecContext(ctx, query,
-		cert.ID,
-		cert.WorkspaceID,
-		cert.Status,
-		cert.RevokedAt,
-	)
-
-	if err != nil {
-		return errors.NewInternalError("Failed to update certificate", err)
-	}
-
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return errors.NewInternalError("Failed to get affected rows", err)
-	}
-
-	if rows == 0 {
-		return errors.NewNotFoundError("Certificate not found", nil)
-	}
-
-	return nil
-}
-
-// Revoke marks a certificate as revoked
-func (r *PostgresCertificateRepository) Revoke(ctx context.Context, workspaceID, id string) error {
-	query := `
-		UPDATE certificates
-		SET status = 'revoked', revoked_at = $3
-		WHERE id = $1 AND workspace_id = $2
-	`
-
-	now := time.Now()
-	result, err := r.db.ExecContext(ctx, query, id, workspaceID, now)
-	if err != nil {
-		return errors.NewInternalError("Failed to revoke certificate", err)
-	}
-
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return errors.NewInternalError("Failed to get affected rows", err)
-	}
-
-	if rows == 0 {
-		return errors.NewNotFoundError("Certificate not found", nil)
-	}
-
-	return nil
-}
-
-// ListByWorkload retrieves all certificates for a workload
-func (r *PostgresCertificateRepository) ListByWorkload(ctx context.Context, workspaceID, workloadID string) ([]*models.Certificate, error) {
-	query := `
-		SELECT id, workspace_id, workload_id, serial_number, COALESCE(sha256_fingerprint, '') as sha256_fingerprint, spiffe_id, cert_pem, ca_chain,
-			issued_at, expires_at, revoked_at, status, issue_type, created_at
-		FROM certificates
-		WHERE workload_id = $1 AND workspace_id = $2
-		ORDER BY issued_at DESC
-	`
-
-	return r.queryCertificates(ctx, query, workloadID, workspaceID)
-}
-
-// ListExpiring retrieves certificates expiring within the given duration
-func (r *PostgresCertificateRepository) ListExpiring(ctx context.Context, workspaceID string, within time.Duration) ([]*models.Certificate, error) {
-	query := `
-		SELECT id, workspace_id, workload_id, serial_number, COALESCE(sha256_fingerprint, '') as sha256_fingerprint, spiffe_id, cert_pem, ca_chain,
-			issued_at, expires_at, revoked_at, status, issue_type, created_at
-		FROM certificates
-		WHERE workspace_id = $1 AND status = 'active' AND expires_at < $2
-		ORDER BY expires_at ASC
-	`
-
-	expiryThreshold := time.Now().Add(within)
-	return r.queryCertificates(ctx, query, workspaceID, expiryThreshold)
-}
-
-// scanCertificate scans a single certificate
-func (r *PostgresCertificateRepository) scanCertificate(ctx context.Context, query string, args ...interface{}) (*models.Certificate, error) {
-	cert := &models.Certificate{}
-	var caChainJSON []byte
-	var revokedAt sql.NullTime
-
-	err := r.db.QueryRowContext(ctx, query, args...).Scan(
-		&cert.ID,
-		&cert.WorkspaceID,
-		&cert.WorkloadID,
-		&cert.SerialNumber,
-		&cert.SHA256Fingerprint,
-		&cert.SpiffeID,
-		&cert.CertPEM,
-		&caChainJSON,
-		&cert.IssuedAt,
-		&cert.ExpiresAt,
-		&revokedAt,
-		&cert.Status,
-		&cert.IssueType,
-		&cert.CreatedAt,
-	)
-
-	if err == sql.ErrNoRows {
+func (r *PostgresCertificateRepository) getOne(ctx context.Context, query string, arg interface{}) (*models.Certificate, error) {
+	c := &models.Certificate{}
+	var chain []byte
+	var revoked sql.NullTime
+	err := tenancy.QueryRowContext(ctx, r.db, query, []interface{}{arg},
+		&c.ID, &c.WorkspaceID, &c.WorkloadID, &c.SerialNumber, &c.SHA256Fingerprint, &c.SpiffeID,
+		&c.CertPEM, &chain, &c.IssuedAt, &c.ExpiresAt, &revoked, &c.Status, &c.IssueType, &c.CreatedAt)
+	if stderrors.Is(err, tenancy.ErrNotFound) {
 		return nil, errors.NewNotFoundError("Certificate not found", err)
 	}
 	if err != nil {
 		return nil, errors.NewInternalError("Failed to get certificate", err)
 	}
-
-	if revokedAt.Valid {
-		cert.RevokedAt = &revokedAt.Time
+	if revoked.Valid {
+		c.RevokedAt = &revoked.Time
 	}
-
-	if err := json.Unmarshal(caChainJSON, &cert.CAChain); err != nil {
-		return nil, errors.NewInternalError("Failed to unmarshal CA chain", err)
+	if len(chain) > 0 {
+		_ = json.Unmarshal(chain, &c.CAChain)
 	}
-
-	return cert, nil
+	return c, nil
 }
 
-// queryCertificates queries multiple certificates
-func (r *PostgresCertificateRepository) queryCertificates(ctx context.Context, query string, args ...interface{}) ([]*models.Certificate, error) {
-	rows, err := r.db.QueryContext(ctx, query, args...)
+// Create inserts a certificate for ctx's workspace.
+func (r *PostgresCertificateRepository) Create(ctx context.Context, cert *models.Certificate) error {
+	ws, err := workspaceOf(ctx)
 	if err != nil {
-		return nil, errors.NewInternalError("Failed to query certificates", err)
+		return err
 	}
-	defer rows.Close()
-
-	var certs []*models.Certificate
-	for rows.Next() {
-		cert := &models.Certificate{}
-		var caChainJSON []byte
-		var revokedAt sql.NullTime
-
-		err := rows.Scan(
-			&cert.ID,
-			&cert.WorkspaceID,
-			&cert.WorkloadID,
-			&cert.SerialNumber,
-			&cert.SHA256Fingerprint,
-			&cert.SpiffeID,
-			&cert.CertPEM,
-			&caChainJSON,
-			&cert.IssuedAt,
-			&cert.ExpiresAt,
-			&revokedAt,
-			&cert.Status,
-			&cert.IssueType,
-			&cert.CreatedAt,
-		)
-		if err != nil {
-			return nil, errors.NewInternalError("Failed to scan certificate", err)
-		}
-
-		if revokedAt.Valid {
-			cert.RevokedAt = &revokedAt.Time
-		}
-
-		if err := json.Unmarshal(caChainJSON, &cert.CAChain); err != nil {
-			return nil, errors.NewInternalError("Failed to unmarshal CA chain", err)
-		}
-
-		certs = append(certs, cert)
+	if cert.ID == "" {
+		cert.ID = uuid.NewString()
 	}
-
-	if err = rows.Err(); err != nil {
-		return nil, errors.NewInternalError("Error iterating certificates", err)
+	cert.WorkspaceID = ws.String()
+	cert.CreatedAt = time.Now()
+	chain, err := json.Marshal(cert.CAChain)
+	if err != nil {
+		return errors.NewInternalError("Failed to marshal CA chain", err)
 	}
+	_, err = tenancy.InsertContext(ctx, r.db, `
+		INSERT INTO spire_certificates (
+			workspace_id, id, workload_id, serial_number, sha256_fingerprint, spiffe_id, cert_pem,
+			ca_chain, issued_at, expires_at, status, issue_type, created_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+		cert.ID, cert.WorkloadID, cert.SerialNumber, nullString(cert.SHA256Fingerprint), cert.SpiffeID,
+		cert.CertPEM, chain, cert.IssuedAt, cert.ExpiresAt, cert.Status, cert.IssueType, cert.CreatedAt)
+	if err != nil {
+		return errors.NewInternalError("Failed to create certificate", err)
+	}
+	return nil
+}
 
-	return certs, nil
+// Revoke marks a certificate of ctx's workspace revoked.
+func (r *PostgresCertificateRepository) Revoke(ctx context.Context, id string) error {
+	if _, err := uuid.Parse(id); err != nil {
+		return errors.NewNotFoundError("Certificate not found", nil)
+	}
+	res, err := tenancy.ExecContext(ctx, r.db, `
+		UPDATE spire_certificates SET status = 'revoked', revoked_at = now()
+		 WHERE workspace_id = $1 AND id = $2 AND revoked_at IS NULL`, id)
+	if err != nil {
+		return errors.NewInternalError("Failed to revoke certificate", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return errors.NewNotFoundError("Certificate not found", nil)
+	}
+	return nil
 }

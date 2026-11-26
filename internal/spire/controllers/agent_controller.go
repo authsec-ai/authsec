@@ -20,86 +20,60 @@ type AgentController struct {
 }
 
 // NewAgentController creates a new agent controller
-func NewAgentController(
-	agentService *services.AgentService,
-	renewalService *services.AgentRenewalService,
-	logger *logrus.Entry,
-) *AgentController {
-	return &AgentController{
-		agentService:   agentService,
-		renewalService: renewalService,
-		logger:         logger,
-	}
+func NewAgentController(agentService *services.AgentService, renewalService *services.AgentRenewalService, logger *logrus.Entry) *AgentController {
+	return &AgentController{agentService: agentService, renewalService: renewalService, logger: logger}
 }
 
-// ListAgents handles GET /spire/v1/agents
-// Lists all active agents for the authenticated tenant
+// ListAgents handles GET /spiresvc/v1/agents: the active agents of the
+// caller's workspace (AuthMiddleware).
 func (ctrl *AgentController) ListAgents(c *gin.Context) {
-	workspaceID, ok := middleware.GetSpireWorkspaceID(c)
-	if !ok || workspaceID == "" {
-		ctrl.sendError(c, errors.NewUnauthorizedError("workspace_id not found in authentication context", nil))
-		return
-	}
-
-	ctrl.logger.WithField("workspace_id", workspaceID).Info("Listing agents")
-
-	agents, err := ctrl.agentService.ListAgentsByTenant(c.Request.Context(), workspaceID)
+	agents, err := ctrl.agentService.ListAgents(c.Request.Context())
 	if err != nil {
-		ctrl.sendError(c, err)
+		sendError(c, ctrl.logger, err)
 		return
 	}
-
-	// Convert to response DTOs
-	agentResponses := make([]*dto.AgentResponse, len(agents))
-	for i, agent := range agents {
-		agentResponses[i] = &dto.AgentResponse{
-			ID:              agent.ID,
-			SpiffeID:        agent.SpiffeID,
-			NodeID:          agent.NodeID,
-			AttestationType: agent.AttestationType,
-			Status:          agent.Status,
-			LastSeen:        agent.LastSeen,
-			CreatedAt:       agent.CreatedAt,
+	out := make([]*dto.AgentResponse, len(agents))
+	for i, a := range agents {
+		out[i] = &dto.AgentResponse{
+			ID:              a.ID,
+			SpiffeID:        a.SpiffeID,
+			NodeID:          a.NodeID,
+			AttestationType: a.AttestationType,
+			Status:          a.Status,
+			LastSeen:        a.LastSeen,
+			CreatedAt:       a.CreatedAt,
 		}
 	}
-
-	c.JSON(http.StatusOK, dto.ListAgentsResponse{
-		Agents: agentResponses,
-		Count:  len(agentResponses),
-	})
+	c.JSON(http.StatusOK, dto.ListAgentsResponse{Agents: out, Count: len(out)})
 }
 
-// RenewAgent handles POST /spire/v1/agent/renew
+// RenewAgent handles POST /spiresvc/v1/agent/renew. The agent is the one
+// whose certificate authenticated the request (agent certificate
+// middleware); a body agent_id naming another agent is 404.
 func (ctrl *AgentController) RenewAgent(c *gin.Context) {
 	var req dto.AgentRenewRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		ctrl.sendError(c, errors.NewBadRequestError("Invalid request body", err))
+		sendError(c, ctrl.logger, errors.NewBadRequestError("Invalid request body", err))
 		return
 	}
-
-	// Validate required fields
-	if req.AgentID == "" {
-		ctrl.sendError(c, errors.NewBadRequestError("agent_id is required", nil))
+	agentID, ok := middleware.GetSpireAgentID(c)
+	if !ok {
+		sendError(c, ctrl.logger, errors.NewUnauthorizedError("Agent certificate required", nil))
+		return
+	}
+	if req.AgentID != "" && req.AgentID != agentID {
+		sendError(c, ctrl.logger, errors.NewNotFoundError("Agent not found", nil))
 		return
 	}
 	if req.CSR == "" {
-		ctrl.sendError(c, errors.NewBadRequestError("csr is required", nil))
+		sendError(c, ctrl.logger, errors.NewBadRequestError("csr is required", nil))
 		return
 	}
-
-	// Call service
-	serviceReq := &services.AgentRenewRequest{
-		AgentID:  req.AgentID,
-		WorkspaceID: req.WorkspaceID,
-		CSR:      req.CSR,
-	}
-
-	resp, err := ctrl.renewalService.Renew(c.Request.Context(), serviceReq)
+	resp, err := ctrl.renewalService.Renew(c.Request.Context(), &services.AgentRenewRequest{AgentID: agentID, CSR: req.CSR})
 	if err != nil {
-		ctrl.sendError(c, err)
+		sendError(c, ctrl.logger, err)
 		return
 	}
-
 	c.JSON(http.StatusOK, dto.AgentRenewResponse{
 		SpiffeID:    resp.SpiffeID,
 		Certificate: resp.Certificate,
@@ -107,25 +81,5 @@ func (ctrl *AgentController) RenewAgent(c *gin.Context) {
 		TTL:         resp.TTL,
 		CAChain:     resp.CAChain,
 		ExpiresAt:   resp.ExpiresAt,
-	})
-}
-
-// sendError sends an error response
-func (ctrl *AgentController) sendError(c *gin.Context, err error) {
-	appErr, ok := err.(*errors.AppError)
-	if !ok {
-		appErr = errors.NewInternalError("Internal server error", err)
-	}
-
-	ctrl.logger.WithFields(logrus.Fields{
-		"code":    appErr.Code,
-		"message": appErr.Message,
-	}).WithError(appErr.Err).Error("Agent request failed")
-
-	c.JSON(appErr.Status, dto.ErrorResponse{
-		Error: dto.ErrorDetail{
-			Code:    appErr.Code,
-			Message: appErr.Message,
-		},
 	})
 }

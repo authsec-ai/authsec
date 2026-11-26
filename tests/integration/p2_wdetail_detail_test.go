@@ -21,6 +21,7 @@ import (
 	"github.com/google/uuid"
 
 	platform "github.com/authsec-ai/authsec/controllers/platform"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 )
 
@@ -381,6 +382,7 @@ func wdetailScopedGet(t *testing.T, l *p2Lab, claims map[string]string, scope, p
 	g := eng.Group("/api/iga/v1")
 	g.Use(func(c *gin.Context) {
 		c.Set("workspace_id", l.ws.String())
+		tenancy.Set(c, tenancy.Context{WorkspaceID: l.ws, PrincipalKind: "user"})
 		for k, v := range claims {
 			c.Set(k, v)
 		}

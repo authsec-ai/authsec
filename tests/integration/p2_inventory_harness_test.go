@@ -29,6 +29,7 @@ import (
 	platform "github.com/authsec-ai/authsec/controllers/platform"
 	"github.com/authsec-ai/authsec/internal/igagraph"
 	"github.com/authsec-ai/authsec/internal/k8sgraph"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/services"
 )
 
@@ -77,7 +78,7 @@ func newInvLab(t *testing.T, gate *services.GraphProjectionGate) *invLab {
 	t.Helper()
 	db := igaDB(t)
 	if gate == nil {
-		gate = services.NewGraphProjectionGate(true, "")
+		gate = services.NewGraphProjectionGate(true)
 		if err := gate.Verify(db); err != nil {
 			t.Fatalf("the integration database must be at 042 for the inventory: %v", err)
 		}
@@ -100,6 +101,7 @@ func newInvLab(t *testing.T, gate *services.GraphProjectionGate) *invLab {
 		l.mu.Unlock()
 		if ws != uuid.Nil {
 			c.Set("workspace_id", ws.String())
+			tenancy.Set(c, tenancy.Context{WorkspaceID: ws, PrincipalKind: "user"})
 		}
 		c.Next()
 	})

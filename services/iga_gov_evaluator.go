@@ -13,6 +13,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/authsec-ai/authsec/internal/igagov"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	repositories "github.com/authsec-ai/authsec/repository"
 )
@@ -138,7 +139,7 @@ func isFenceLoss(err error) bool {
 func (e *GovEvaluator) evaluate(ctx context.Context, ws uuid.UUID, rev int64, fence EvalFence) (string, error) {
 	// 1. Decide, in one fenced transaction: no-op, supersede, retry or go.
 	var decision string
-	err := e.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := tenancy.InWorkspace(ctx, e.db, ws, func(tx *gorm.DB) error {
 		if err := fence(tx); err != nil {
 			return err
 		}
@@ -233,7 +234,25 @@ func (e *GovEvaluator) evaluate(ctx context.Context, ws uuid.UUID, rev int64, fe
 }
 
 func (e *GovEvaluator) compute(ctx context.Context, ws uuid.UUID, rev int64) (igagov.Evaluation, *govSnapshot, error) {
-	gs, err := loadGovSnapshot(ctx, e.db, ws, rev, nil)
+	wctx, err := govWorkspaceContext(ctx, ws)
+	if err != nil {
+		return igagov.Evaluation{}, nil, err
+	}
+	var gs *govSnapshot
+	err = tenancy.RLSTransaction(wctx, e.db, repeatableRead, func(tx *gorm.DB, _ uuid.UUID) (err error) {
+		if gs, err = readGovSnapshot(tx, ws, rev, nil); err != nil || !PolicyActionsOn() {
+			return err
+		}
+		// R1b (R1b): the connectors' CloudTrail history, read
+		// under the same barrier (and the same workspace transaction),
+		// qualifies actions of the services kept.
+		trails, err := loadActionTrails(wctx, tx, ws, gs.Snap.EvaluatedAt)
+		if err != nil {
+			return err
+		}
+		gs.Snap.ActionLevel, gs.Snap.ActionTrails = true, trails
+		return nil
+	})
 	if err != nil {
 		return igagov.Evaluation{}, nil, fmt.Errorf("snapshot: %w", err)
 	}
@@ -243,6 +262,7 @@ func (e *GovEvaluator) compute(ctx context.Context, ws uuid.UUID, rev int64) (ig
 	if err := ctx.Err(); err != nil {
 		return igagov.Evaluation{}, nil, err
 	}
+	gs.Snap.NoOwnership = !GovOwnershipEnabled()
 	out, err := igagov.Evaluate(gs.Snap)
 	if err != nil {
 		return igagov.Evaluation{}, nil, fmt.Errorf("evaluate: %w", err)
@@ -262,7 +282,7 @@ func (e *GovEvaluator) fail(ws uuid.UUID, rev int64, fence EvalFence, cause erro
 	}
 	fctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	err := e.db.WithContext(fctx).Transaction(func(tx *gorm.DB) error {
+	err := tenancy.InWorkspace(fctx, e.db, ws, func(tx *gorm.DB) error {
 		if err := fence(tx); err != nil {
 			return err
 		}
@@ -287,7 +307,7 @@ func (e *GovEvaluator) fail(ws uuid.UUID, rev int64, fence EvalFence, cause erro
 func (e *GovEvaluator) write(ctx context.Context, ws uuid.UUID, rev int64, fence EvalFence, out igagov.Evaluation, gs *govSnapshot) error {
 	var err error
 	for attempt := 1; attempt <= evalTxMaxAttempts; attempt++ {
-		err = e.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		err = tenancy.InWorkspace(ctx, e.db, ws, func(tx *gorm.DB) error {
 			return e.writeTx(tx, ws, rev, fence, out, gs)
 		})
 		if err == nil {
@@ -340,6 +360,11 @@ func (e *GovEvaluator) writeTx(tx *gorm.DB, ws uuid.UUID, rev int64, fence EvalF
 	}
 	if err := e.repo.InsertEvidenceTx(tx, evidence); err != nil {
 		return fmt.Errorf("activity evidence: %w", err)
+	}
+	if out.ActionLevel {
+		if err := insertActionEvidenceTx(tx, ws, rev, out.ActionEvidence); err != nil {
+			return fmt.Errorf("action evidence: %w", err)
+		}
 	}
 
 	// §8.7 lock order 1: the workspace's live controls.
@@ -440,11 +465,14 @@ func (e *GovEvaluator) writeTx(tx *gorm.DB, ws uuid.UUID, rev int64, fence EvalF
 		}
 		return err
 	}
-	if err := tx.Exec(`INSERT INTO iga_gov_job (workspace_id, kind, rev, dedupe_key)
-	                   VALUES (?, 'evaluate_owner_rules', ?, ?)
-	                   ON CONFLICT (workspace_id, kind, dedupe_key) WHERE status IN ('queued','running') DO NOTHING`,
-		ws, rev, fmt.Sprintf("rev:%d", rev)).Error; err != nil {
-		return fmt.Errorf("enqueue evaluate_owner_rules: %w", err)
+	// Owner rules run only in owners mode (admin mode has no owners).
+	if GovOwnershipEnabled() {
+		if err := tx.Exec(`INSERT INTO iga_gov_job (workspace_id, kind, rev, dedupe_key)
+		                   VALUES (?, 'evaluate_owner_rules', ?, ?)
+		                   ON CONFLICT (workspace_id, kind, dedupe_key) WHERE status IN ('queued','running') DO NOTHING`,
+			ws, rev, fmt.Sprintf("rev:%d", rev)).Error; err != nil {
+			return fmt.Errorf("enqueue evaluate_owner_rules: %w", err)
+		}
 	}
 	// The publication hook (p3-wire, item 4; §2.8 "Revalidation, not silent
 	// recompilation", §8.3, A59): every version still in review is
@@ -490,6 +518,9 @@ func (e *GovEvaluator) writeTx(tx *gorm.DB, ws uuid.UUID, rev int64, fence EvalF
 	}
 	counts["results"] = len(results)
 	counts["evidence"] = len(evidence)
+	if out.ActionLevel {
+		counts["action_evidence"] = len(out.ActionEvidence)
+	}
 	return e.appendEvent(tx, ws, "evaluation_completed", map[string]any{"rev": rev, "counts": counts,
 		"skipped_roles": len(out.Skipped), "unknown_conditions": len(out.Unknown)})
 }
@@ -575,16 +606,21 @@ func (e *GovEvaluator) appendEvent(tx *gorm.DB, ws uuid.UUID, event string, payl
 // prune drops the evidence and results of complete evaluations outside the
 // retention (§2.5): best effort, outside the evaluation's transaction.
 func (e *GovEvaluator) prune(ctx context.Context, ws uuid.UUID) {
-	settings, err := repositories.NewIGAGovSettingsRepository(e.db.WithContext(ctx)).Get(ws)
-	if err != nil {
-		log.Printf("[policy] prune %s: settings: %v", ws, err)
-		return
-	}
-	if err := e.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		_, err := e.repo.PruneTx(tx, ws, settings.EvidenceRetentionRevs)
-		return err
+	if err := tenancy.InWorkspace(ctx, e.db, ws, func(tx *gorm.DB) error {
+		settings, err := repositories.NewIGAGovSettingsRepository(tx).Get(ws)
+		if err != nil {
+			return fmt.Errorf("settings: %w", err)
+		}
+		if _, err := e.repo.PruneTx(tx, ws, settings.EvidenceRetentionRevs); err != nil {
+			return err
+		}
+		if PolicyActionsOn() {
+			_, err := pruneActionEvidenceTx(tx, ws)
+			return err
+		}
+		return nil
 	}); err != nil {
-		log.Printf("[policy] prune %s: %v", ws, err)
+		log.Printf("[policy] prune workspace %s: %v", ws, err)
 	}
 }
 

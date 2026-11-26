@@ -147,43 +147,57 @@ func (s *ConsentService) UpsertConsent(
 	return &grant, nil
 }
 
-// RevokeConsent revokes a consent grant by ID.
-func (s *ConsentService) RevokeConsent(grantID uuid.UUID) error {
-	now := time.Now()
-	result := s.db.Model(&models.OAuthConsentGrant{}).
-		Where("id = ? AND revoked_at IS NULL", grantID).
-		Update("revoked_at", now)
-	if result.RowsAffected == 0 {
-		return gorm.ErrRecordNotFound
-	}
-	return result.Error
+// RevokeConsentByUser revokes the caller's own consent grant in the
+// workspace the caller is signed in to, and returns it so the caller can
+// revoke the tokens it backs.
+func (s *ConsentService) RevokeConsentByUser(grantID, userID, workspaceID uuid.UUID) (*models.OAuthConsentGrant, error) {
+	return s.revoke(s.db.Where("id = ? AND user_id = ? AND workspace_id = ?", grantID, userID, workspaceID))
 }
 
-// RevokeConsentByUser revokes a consent grant, ensuring the caller is the owner.
-func (s *ConsentService) RevokeConsentByUser(grantID, userID uuid.UUID) error {
-	now := time.Now()
-	result := s.db.Model(&models.OAuthConsentGrant{}).
-		Where("id = ? AND user_id = ? AND revoked_at IS NULL", grantID, userID).
-		Update("revoked_at", now)
-	if result.RowsAffected == 0 {
-		return gorm.ErrRecordNotFound
-	}
-	return result.Error
+// RevokeConsentByTenant revokes a consent grant only when it belongs to
+// workspaceID (admin path), and returns it.
+func (s *ConsentService) RevokeConsentByTenant(grantID, workspaceID uuid.UUID) (*models.OAuthConsentGrant, error) {
+	return s.revoke(s.db.Where("id = ? AND workspace_id = ?", grantID, workspaceID))
 }
 
-// RevokeConsentByTenant revokes a consent grant only when it belongs to workspaceID (admin path).
-func (s *ConsentService) RevokeConsentByTenant(grantID, workspaceID uuid.UUID) error {
-	now := time.Now()
-	result := s.db.Model(&models.OAuthConsentGrant{}).
-		Where("id = ? AND workspace_id = ? AND revoked_at IS NULL", grantID, workspaceID).
-		Update("revoked_at", now)
-	if result.Error != nil {
-		return result.Error
+func (s *ConsentService) revoke(scoped *gorm.DB) (*models.OAuthConsentGrant, error) {
+	var grant models.OAuthConsentGrant
+	err := s.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where(scoped).Where("revoked_at IS NULL").
+			Clauses(clause.Locking{Strength: "UPDATE"}).First(&grant).Error; err != nil {
+			return err
+		}
+		now := time.Now()
+		grant.RevokedAt = &now
+		return tx.Model(&grant).Update("revoked_at", now).Error
+	})
+	if err != nil {
+		return nil, err
 	}
-	if result.RowsAffected == 0 {
-		return gorm.ErrRecordNotFound
-	}
-	return nil
+	return &grant, nil
+}
+
+// ConsentWithdrawn reports whether the user withdrew (or an admin revoked)
+// consent for this client on this resource server and has not consented
+// again since. Refreshes of tokens issued under that consent are refused
+// (AS-068).
+func (s *ConsentService) ConsentWithdrawn(workspaceID, userID, clientID, resourceServerID uuid.UUID) (bool, error) {
+	var n int64
+	err := s.db.Model(&models.OAuthConsentGrant{}).
+		Where("workspace_id = ? AND user_id = ? AND oauth_client_id = ? AND resource_server_id = ? AND revoked_at IS NOT NULL",
+			workspaceID, userID, clientID, resourceServerID).
+		Count(&n).Error
+	return n > 0, err
+}
+
+// MarkReconsented records that the user consented again without asking to be
+// remembered: a revoked grant is cleared and left expired, so it no longer
+// withdraws consent but still never skips the consent screen.
+func (s *ConsentService) MarkReconsented(workspaceID, userID, clientID, resourceServerID uuid.UUID) error {
+	return s.db.Model(&models.OAuthConsentGrant{}).
+		Where("workspace_id = ? AND user_id = ? AND oauth_client_id = ? AND resource_server_id = ? AND revoked_at IS NOT NULL",
+			workspaceID, userID, clientID, resourceServerID).
+		Updates(map[string]interface{}{"revoked_at": nil, "expires_at": time.Now(), "updated_at": time.Now()}).Error
 }
 
 // ListByUser returns all active (non-revoked) consent grants for a user.

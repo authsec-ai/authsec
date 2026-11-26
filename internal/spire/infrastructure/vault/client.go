@@ -128,6 +128,16 @@ func NewClientFromExisting(apiClient *api.Client, logger *logrus.Entry, pkiBaseP
 	}
 }
 
+// Available reports whether c can reach Vault. It is safe on a nil *Client:
+// callers check it before any PKI or KV operation, which would otherwise
+// dereference a nil client.
+func (c *Client) Available() bool {
+	return c != nil && c.client != nil
+}
+
+// ErrUnavailable is returned when no Vault client is configured.
+var ErrUnavailable = spireerrors.NewServiceUnavailableError("Vault PKI is not configured", nil)
+
 func authenticateWithAppRole(client *api.Client, roleID, secretID string) error {
 	data := map[string]interface{}{
 		"role_id":   roleID,
@@ -146,6 +156,9 @@ func authenticateWithAppRole(client *api.Client, roleID, secretID string) error 
 
 // IssueCertificate signs a CSR using Vault PKI
 func (c *Client) IssueCertificate(ctx context.Context, tenantMount, role string, req *CertificateRequest) (*CertificateResponse, error) {
+	if !c.Available() {
+		return nil, ErrUnavailable
+	}
 	var path string
 	if c.pkiBasePath != "" {
 		path = fmt.Sprintf("%s/%s/sign/%s", c.pkiBasePath, tenantMount, role)
@@ -220,6 +233,9 @@ func (c *Client) IssueCertificate(ctx context.Context, tenantMount, role string,
 
 // RevokeCertificate revokes a certificate
 func (c *Client) RevokeCertificate(ctx context.Context, tenantMount, serialNumber string) error {
+	if !c.Available() {
+		return ErrUnavailable
+	}
 	var path string
 	if c.pkiBasePath != "" {
 		path = fmt.Sprintf("%s/%s/revoke", c.pkiBasePath, tenantMount)
@@ -241,6 +257,9 @@ func (c *Client) RevokeCertificate(ctx context.Context, tenantMount, serialNumbe
 
 // GetCABundle retrieves the CA certificate bundle
 func (c *Client) GetCABundle(ctx context.Context, tenantMount string) (string, error) {
+	if !c.Available() {
+		return "", ErrUnavailable
+	}
 	var path string
 	if c.pkiBasePath != "" {
 		path = fmt.Sprintf("%s/%s/ca/pem", c.pkiBasePath, tenantMount)
@@ -270,6 +289,9 @@ func (c *Client) GetCABundle(ctx context.Context, tenantMount string) (string, e
 
 // HealthCheck checks Vault health
 func (c *Client) HealthCheck(ctx context.Context) error {
+	if !c.Available() {
+		return ErrUnavailable
+	}
 	health, err := c.client.Sys().HealthWithContext(ctx)
 	if err != nil {
 		return err
@@ -285,6 +307,9 @@ func (c *Client) HealthCheck(ctx context.Context) error {
 
 // EnablePKIEngine enables a PKI secrets engine at the specified path
 func (c *Client) EnablePKIEngine(ctx context.Context, path string) error {
+	if !c.Available() {
+		return ErrUnavailable
+	}
 	c.logger.WithField("path", path).Info("Enabling PKI secrets engine")
 
 	mountInput := &api.MountInput{
@@ -304,6 +329,9 @@ func (c *Client) EnablePKIEngine(ctx context.Context, path string) error {
 
 // GenerateRootCA generates a root CA certificate for a PKI mount
 func (c *Client) GenerateRootCA(ctx context.Context, pkiMount, commonName, ttl string) (string, error) {
+	if !c.Available() {
+		return "", ErrUnavailable
+	}
 	path := fmt.Sprintf("%s/root/generate/internal", pkiMount)
 
 	c.logger.WithFields(logrus.Fields{"path": path, "common_name": commonName}).Info("Generating root CA")
@@ -334,6 +362,9 @@ func (c *Client) GenerateRootCA(ctx context.Context, pkiMount, commonName, ttl s
 
 // CreatePKIRole creates a role for certificate issuance
 func (c *Client) CreatePKIRole(ctx context.Context, pkiMount, roleName string, config *PKIRoleConfig) error {
+	if !c.Available() {
+		return ErrUnavailable
+	}
 	path := fmt.Sprintf("%s/roles/%s", pkiMount, roleName)
 
 	c.logger.WithFields(logrus.Fields{"path": path, "role": roleName}).Info("Creating PKI role")
@@ -367,6 +398,9 @@ func (c *Client) CreatePKIRole(ctx context.Context, pkiMount, roleName string, c
 
 // ReadKVSecret reads a secret from KV v2 secrets engine
 func (c *Client) ReadKVSecret(ctx context.Context, kvMount, secretPath string) (map[string]interface{}, error) {
+	if !c.Available() {
+		return nil, ErrUnavailable
+	}
 	path := fmt.Sprintf("%s/data/%s", kvMount, secretPath)
 
 	secret, err := c.client.Logical().ReadWithContext(ctx, path)
@@ -387,6 +421,9 @@ func (c *Client) ReadKVSecret(ctx context.Context, kvMount, secretPath string) (
 
 // WriteKVSecret writes a secret to KV v2 secrets engine
 func (c *Client) WriteKVSecret(ctx context.Context, kvMount, secretPath string, data map[string]interface{}) error {
+	if !c.Available() {
+		return ErrUnavailable
+	}
 	path := fmt.Sprintf("%s/data/%s", kvMount, secretPath)
 
 	wrappedData := map[string]interface{}{"data": data}

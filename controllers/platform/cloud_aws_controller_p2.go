@@ -169,7 +169,7 @@ func (ctl *CloudAWSController) GetConnectorRegions(c *gin.Context) {
 		sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	}
 
-	recorded := connector.AWSAttrs().TemplateVersion
+	attrs := connector.AWSAttrs()
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"data":    out,
@@ -178,9 +178,9 @@ func (ctl *CloudAWSController) GetConnectorRegions(c *gin.Context) {
 			"integration": igaread.R(igaread.RefConnector, connector.ID),
 			"source":      "ec2:DescribeRegions",
 			"error":       failure,
-			"template":    templateFacts(recorded),
+			"template":    templateFacts(attrs),
 			// D-90 names it on its own; the same fact as template.outdated.
-			"template_outdated": awsdiscovery.TemplateOutdated(recorded),
+			"template_outdated": awsdiscovery.TemplateOutdated(attrs.StackReportedTemplateVersion()),
 			"note": "enabled is what AWS reported for this account just now (null when AWS " +
 				"could not be asked; see error); selected is what this connector scans. A " +
 				"change applies from the next scan to start.",
@@ -188,14 +188,17 @@ func (ctl *CloudAWSController) GetConnectorRegions(c *gin.Context) {
 	})
 }
 
-// templateFacts states the stack version recorded when the account was
-// onboarded and the one this build ships (D-72). A fact, never the cause of a
-// denial: an SCP or a permissions boundary refuses the same call.
-func templateFacts(recorded string) gin.H {
+// templateFacts states the version recorded for the account and the one this
+// build ships (D-72). outdated is judged only from a version the account's
+// stack reported itself: a version AuthSec recorded (the build's own) proves
+// nothing about the deployed stack, so outdated is null (unknown), never
+// false. A fact, never the cause of a denial: an SCP or a permissions boundary
+// refuses the same call.
+func templateFacts(attrs models.AWSConnectorAttrs) gin.H {
 	return gin.H{
-		"deployed": nullIfEmpty(recorded),
+		"deployed": nullIfEmpty(attrs.TemplateVersion),
 		"current":  awsdiscovery.TemplateVersion,
-		"outdated": awsdiscovery.TemplateOutdated(recorded),
+		"outdated": awsdiscovery.TemplateOutdated(attrs.StackReportedTemplateVersion()),
 	}
 }
 

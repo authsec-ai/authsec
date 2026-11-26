@@ -243,7 +243,8 @@ func TestP3IaCFixSourceChecks(t *testing.T) {
 		t.Fatal(err)
 	}
 	ref, err := services.IaCRepoRef(l.db, l.ws, row)
-	if err != nil || ref.ProviderHost != "ghe.acme.test" || iacpr.APIBase(ref.ProviderHost, "") != "https://ghe.acme.test/api/v3" || ref.InstallationID != inst {
+	if base, berr := iacpr.APIBase(ref.ProviderHost, ""); err != nil || berr != nil || ref.ProviderHost != "ghe.acme.test" ||
+		base != "https://ghe.acme.test/api/v3" || ref.InstallationID != inst {
 		t.Fatalf("GHES repo ref %+v %v", ref, err)
 	}
 
@@ -269,5 +270,47 @@ func TestP3IaCFixExportRefusesExpiredApproval(t *testing.T) {
 	p3exec(t, l.db, `UPDATE iga_gov_approval SET expires_at = now() - interval '1 minute' WHERE workspace_id = ? AND version_id = ?`, l.ws, l.versionID(pol, 1))
 	if code, body := l.call(l.author, http.MethodGet, path, nil); code != http.StatusConflict || digs(body, "error", "code") != services.GovCodeApprovalExpired {
 		t.Fatalf("expired approval exported: %d %v", code, body)
+	}
+}
+
+// A reviewer approves the commit AuthSec opened, then the base moves and
+// AuthSec re-renders the approved change onto it: the pushed head is not the
+// reviewed one, so the change is changed_after_review (the same state and
+// event as a human push after review) and the merge records it.
+func TestP3IaCFixAuthSecUpdateAfterApprovalIsChangedAfterReview(t *testing.T) {
+	l, _, dep := p3xApproved(t, "p3x-reviewed")
+	if out := l.deliver(dep); out.State != "awaiting_merge" {
+		t.Fatalf("deliver %+v", out)
+	}
+	first := l.change(dep)
+	l.gh.Approve(l.repo, *first.PRNumber)
+	tf, _ := l.gh.File(l.repo, "main", "iam/main.tf")
+	l.gh.Seed(l.repo, "main", map[string]string{"iam/main.tf": "# Owned by the platform team.\n" + tf})
+	if err := l.p3xSync(first.ID); err != nil {
+		t.Fatal(err)
+	}
+	ch := l.change(dep)
+	if ch.ReviewedSHA != first.ProposedSHA || ch.ProposedSHA == first.ProposedSHA || ch.ProposedSHA != l.gh.Head(l.repo, first.Branch) ||
+		ch.State != "changed_after_review" || l.dep(dep).State != "awaiting_merge" ||
+		l.p3xEvents(services.GovEventIaCPRUpdated, dep) != 1 || l.p3xEvents(services.GovEventIaCChangedReview, dep) != 1 {
+		t.Fatalf("after the update: change %+v events updated=%d changed=%d", ch, l.p3xEvents(services.GovEventIaCPRUpdated, dep),
+			l.p3xEvents(services.GovEventIaCChangedReview, dep))
+	}
+	// The state is not re-evaluated into open, nor updated again.
+	if err := l.p3xSync(first.ID); err != nil {
+		t.Fatal(err)
+	}
+	if l.change(dep).State != "changed_after_review" || l.p3xEvents(services.GovEventIaCChangedReview, dep) != 1 {
+		t.Fatal("changed_after_review was not stable across a second sync")
+	}
+	// The deployment still progresses: merge -> awaiting_apply, and the merged
+	// event says the merged head is not what was reviewed.
+	l.gh.Merge(l.repo, *first.PRNumber, l.clock)
+	l.sync(first.ID)
+	var merged []string
+	l.db.Raw(`SELECT payload->>'changed_after_review' FROM iga_gov_event WHERE workspace_id = ? AND deployment_id = ? AND event = ?`,
+		l.ws, dep, services.GovEventIaCMerged).Scan(&merged)
+	if d := l.dep(dep); d.State != "awaiting_apply" || l.change(dep).ReviewedSHA != first.ProposedSHA || len(merged) != 1 || merged[0] != "true" {
+		t.Fatalf("after merge: %s reviewed %s merged events %v", d.State, l.change(dep).ReviewedSHA, merged)
 	}
 }

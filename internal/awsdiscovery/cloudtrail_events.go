@@ -248,6 +248,8 @@ func (e TrailEvent) Attribution() Attribution {
 // CloudTrailReader reads recent management events for one region.
 type CloudTrailReader struct {
 	api CloudTrailAPI
+	// now is the clock ReadWindow reads from (WithClock); nil is time.Now.
+	now func() time.Time
 }
 
 // NewCloudTrailReader constructs a reader over the given API.

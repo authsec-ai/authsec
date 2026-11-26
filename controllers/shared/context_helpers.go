@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -38,6 +39,11 @@ func ContextStringValue(c *gin.Context, key string) string {
 // error when missing. Phase 6: workspace_id is the only identity claim; no
 // workspace_id fallback.
 func RequireWorkspaceID(c *gin.Context) (string, error) {
+	// The tenant context set by the auth middleware (ADR-0001 §4.2); the
+	// legacy key covers middlewares that do not set it yet.
+	if tc, err := tenancy.From(c); err == nil {
+		return tc.WorkspaceID.String(), nil
+	}
 	workspaceID := ContextStringValue(c, "workspace_id")
 	if workspaceID == "" {
 		return "", fmt.Errorf("workspace not found")

@@ -94,8 +94,8 @@ import (
 //   - Report a problem / It's working go to the health reporter T3.15
 //     registers (SetGovHealthReporter): its authorization (owner of a
 //     consumer, or governance:author) is that reporter's, as for the UI
-//     route; a reporter that also implements GovHealthAuthorizer is asked
-//     before the claim. Unregistered: 503 health_reports_unavailable.
+//     route, asked before the claim. Unregistered: 503
+//     health_reports_unavailable.
 
 const (
 	// slackInteractionWorkers bounds the interactions running at once.
@@ -118,16 +118,13 @@ type GovHealthReport struct {
 
 // GovHealthReporter is T3.15's health-report service as Slack calls it: the
 // same authorization and write as POST /deployments/:id/health-reports.
-// It returns the stored report (for the audit row).
+// AuthorizeHealthReport is the authorization alone, without writing: a Slack
+// click is authorized before its action_ts is claimed, so every reporter
+// must provide it (a reporter that cannot authorize cannot be installed).
+// ReportHealth returns the stored report (for the audit row).
 type GovHealthReporter interface {
-	ReportHealth(ctx context.Context, r GovHealthReport) (any, error)
-}
-
-// GovHealthAuthorizer is optionally implemented by a GovHealthReporter: the
-// reporter's authorization alone, without writing, so a Slack click is
-// authorized before its action_ts is claimed.
-type GovHealthAuthorizer interface {
 	AuthorizeHealthReport(ctx context.Context, r GovHealthReport) error
+	ReportHealth(ctx context.Context, r GovHealthReport) (any, error)
 }
 
 var (
@@ -262,35 +259,46 @@ func (s *SlackIntegrationService) acceptInteraction(ctx context.Context, h http.
 	if err != nil {
 		return nil, nil, GovNotFound()
 	}
-	db := s.db.WithContext(ctx)
 	var ns []models.IGAGovNotification
-	if err := db.Where("id = ? AND channel = ?", nid, GovChannelSlack).Limit(1).Find(&ns).Error; err != nil {
+	// TENANT-EXEMPT: a Slack request carries no workspace: the signed
+	// payload names a notification, whose row says which workspace it is
+	// (checked next: the Slack team must be that workspace's installation).
+	if err := s.db.WithContext(ctx).Where("id = ? AND channel = ?", nid, GovChannelSlack).Limit(1).Find(&ns).Error; err != nil {
 		return nil, nil, err
 	}
 	if len(ns) == 0 {
 		return nil, nil, GovNotFound()
 	}
 	ic.n = ns[0]
-	if ic.integ, err = activeSlackIntegration(db, ic.n.WorkspaceID); err != nil {
-		return nil, nil, err
-	}
-	if ic.integ == nil || in.TeamID() == "" || in.TeamID() != ic.integ.SlackTeamID {
-		// The Slack team is not the one installed in this workspace.
-		return nil, nil, notLinked("team_not_connected", "")
-	}
 	ts := ic.act.ActionTS
-	if !slackapp.ValidActionTS(ts) {
-		return nil, nil, signatureRefused("bad_action_ts")
-	}
-	// Step 3, a read: an action already recorded is refused at once. The
-	// claim itself (step 6) is atomic and comes after authorization.
-	var fresh bool
-	if err := db.Raw(`SELECT (last_action_ts = '' OR last_action_ts::numeric < ?::numeric) FROM iga_gov_notification WHERE workspace_id = ? AND id = ?`,
-		ts, ic.n.WorkspaceID, ic.n.ID).Row().Scan(&fresh); err != nil {
+	// From here on, everything is read under row-level security for the
+	// notification's workspace.
+	err = s.read(ctx, ic.n.WorkspaceID, func(db *gorm.DB) error {
+		var err error
+		if ic.integ, err = activeSlackIntegration(db, ic.n.WorkspaceID); err != nil {
+			return err
+		}
+		if ic.integ == nil || in.TeamID() == "" || in.TeamID() != ic.integ.SlackTeamID {
+			// The Slack team is not the one installed in this workspace.
+			return notLinked("team_not_connected", "")
+		}
+		if !slackapp.ValidActionTS(ts) {
+			return signatureRefused("bad_action_ts")
+		}
+		// Step 3, a read: an action already recorded is refused at once. The
+		// claim itself (step 6) is atomic and comes after authorization.
+		var fresh bool
+		if err := db.Raw(`SELECT (last_action_ts = '' OR last_action_ts::numeric < ?::numeric) FROM iga_gov_notification WHERE workspace_id = ? AND id = ?`,
+			ts, ic.n.WorkspaceID, ic.n.ID).Row().Scan(&fresh); err != nil {
+			return err
+		}
+		if !fresh {
+			return signatureRefused("replayed")
+		}
+		return nil
+	})
+	if err != nil {
 		return nil, nil, err
-	}
-	if !fresh {
-		return nil, nil, signatureRefused("replayed")
 	}
 	return ic, &SlackInteractionAck{Accepted: true, Action: ic.act.ActionID}, nil
 }
@@ -339,7 +347,6 @@ func (s *SlackIntegrationService) runInteraction(ctx context.Context, ic *intera
 // authenticated is steps 4-7 for an authentic Slack user of the installed
 // team.
 func (s *SlackIntegrationService) authenticated(ctx context.Context, ic *interactionCtx) (*SlackInteractionResult, error) {
-	db := s.db.WithContext(ctx)
 	ws := ic.n.WorkspaceID
 	if ic.n.SlackTS != "" && ic.in.MessageTS() != ic.n.SlackTS {
 		return nil, govConflict(GovCodePlanChanged, "This message is no longer current; open AuthSec.", map[string]any{"reason": "message_superseded"})
@@ -353,8 +360,12 @@ func (s *SlackIntegrationService) authenticated(ctx context.Context, ic *interac
 		link, _ := s.LinkURL(ws, ic.integ.SlackTeamID, ic.in.User.ID)
 		return nil, notLinked("no_link", link)
 	}
-	m, err := s.members.ActiveMembers(db, ws, []uuid.UUID{user})
-	if err != nil {
+	var m map[uuid.UUID]WorkspaceMember
+	if err := s.read(ctx, ws, func(db *gorm.DB) error {
+		var err error
+		m, err = s.members.ActiveMembers(db, ws, []uuid.UUID{user})
+		return err
+	}); err != nil {
 		return nil, err
 	}
 	member, ok := m[user]
@@ -394,7 +405,7 @@ func (s *SlackIntegrationService) authenticated(ctx context.Context, ic *interac
 // replay.
 func (s *SlackIntegrationService) claimAction(ctx context.Context, ic *interactionCtx) error {
 	ws, ts := ic.n.WorkspaceID, ic.act.ActionTS
-	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	return s.write(ctx, ws, func(tx *gorm.DB) error {
 		res := tx.Exec(`UPDATE iga_gov_notification SET last_action_ts = ?
 			WHERE workspace_id = ? AND id = ? AND (last_action_ts = '' OR last_action_ts::numeric < ?::numeric)`, ts, ws, ic.n.ID, ts)
 		if res.Error != nil {
@@ -409,7 +420,9 @@ func (s *SlackIntegrationService) claimAction(ctx context.Context, ic *interacti
 	})
 }
 
-func (s *SlackIntegrationService) authoring() *GovAuthoring { return NewGovAuthoring(s.db, s.live) }
+func (s *SlackIntegrationService) authoring() *GovAuthoring {
+	return NewGovAuthoring(s.handle(), s.live)
+}
 
 // approvalDigest is the digest an approval request's buttons carry.
 func approvalDigest(h GovApprovalHashes) string {
@@ -425,19 +438,24 @@ func (s *SlackIntegrationService) authorizeDecision(ctx context.Context, ic *int
 		return nil, GovBadParam("actions[0].action_id", "An approval request takes approve or reject.")
 	}
 	// The UI route's permission (governance:approve), read now.
-	ok, err := WorkspaceUserHoldsPermission(s.db.WithContext(ctx), ws, ic.user, "governance", "approve")
-	if err != nil {
-		return nil, err
-	}
-	if !ok {
-		return nil, govErr(http.StatusForbidden, "forbidden", slackapp.CopyNotApprover,
-			map[string]any{"required_permissions": []string{"governance:approve"}})
-	}
 	var v models.IGAGovPolicyVersion
-	if err := s.db.WithContext(ctx).Where("workspace_id = ? AND id = ?", ws, ic.n.SubjectID).Take(&v).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, GovNotFound()
+	if err := s.read(ctx, ws, func(db *gorm.DB) error {
+		ok, err := WorkspaceUserHoldsPermission(db, ws, ic.user, "governance", "approve")
+		if err != nil {
+			return err
 		}
+		if !ok {
+			return govErr(http.StatusForbidden, "forbidden", slackapp.CopyNotApprover,
+				map[string]any{"required_permissions": []string{"governance:approve"}})
+		}
+		if err := db.Where("workspace_id = ? AND id = ?", ws, ic.n.SubjectID).Take(&v).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return GovNotFound()
+			}
+			return err
+		}
+		return nil
+	}); err != nil {
 		return nil, err
 	}
 	// Separation of duties (§2.10), as Approve / RejectVia enforce it again
@@ -526,9 +544,13 @@ func (s *SlackIntegrationService) authorizeResponse(ctx context.Context, ic *int
 	default:
 		return nil, GovBadParam("actions[0].action_id", "An owner review takes acknowledge, retain or object.")
 	}
-	svc := NewIGAGovOwnerReviewService(s.db)
-	owner, err := svc.IsOwnerOf(s.db.WithContext(ctx), ws, ic.n.SubjectID, ic.user)
-	if err != nil {
+	svc := NewIGAGovOwnerReviewService(s.handle())
+	var owner bool
+	if err := s.read(ctx, ws, func(db *gorm.DB) error {
+		var err error
+		owner, err = svc.IsOwnerOf(db, ws, ic.n.SubjectID, ic.user)
+		return err
+	}); err != nil {
 		return nil, err
 	}
 	if !owner {
@@ -573,7 +595,7 @@ func (s *SlackIntegrationService) authorizeResponse(ctx context.Context, ic *int
 }
 
 // authorizeHealth checks a Report a problem / It's working click (the
-// reporter's own authorization when it exposes one) and returns the report.
+// reporter's authorization, as for the console route) and returns the report.
 func (s *SlackIntegrationService) authorizeHealth(ctx context.Context, ic *interactionCtx) (slackAction, error) {
 	kind := ""
 	switch ic.act.ActionID {
@@ -595,10 +617,8 @@ func (s *SlackIntegrationService) authorizeHealth(ctx context.Context, ic *inter
 	}
 	r := GovHealthReport{WorkspaceID: ic.n.WorkspaceID, ActorID: ic.user, SubjectKind: ic.n.SubjectKind,
 		SubjectID: ic.n.SubjectID, Kind: kind, Detail: detail, Channel: "slack"}
-	if a, ok := h.(GovHealthAuthorizer); ok {
-		if err := a.AuthorizeHealthReport(ctx, r); err != nil {
-			return nil, err
-		}
+	if err := h.AuthorizeHealthReport(ctx, r); err != nil {
+		return nil, err
 	}
 	return func(ctx context.Context) (*SlackInteractionResult, error) {
 		out, err := h.ReportHealth(ctx, r)
@@ -681,15 +701,9 @@ func (s *SlackIntegrationService) answerOutcome(ctx context.Context, ic *interac
 	s.respondURL(ctx, ic, slackapp.Outcome(title, line))
 }
 
-// slackNoticeLink is the console page a notice is about.
-func slackNoticeLink(n models.IGAGovNotification) string {
-	switch n.SubjectKind {
-	case GovNoticeApprovalRequest:
-		return govConsoleLink("/iga/policy/approvals")
-	case GovNoticeOwnerReview:
-		return govConsoleLink("/iga/policy/reviews/" + n.SubjectID.String())
-	case GovNoticeDeployment, GovNoticeCanaryGate:
-		return govConsoleLink("/iga/policy/deployments")
-	}
+// slackNoticeLink is the console page a notice is about: the Policy area
+// (the approvals, owner reviews and deployments pages were removed from the
+// console with the R1a pages; their paths would open as a policy id).
+func slackNoticeLink(models.IGAGovNotification) string {
 	return govConsoleLink("/iga/policy")
 }

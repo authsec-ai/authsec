@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -11,7 +12,10 @@ import (
 
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/database"
+	"github.com/authsec-ai/authsec/internal/lockout"
+	"github.com/authsec-ai/authsec/internal/logintickets"
 	sharedmodels "github.com/authsec-ai/authsec/internal/sharedmodels"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/monitoring"
 	"github.com/authsec-ai/authsec/services"
@@ -40,12 +44,18 @@ type RegisterInput struct {
 // ForgotPasswordInput represents the input for forgot password
 type ForgotPasswordInput struct {
 	Email string `json:"email" binding:"required,email"`
+	// WorkspaceDomain names the workspace when the email is an admin in more
+	// than one (AS-038). Optional otherwise.
+	WorkspaceDomain string `json:"workspace_domain,omitempty"`
 }
 
 // ResetPasswordInput represents the input for password reset
 type ResetPasswordInput struct {
 	Email       string `json:"email" binding:"required,email"`
 	NewPassword string `json:"new_password" binding:"required,min=6"`
+	// WorkspaceDomain names the workspace when the email is an admin in more
+	// than one (AS-038). Optional otherwise.
+	WorkspaceDomain string `json:"workspace_domain,omitempty"`
 } // NewAdminAuthController creates a new admin auth controller
 func NewAdminAuthController() (*AdminAuthController, error) {
 	db := config.GetDatabase()
@@ -209,31 +219,19 @@ func (aac *AdminAuthController) AdminLogin(c *gin.Context) {
 		return
 	}
 
-	// Check if account is locked (lockout period: 30 minutes)
-	if adminUser.AccountLockedAt != nil {
-		lockoutDuration := 30 * time.Minute
-		if time.Since(*adminUser.AccountLockedAt) < lockoutDuration {
-			remainingTime := lockoutDuration - time.Since(*adminUser.AccountLockedAt)
-			if config.AuditLogger != nil {
-				config.AuditLogger.LogAuthentication(requestID, auditWorkspaceID(adminUser.WorkspaceID), "admin", adminUser.ID.String(), "admin_login", clientIP, userAgent, false, "account locked")
-			}
-			monitoring.RecordAuthFailure("admin", "account_locked", "admin")
-
-			c.JSON(http.StatusUnauthorized, gin.H{
-				"error":   "Account is temporarily locked due to multiple failed login attempts",
-				"message": fmt.Sprintf("Please try again in %d minutes or reset your password", int(remainingTime.Minutes())+1),
-			})
-			return
+	// Account lockout (AS-034): counted in auth_lockouts with an atomic
+	// upsert, keyed by (workspace, email). The users.failed_login_attempts
+	// counter this replaces was never loaded by the lookup, so it never fired.
+	lockWS := uuid.Nil
+	if adminUser.WorkspaceID != nil {
+		lockWS = *adminUser.WorkspaceID
+	}
+	if lockout.Refuse(c, lockWS, lockout.AdminPassword, adminUser.Email) {
+		if config.AuditLogger != nil {
+			config.AuditLogger.LogAuthentication(requestID, auditWorkspaceID(adminUser.WorkspaceID), "admin", adminUser.ID.String(), "admin_login", clientIP, userAgent, false, "account locked")
 		}
-		// Lockout period expired, reset fields
-		if err := aac.adminUserRepo.UpdateAdminUser(adminUser.ID, map[string]interface{}{
-			"failed_login_attempts": 0,
-			"account_locked_at":     nil,
-		}); err != nil {
-			fmt.Printf("Failed to reset lockout fields: %v\n", err)
-		}
-		adminUser.FailedLoginAttempts = 0
-		adminUser.AccountLockedAt = nil
+		monitoring.RecordAuthFailure("admin", "account_locked", "admin")
+		return
 	}
 
 	// Check if password reset is required
@@ -252,61 +250,17 @@ func (aac *AdminAuthController) AdminLogin(c *gin.Context) {
 
 	// Verify password
 	if !adminUser.CheckPassword(input.Password) {
-		// Increment failed login attempts
-		adminUser.FailedLoginAttempts++
-
-		updates := map[string]interface{}{
-			"failed_login_attempts": adminUser.FailedLoginAttempts,
-		}
-
-		// Lock account after 3 failed attempts and require password reset
-		if adminUser.FailedLoginAttempts >= 3 {
-			now := time.Now()
-			updates["account_locked_at"] = now
-			updates["password_reset_required"] = true
-			if err := aac.adminUserRepo.UpdateAdminUser(adminUser.ID, updates); err != nil {
-				fmt.Printf("Failed to lock account: %v\n", err)
-			}
-
-			if config.AuditLogger != nil {
-				config.AuditLogger.LogAuthentication(requestID, auditWorkspaceID(adminUser.WorkspaceID), "admin", adminUser.ID.String(), "admin_login", clientIP, userAgent, false, "account locked after 3 failed attempts")
-			}
-			monitoring.RecordAuthFailure("admin", "account_locked", "admin")
-
-			c.JSON(http.StatusUnauthorized, gin.H{
-				"error":   "Account locked due to multiple failed login attempts",
-				"message": "Your account has been locked for security. Please reset your password to unlock.",
-			})
-			return
-		}
-
-		if err := aac.adminUserRepo.UpdateAdminUser(adminUser.ID, updates); err != nil {
-			fmt.Printf("Failed to update failed attempts: %v\n", err)
-		}
-
-		// Audit: Failed login - invalid password
 		if config.AuditLogger != nil {
 			config.AuditLogger.LogAuthentication(requestID, auditWorkspaceID(adminUser.WorkspaceID), "admin", adminUser.ID.String(), "admin_login", clientIP, userAgent, false, "invalid password")
 		}
 		monitoring.RecordAuthFailure("admin", "invalid_password", "admin")
-
-		remainingAttempts := 3 - adminUser.FailedLoginAttempts
-		c.JSON(http.StatusUnauthorized, gin.H{
-			"error":   "Invalid credentials",
-			"message": fmt.Sprintf("Invalid password. %d attempt(s) remaining before account lockout.", remainingAttempts),
-		})
+		if lockout.RecordFailure(c, lockWS, lockout.AdminPassword, adminUser.Email) {
+			return
+		}
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 		return
 	}
-
-	// Successful login - reset failed attempts
-	if adminUser.FailedLoginAttempts > 0 {
-		if err := aac.adminUserRepo.UpdateAdminUser(adminUser.ID, map[string]interface{}{
-			"failed_login_attempts": 0,
-			"account_locked_at":     nil,
-		}); err != nil {
-			fmt.Printf("Failed to reset failed attempts: %v\n", err)
-		}
-	}
+	lockout.RecordSuccess(c, lockWS, lockout.AdminPassword, adminUser.Email)
 
 	// Update last login
 	if err := aac.adminUserRepo.UpdateLastLogin(adminUser.ID); err != nil {
@@ -441,6 +395,20 @@ func (aac *AdminAuthController) AdminLogin(c *gin.Context) {
 			return
 		}
 		response["token"] = token
+	} else {
+		// The MFA step and the session callback require proof that this
+		// password check happened.
+		if adminUser.WorkspaceID == nil {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
+			return
+		}
+		ticket, err := logintickets.Issue(config.GetDatabase().DB, logintickets.RealmAdmin, *adminUser.WorkspaceID, adminUser.ID, adminUser.Email, "password")
+		if err != nil {
+			log.Printf("AdminLogin: failed to issue login ticket: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start sign-in"})
+			return
+		}
+		response[logintickets.ResponseField] = ticket
 	}
 
 	// Include temporary password status if applicable
@@ -509,6 +477,7 @@ func (aac *AdminAuthController) AdminRegister(c *gin.Context) {
 	workspaceDomain := fmt.Sprintf("%s.%s", strings.ToLower(input.WorkspaceDomain), config.AppConfig.WorkspaceDomainSuffix)
 	db := config.GetDatabase()
 	var count int
+	// TENANT-EXEMPT: pre-auth sign-up; workspace_domain is unique across the tenant registry.
 	err = db.QueryRow("SELECT COUNT(*) FROM workspaces WHERE workspace_domain = $1", workspaceDomain).Scan(&count)
 	if err != nil {
 		log.Printf("Failed to check tenant domain existence: %v", err)
@@ -518,20 +487,6 @@ func (aac *AdminAuthController) AdminRegister(c *gin.Context) {
 	if count > 0 {
 		c.JSON(http.StatusConflict, gin.H{"error": "Tenant domain already exists"})
 		return
-	}
-
-	// Single-tenant guard: authsec runs as a single-workspace deployment.
-	// Only one admin/tenant is permitted; reject any subsequent registration.
-	// Exclude the system workspace (00000000-...) which is seeded at bootstrap.
-	{
-		db := config.GetDatabase()
-		var tenantCount int
-		if err := db.QueryRow("SELECT COUNT(*) FROM workspaces WHERE status = 'active' AND id != '00000000-0000-0000-0000-000000000000'").Scan(&tenantCount); err == nil && tenantCount > 0 {
-			c.JSON(http.StatusConflict, gin.H{
-				"error": "Single-tenant deployment: only one admin is allowed.",
-			})
-			return
-		}
 	}
 
 	// Check if pending registration already exists
@@ -546,7 +501,7 @@ func (aac *AdminAuthController) AdminRegister(c *gin.Context) {
 		}
 
 		// Delete existing OTPs
-		if err := aac.otpRepo.DeleteOTPsByEmail(input.Email); err != nil {
+		if err := aac.otpRepo.DeleteOTPsByEmail(database.OTPScope{Purpose: database.OTPPurposeWorkspaceSignup}, input.Email); err != nil {
 			log.Printf("Warning - failed to delete old OTPs: %v", err)
 		}
 
@@ -554,6 +509,7 @@ func (aac *AdminAuthController) AdminRegister(c *gin.Context) {
 		otpEntry := models.OTPEntry{
 			Email:     input.Email,
 			OTP:       otp,
+			Purpose:   database.OTPPurposeWorkspaceSignup,
 			ExpiresAt: time.Now().Add(30 * time.Minute),
 			Verified:  false,
 		}
@@ -574,7 +530,6 @@ func (aac *AdminAuthController) AdminRegister(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"message": "OTP regenerated and sent to your email",
 			"email":   input.Email,
-			"otp":     otp, // Include OTP in response for testing (remove in production)
 		})
 		return
 	}
@@ -587,8 +542,9 @@ func (aac *AdminAuthController) AdminRegister(c *gin.Context) {
 		return
 	}
 
-	// Generate UUIDs for admin user
-	adminUUID := uuid.New()
+	// The new workspace's id. The first admin gets an id of their own when
+	// the registration completes (AS-083).
+	newWorkspaceID := uuid.New()
 
 	// Create pending registration.
 	// ProjectID is generated up-front and persisted on pending_registrations so
@@ -600,9 +556,9 @@ func (aac *AdminAuthController) AdminRegister(c *gin.Context) {
 	pendingReg := &models.PendingRegistration{
 		Email:           input.Email,
 		PasswordHash:    hashedPassword,
-		WorkspaceID:     adminUUID,
+		WorkspaceID:     newWorkspaceID,
 		ProjectID:       uuid.New(),
-		ClientID:        adminUUID, // Same as tenant for admin
+		ClientID:        newWorkspaceID, // Same as tenant for admin
 		WorkspaceDomain: workspaceDomain,
 		ExpiresAt:       time.Now().Add(24 * time.Hour), // 24 hours for admin registration
 	}
@@ -625,6 +581,7 @@ func (aac *AdminAuthController) AdminRegister(c *gin.Context) {
 	otpEntry := models.OTPEntry{
 		Email:     input.Email,
 		OTP:       otp,
+		Purpose:   database.OTPPurposeWorkspaceSignup,
 		ExpiresAt: time.Now().Add(30 * time.Minute),
 		Verified:  false,
 	}
@@ -645,7 +602,6 @@ func (aac *AdminAuthController) AdminRegister(c *gin.Context) {
 	c.JSON(http.StatusCreated, gin.H{
 		"message": "Admin registration initiated. Please check your email for OTP to complete registration.",
 		"email":   input.Email,
-		"otp":     otp, // Include OTP in response for testing purposes (remove in production)
 	})
 }
 
@@ -674,11 +630,13 @@ func (aac *AdminAuthController) AdminForgotPassword(c *gin.Context) {
 		time.Sleep(time.Until(start.Add(1 * time.Second)))
 	}()
 
-	// ✅ Check if admin user exists
-	adminUser, err := aac.adminUserRepo.GetAdminUserByEmail(input.Email)
+	// Check if admin user exists. An email that is an admin in several
+	// workspaces resolves only with a workspace domain (AS-038); the generic
+	// answer below does not reveal which case applied.
+	adminUser, err := aac.adminUserRepo.ResolveAdminForPasswordReset(input.Email, input.WorkspaceDomain)
 	if err != nil {
 		// Differentiate between "not found" vs real DB error
-		if errors.Is(err, sql.ErrNoRows) {
+		if errors.Is(err, sql.ErrNoRows) || errors.Is(err, database.ErrAmbiguousAdminEmail) {
 			// Don't reveal user existence
 			c.JSON(http.StatusOK, gin.H{"message": "If the email exists, a reset code has been sent"})
 			return
@@ -704,7 +662,7 @@ func (aac *AdminAuthController) AdminForgotPassword(c *gin.Context) {
 	}
 
 	// ✅ Delete existing OTPs
-	if err := aac.otpRepo.DeleteOTPsByEmail(input.Email); err != nil {
+	if err := aac.otpRepo.DeleteOTPsByEmail(database.OTPScope{Purpose: database.OTPPurposeAdminPasswordReset}, input.Email); err != nil {
 		log.Printf("AdminForgotPassword: failed to delete existing OTPs for %s: %v", input.Email, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Internal server error"})
 		return
@@ -714,6 +672,7 @@ func (aac *AdminAuthController) AdminForgotPassword(c *gin.Context) {
 	otpEntry := models.OTPEntry{
 		Email:     input.Email,
 		OTP:       otp,
+		Purpose:   database.OTPPurposeAdminPasswordReset,
 		ExpiresAt: time.Now().Add(30 * time.Minute),
 		Verified:  false,
 	}
@@ -757,7 +716,7 @@ func (aac *AdminAuthController) AdminVerifyOTP(c *gin.Context) {
 
 	input.Email = strings.ToLower(input.Email)
 
-	otpEntry, err := aac.otpRepo.GetValidOTP(input.Email, input.OTP)
+	otpEntry, err := aac.otpRepo.GetValidOTP(database.OTPScope{Purpose: database.OTPPurposeAdminPasswordReset}, input.Email, input.OTP)
 	if err != nil {
 		log.Printf("AdminVerifyOTP: OTP validation failed for %s: %v", input.Email, err)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired OTP"})
@@ -795,15 +754,20 @@ func (aac *AdminAuthController) AdminResetPassword(c *gin.Context) {
 	input.Email = strings.ToLower(input.Email)
 
 	// Check if there's a verified OTP for this email
-	_, err := aac.otpRepo.GetVerifiedOTP(input.Email)
+	_, err := aac.otpRepo.GetVerifiedOTP(database.OTPScope{Purpose: database.OTPPurposeAdminPasswordReset}, input.Email)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "No verified reset code found. Please request a new password reset"})
 		return
 	}
 
-	// Get admin user
-	adminUser, err := aac.adminUserRepo.GetAdminUserByEmail(input.Email)
+	// Get the one admin account this reset applies to. The first admin with
+	// this email in any workspace used to be rewritten (AS-038).
+	adminUser, err := aac.adminUserRepo.ResolveAdminForPasswordReset(input.Email, input.WorkspaceDomain)
 	if err != nil {
+		if errors.Is(err, database.ErrAmbiguousAdminEmail) {
+			c.JSON(http.StatusConflict, gin.H{"error": "This email is an admin in more than one workspace; include workspace_domain"})
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Admin user not found"})
 		return
 	}
@@ -832,7 +796,7 @@ func (aac *AdminAuthController) AdminResetPassword(c *gin.Context) {
 	}
 
 	// Clean up the used OTP
-	aac.otpRepo.DeleteOTPsByEmail(input.Email)
+	aac.otpRepo.DeleteOTPsByEmail(database.OTPScope{Purpose: database.OTPPurposeAdminPasswordReset}, input.Email)
 
 	c.JSON(http.StatusOK, gin.H{"message": "Password reset successfully"})
 }
@@ -858,7 +822,7 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 
 	input.Email = strings.ToLower(input.Email)
 
-	otpEntry, err := aac.otpRepo.GetValidOTP(input.Email, input.OTP)
+	otpEntry, err := aac.otpRepo.GetValidOTP(database.OTPScope{Purpose: database.OTPPurposeWorkspaceSignup}, input.Email, input.OTP)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired OTP"})
 		return
@@ -899,16 +863,30 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 	if workspaceName == "" {
 		workspaceName = pendingReg.Email
 	}
-	if _, err := tx.Exec(`
+	// Admin registration only ever creates a NEW workspace; a pending row
+	// naming an existing one (e.g. from end-user /user/register/initiate)
+	// must not make its email that workspace's owner.
+	// TENANT-EXEMPT: sign-up creates the tenant registry row (workspaces has no workspace_id).
+	wsRes, err := tx.Exec(`
 		INSERT INTO workspaces (id, name, slug, owner_user_id, workspace_type, workspace_domain, email, password_hash, provider, source, status, vault_mount, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, 'personal', $5, $6, $7, 'local', 'admin_registration', 'active', NULL, NOW(), NOW())
 		ON CONFLICT (id) DO NOTHING
-	`, pendingReg.WorkspaceID, workspaceName, workspaceSlug, pendingReg.WorkspaceID, pendingReg.WorkspaceDomain, pendingReg.Email, pendingReg.PasswordHash); err != nil {
+	`, pendingReg.WorkspaceID, workspaceName, workspaceSlug, pendingReg.WorkspaceID, pendingReg.WorkspaceDomain, pendingReg.Email, pendingReg.PasswordHash)
+	if err != nil {
 		tx.Rollback()
 		log.Printf("Failed to create workspace: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create workspace"})
 		return
 	}
+	if n, err := wsRes.RowsAffected(); err != nil || n != 1 {
+		tx.Rollback()
+		log.Printf("Admin registration refused: workspace %s already exists", pendingReg.WorkspaceID)
+		c.JSON(http.StatusConflict, gin.H{"error": "Registration session is not valid for a new workspace. Please initiate registration again"})
+		return
+	}
+	// The workspace this sign-up just created, from the OTP-verified pending
+	// registration: the rest of its rows are written on the scoped layer.
+	wctx := database.WithWorkspace(c.Request.Context(), pendingReg.WorkspaceID)
 
 	// Auto-verify the workspace's OWN subdomain as a verified workspace_domains
 	// row, but ONLY when it falls under the deployment's configured base domain
@@ -919,16 +897,27 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 	// verification. Per-subdomain RP-ID isolation is preserved.
 	if suffix := config.AppConfig.WorkspaceDomainSuffix; suffix != "" &&
 		(pendingReg.WorkspaceDomain == suffix || strings.HasSuffix(pendingReg.WorkspaceDomain, "."+suffix)) {
-		if _, derr := tx.Exec(`
+		// The upsert only ever touches this workspace's row: a domain that is
+		// already another workspace's must not be verified or made primary
+		// for it, so the registration is refused instead.
+		res, derr := tenancy.ExecContext(wctx, tx, `
 			INSERT INTO workspace_domains
 			  (workspace_id, domain, kind, is_primary, is_verified, verification_token, verification_method, verification_txt_name, verification_txt_value, verified_at, created_at, updated_at)
 			VALUES ($1, $2, 'system', true, true, 'single-node-bootstrap', 'bootstrap', $3, 'single-node-bootstrap', NOW(), NOW(), NOW())
 			ON CONFLICT (domain) DO UPDATE SET is_verified = true, is_primary = true,
 			  verified_at = COALESCE(workspace_domains.verified_at, NOW()), updated_at = NOW()
-		`, pendingReg.WorkspaceID, pendingReg.WorkspaceDomain, "_authsec-domain."+pendingReg.WorkspaceDomain); derr != nil {
+			  WHERE workspace_domains.workspace_id = $1
+		`, pendingReg.WorkspaceDomain, "_authsec-domain."+pendingReg.WorkspaceDomain)
+		if derr != nil {
 			tx.Rollback()
 			log.Printf("Failed to auto-verify workspace domain %s: %v", pendingReg.WorkspaceDomain, derr)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify workspace domain"})
+			return
+		}
+		if n, err := res.RowsAffected(); err != nil || n != 1 {
+			tx.Rollback()
+			log.Printf("Admin registration refused: domain %s belongs to another workspace", pendingReg.WorkspaceDomain)
+			c.JSON(http.StatusConflict, gin.H{"error": "Workspace domain already exists"})
 			return
 		}
 	}
@@ -941,7 +930,8 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 	username := pendingReg.Email
 	adminUser := models.ExtendedUser{
 		User: sharedmodels.User{
-			ID:              pendingReg.WorkspaceID, // Use tenant ID as user ID for admin
+			// No ID: CreateUserTx gives the admin a fresh id, independent of
+			// the workspace's (AS-083).
 			Email:           pendingReg.Email,
 			Name:            fmt.Sprintf("%s %s", pendingReg.FirstName, pendingReg.LastName),
 			PasswordHash:    pendingReg.PasswordHash,
@@ -956,7 +946,7 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 		},
 	}
 
-	if err := userRepo.CreateUserTx(tx, &adminUser); err != nil {
+	if err := userRepo.CreateUserTx(database.WithWorkspace(c.Request.Context(), pendingReg.WorkspaceID), tx, &adminUser); err != nil {
 		tx.Rollback()
 		log.Printf("Failed to create admin user: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create admin user"})
@@ -967,7 +957,7 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 	// is now resolved directly via clients.workspace_id.
 
 	// Assign admin role BEFORE committing transaction (workspace-scoped)
-	roleID, err := database.NewAdminSeedRepository(config.GetDatabase()).EnsureAdminRoleAndPermissionsTx(tx, pendingReg.WorkspaceID)
+	roleID, err := database.NewAdminSeedRepository(config.GetDatabase()).EnsureAdminRoleAndPermissionsTx(database.WithWorkspace(c.Request.Context(), pendingReg.WorkspaceID), tx)
 	if err != nil {
 		tx.Rollback()
 		log.Printf("Failed to ensure admin role/permissions: %v", err)
@@ -976,16 +966,15 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 	}
 
 	// Insert into role_bindings within transaction (user_roles is deprecated)
-	// scope_type and scope_id are NULL for workspace-wide role assignments
-	bindingID := uuid.New()
-	_, err = tx.Exec(`
+	// scope_type and scope_id are NULL for workspace-wide role assignments.
+	// The user was created in this transaction, so it has no binding yet; the
+	// role must be the new workspace's.
+	_, err = tenancy.ExecContext(wctx, tx, `
 		INSERT INTO role_bindings (id, workspace_id, user_id, role_id, scope_type, scope_id, created_at, updated_at)
-		SELECT $1, $2, $3, $4, NULL, NULL, $5, $5
-		WHERE NOT EXISTS (
-			SELECT 1 FROM role_bindings
-			WHERE workspace_id = $2 AND user_id = $3 AND role_id = $4 AND scope_type IS NULL AND scope_id IS NULL
-		)
-	`, bindingID, pendingReg.WorkspaceID, adminUser.ID, roleID, time.Now())
+		SELECT $2::uuid, r.workspace_id, $3::uuid, r.id, NULL, NULL, NOW(), NOW()
+		  FROM roles r
+		 WHERE r.workspace_id = $1 AND r.id = $4
+	`, uuid.New(), adminUser.ID, roleID)
 	if err != nil {
 		tx.Rollback()
 		log.Printf("Failed to assign admin role: %v", err)
@@ -994,6 +983,7 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 	}
 
 	// Patch workspace owner_user_id now that the admin user row exists.
+	// TENANT-EXEMPT: the tenant registry row this sign-up created (workspaces has no workspace_id).
 	if _, err := tx.Exec(`UPDATE workspaces SET owner_user_id = $1 WHERE id = $2`, adminUser.ID, pendingReg.WorkspaceID); err != nil {
 		tx.Rollback()
 		log.Printf("Failed to update workspace owner: %v", err)
@@ -1002,11 +992,13 @@ func (aac *AdminAuthController) AdminCompleteRegistration(c *gin.Context) {
 	}
 
 	// Bind the admin user to the workspace with the admin role.
-	if _, err := tx.Exec(`
+	if _, err := tenancy.ExecContext(wctx, tx, `
 		INSERT INTO workspace_memberships (id, workspace_id, user_id, role_id, status, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, 'active', NOW(), NOW())
+		SELECT $2::uuid, r.workspace_id, $3::uuid, r.id, 'active', NOW(), NOW()
+		  FROM roles r
+		 WHERE r.workspace_id = $1 AND r.id = $4
 		ON CONFLICT (workspace_id, user_id) DO NOTHING
-	`, uuid.New(), pendingReg.WorkspaceID, adminUser.ID, roleID); err != nil {
+	`, uuid.New(), adminUser.ID, roleID); err != nil {
 		tx.Rollback()
 		log.Printf("Failed to create workspace_membership: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create workspace membership"})
@@ -1062,7 +1054,7 @@ func (aac *AdminAuthController) generateAdminJWTToken(adminUser *models.AdminUse
 	var roles []string
 	if adminUser.WorkspaceID != nil && *adminUser.WorkspaceID != uuid.Nil {
 		// Get roles for this admin user in their tenant
-		rolesFromDB, err := aac.adminUserRepo.GetAdminRoles(adminUser.ID, *adminUser.WorkspaceID)
+		rolesFromDB, err := aac.adminUserRepo.GetAdminRoles(database.WithWorkspace(context.Background(), *adminUser.WorkspaceID), adminUser.ID)
 		if err == nil {
 			roles = rolesFromDB
 		} else {
@@ -1258,6 +1250,7 @@ func (aac *AdminAuthController) AdminBootstrap(c *gin.Context) {
 	// Phase 6: tenants table deleted, workspaces.workspace_domain is the new home.
 	db := config.GetDatabase()
 	var count int
+	// TENANT-EXEMPT: pre-auth bootstrap; workspace_domain is unique across the tenant registry.
 	err = db.QueryRow("SELECT COUNT(*) FROM workspaces WHERE workspace_domain = $1", workspaceDomain).Scan(&count)
 	if err != nil {
 		log.Printf("ERROR: Failed to check workspace domain: %v", err)
@@ -1332,7 +1325,7 @@ func (aac *AdminAuthController) AdminBootstrap(c *gin.Context) {
 	}
 
 	// Delete old OTPs for this email
-	if err := aac.otpRepo.DeleteOTPsByEmail(input.Email); err != nil {
+	if err := aac.otpRepo.DeleteOTPsByEmail(database.OTPScope{Purpose: database.OTPPurposeWorkspaceSignup}, input.Email); err != nil {
 		log.Printf("WARN: Failed to delete old OTPs: %v", err)
 	}
 
@@ -1340,6 +1333,7 @@ func (aac *AdminAuthController) AdminBootstrap(c *gin.Context) {
 	otpEntry := models.OTPEntry{
 		Email:     input.Email,
 		OTP:       otp,
+		Purpose:   database.OTPPurposeWorkspaceSignup,
 		ExpiresAt: time.Now().Add(30 * time.Minute),
 		Verified:  false,
 	}
@@ -1362,7 +1356,7 @@ func (aac *AdminAuthController) AdminBootstrap(c *gin.Context) {
 		}
 	}(input.Email, otp)
 
-	log.Printf("INFO: Bootstrap initiated for: %s, tenant: %s, OTP: %s", input.Email, workspaceDomain, otp)
+	log.Printf("INFO: Bootstrap initiated for: %s, tenant: %s", input.Email, workspaceDomain)
 
 	c.JSON(http.StatusCreated, models.AdminBootstrapResponse{
 		Message:         "Bootstrap initiated. Please check your email for OTP to complete registration.",
@@ -1431,13 +1425,14 @@ func (aac *AdminAuthController) AdminResendOTP(c *gin.Context) {
 	}
 
 	// Replace any prior OTP for this email — only the latest is valid.
-	if delErr := aac.otpRepo.DeleteOTPsByEmail(email); delErr != nil {
+	if delErr := aac.otpRepo.DeleteOTPsByEmail(database.OTPScope{Purpose: database.OTPPurposeWorkspaceSignup}, email); delErr != nil {
 		log.Printf("WARN: AdminResendOTP failed to delete old OTPs for %s: %v", email, delErr)
 	}
 
 	otpEntry := models.OTPEntry{
 		Email:     email,
 		OTP:       otp,
+		Purpose:   database.OTPPurposeWorkspaceSignup,
 		ExpiresAt: time.Now().Add(30 * time.Minute),
 		Verified:  false,
 	}

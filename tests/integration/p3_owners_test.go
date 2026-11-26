@@ -310,12 +310,12 @@ func p3NewOwnersAPI(t *testing.T, db *gorm.DB) *p3OwnersAPI {
 	t.Setenv("AUTH_EXPECT_ISS", "authsec-ai/auth-manager")
 	t.Setenv("REQUIRE_SERVER_AUTH", "true")
 	graphOn := p3GraphOn(t, db)
-	gate := services.NewPolicyGate(true, "", graphOn)
+	gate := services.NewPolicyGate(true, graphOn)
 	if err := gate.Verify(db); err != nil {
 		t.Fatal(err)
 	}
 	eng := gin.New()
-	ctl := platform.NewIGAGraphReadControllerWith(db, services.NewGraphProjectionGate(false, ""), readTestCursorKey).WithPolicyGate(gate)
+	ctl := platform.NewIGAGraphReadControllerWith(db, services.NewGraphProjectionGate(false), readTestCursorKey).WithPolicyGate(gate)
 	routes.SetupIGARoutes(eng, platform.NewIGAController(db), ctl)
 	return &p3OwnersAPI{t: t, eng: eng}
 }

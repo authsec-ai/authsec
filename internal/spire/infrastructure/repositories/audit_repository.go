@@ -6,164 +6,88 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/authsec-ai/authsec/internal/spire/domain/models"
 	"github.com/authsec-ai/authsec/internal/spire/domain/repositories"
 	"github.com/authsec-ai/authsec/internal/spire/errors"
-
-	"github.com/google/uuid"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 )
 
-// PostgresAuditRepository implements the AuditRepository interface
+// PostgresAuditRepository stores the attest / renew / revoke audit trail
+// (spire_icp_audit_logs, append-only) of the workspace carried by ctx.
 type PostgresAuditRepository struct {
 	db *sql.DB
 }
 
-// NewPostgresAuditRepository creates a new audit repository
+// NewPostgresAuditRepository creates the audit repository.
 func NewPostgresAuditRepository(db *sql.DB) repositories.AuditRepository {
 	return &PostgresAuditRepository{db: db}
 }
 
-// Create creates a new audit log entry
+// Create appends an audit record for ctx's workspace.
 func (r *PostgresAuditRepository) Create(ctx context.Context, log *models.AuditLog) error {
-	query := `
-		INSERT INTO audit_icp_logs (id, workspace_id, event_type, workload_id, certificate_id, spiffe_id,
-			success, error_message, metadata, ip_address, user_agent, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-	`
-
-	if log.ID == "" {
-		log.ID = uuid.New().String()
+	ws, err := workspaceOf(ctx)
+	if err != nil {
+		return err
 	}
+	if log.ID == "" {
+		log.ID = uuid.NewString()
+	}
+	log.WorkspaceID = ws.String()
 	log.CreatedAt = time.Now()
-
-	// Convert metadata to JSON
-	metadataJSON, err := json.Marshal(log.Metadata)
+	metadata, err := json.Marshal(log.Metadata)
 	if err != nil {
 		return errors.NewInternalError("Failed to marshal metadata", err)
 	}
-
-	_, err = r.db.ExecContext(ctx, query,
-		log.ID,
-		log.WorkspaceID,
-		log.EventType,
-		log.WorkloadID,
-		log.CertificateID,
-		log.SpiffeID,
-		log.Success,
-		log.ErrorMessage,
-		metadataJSON,
-		log.IPAddress,
-		log.UserAgent,
-		log.CreatedAt,
-	)
-
+	_, err = tenancy.InsertContext(ctx, r.db, `
+		INSERT INTO spire_icp_audit_logs (
+			workspace_id, id, event_type, workload_id, certificate_id, spiffe_id, success,
+			error_message, metadata, ip_address, user_agent, created_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+		log.ID, string(log.EventType), nullString(log.WorkloadID), nullString(log.CertificateID),
+		nullString(log.SpiffeID), log.Success, nullString(log.ErrorMessage), metadata,
+		nullString(log.IPAddress), nullString(log.UserAgent), log.CreatedAt)
 	if err != nil {
 		return errors.NewInternalError("Failed to create audit log", err)
 	}
-
 	return nil
 }
 
-// List retrieves audit logs for a tenant
-func (r *PostgresAuditRepository) List(ctx context.Context, workspaceID string, limit, offset int) ([]*models.AuditLog, error) {
-	query := `
-		SELECT id, workspace_id, event_type, workload_id, certificate_id, spiffe_id,
-			success, error_message, metadata, ip_address, user_agent, created_at
-		FROM audit_icp_logs
-		WHERE workspace_id = $1
-		ORDER BY created_at DESC
-		LIMIT $2 OFFSET $3
-	`
-
-	return r.queryAuditLogs(ctx, query, workspaceID, limit, offset)
-}
-
-// ListByWorkload retrieves audit logs for a specific workload
-func (r *PostgresAuditRepository) ListByWorkload(ctx context.Context, workspaceID, workloadID string, limit, offset int) ([]*models.AuditLog, error) {
-	query := `
-		SELECT id, workspace_id, event_type, workload_id, certificate_id, spiffe_id,
-			success, error_message, metadata, ip_address, user_agent, created_at
-		FROM audit_icp_logs
-		WHERE workspace_id = $1 AND workload_id = $2
-		ORDER BY created_at DESC
-		LIMIT $3 OFFSET $4
-	`
-
-	return r.queryAuditLogs(ctx, query, workspaceID, workloadID, limit, offset)
-}
-
-// ListByEventType retrieves audit logs by event type
-func (r *PostgresAuditRepository) ListByEventType(ctx context.Context, workspaceID string, eventType models.AuditEventType, limit, offset int) ([]*models.AuditLog, error) {
-	query := `
-		SELECT id, workspace_id, event_type, workload_id, certificate_id, spiffe_id,
-			success, error_message, metadata, ip_address, user_agent, created_at
-		FROM audit_icp_logs
-		WHERE workspace_id = $1 AND event_type = $2
-		ORDER BY created_at DESC
-		LIMIT $3 OFFSET $4
-	`
-
-	return r.queryAuditLogs(ctx, query, workspaceID, eventType, limit, offset)
-}
-
-// ListByDateRange retrieves audit logs within a date range
-func (r *PostgresAuditRepository) ListByDateRange(ctx context.Context, workspaceID string, from, to time.Time, limit, offset int) ([]*models.AuditLog, error) {
-	query := `
-		SELECT id, workspace_id, event_type, workload_id, certificate_id, spiffe_id,
-			success, error_message, metadata, ip_address, user_agent, created_at
-		FROM audit_icp_logs
-		WHERE workspace_id = $1 AND created_at BETWEEN $2 AND $3
-		ORDER BY created_at DESC
-		LIMIT $4 OFFSET $5
-	`
-
-	return r.queryAuditLogs(ctx, query, workspaceID, from, to, limit, offset)
-}
-
-// queryAuditLogs is a helper function to execute audit log queries
-func (r *PostgresAuditRepository) queryAuditLogs(ctx context.Context, query string, args ...interface{}) ([]*models.AuditLog, error) {
-	rows, err := r.db.QueryContext(ctx, query, args...)
+// List returns ctx's workspace's audit records, newest first.
+func (r *PostgresAuditRepository) List(ctx context.Context, limit, offset int) ([]*models.AuditLog, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	rows, err := tenancy.QueryContext(ctx, r.db, `
+		SELECT id::text, workspace_id::text, event_type, COALESCE(workload_id, ''), COALESCE(certificate_id, ''),
+		       COALESCE(spiffe_id, ''), success, COALESCE(error_message, ''), metadata,
+		       COALESCE(ip_address, ''), COALESCE(user_agent, ''), created_at
+		  FROM spire_icp_audit_logs
+		 WHERE workspace_id = $1
+		 ORDER BY created_at DESC
+		 LIMIT $2 OFFSET $3`, limit, offset)
 	if err != nil {
 		return nil, errors.NewInternalError("Failed to query audit logs", err)
 	}
 	defer rows.Close()
-
 	var logs []*models.AuditLog
 	for rows.Next() {
-		log := &models.AuditLog{}
-		var metadataJSON []byte
-
-		err := rows.Scan(
-			&log.ID,
-			&log.WorkspaceID,
-			&log.EventType,
-			&log.WorkloadID,
-			&log.CertificateID,
-			&log.SpiffeID,
-			&log.Success,
-			&log.ErrorMessage,
-			&metadataJSON,
-			&log.IPAddress,
-			&log.UserAgent,
-			&log.CreatedAt,
-		)
-		if err != nil {
+		l := &models.AuditLog{}
+		var eventType string
+		var metadata []byte
+		if err := rows.Scan(&l.ID, &l.WorkspaceID, &eventType, &l.WorkloadID, &l.CertificateID, &l.SpiffeID,
+			&l.Success, &l.ErrorMessage, &metadata, &l.IPAddress, &l.UserAgent, &l.CreatedAt); err != nil {
 			return nil, errors.NewInternalError("Failed to scan audit log", err)
 		}
-
-		// Unmarshal metadata
-		if len(metadataJSON) > 0 {
-			if err := json.Unmarshal(metadataJSON, &log.Metadata); err != nil {
-				return nil, errors.NewInternalError("Failed to unmarshal metadata", err)
-			}
+		l.EventType = models.AuditEventType(eventType)
+		if len(metadata) > 0 {
+			_ = json.Unmarshal(metadata, &l.Metadata)
 		}
-
-		logs = append(logs, log)
+		logs = append(logs, l)
 	}
-
-	if err = rows.Err(); err != nil {
-		return nil, errors.NewInternalError("Error iterating audit logs", err)
-	}
-
-	return logs, nil
+	return logs, rows.Err()
 }

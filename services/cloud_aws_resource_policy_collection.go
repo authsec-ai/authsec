@@ -21,7 +21,7 @@ import (
 // Resource-policy collection (SPEC-iga-phase3-policy.md §3.9, T3.03b): the
 // per-scan, immutable evidence the first-attachment proof and the route
 // analysis (§3.4) read. It runs inside the existing scan, under the pipeline
-// barrier, when the IGA_POLICY gate is available (AWSScanWorker.execute), and
+// barrier, when the policy gate is available (AWSScanWorker.execute), and
 // writes 056: per (form, region) one cloud_resource_policy_coverage row, per
 // resource read one cloud_resource_policy_observation (including "no
 // policy"), and each document once in cloud_policy_document under the

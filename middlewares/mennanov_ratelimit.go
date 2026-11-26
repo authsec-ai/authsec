@@ -127,7 +127,35 @@ var (
 		Window:   time.Minute,
 		Endpoint: "admin",
 	}
+
+	// Event ingest (EventBridge API destinations): EventBridge delivers from
+	// shared AWS addresses, one event per request, so the general per-IP
+	// budget would throttle a busy account. The ingest has its own
+	// per-connector limit after the secret check; this per-IP ceiling only
+	// bounds unauthenticated traffic.
+	IngestRateLimit = RateLimitConfig{
+		Limit:    6000,
+		Window:   time.Minute,
+		Endpoint: "ingest",
+	}
 )
+
+// ingestRateLimitPaths are the event-ingest endpoints, relative to /authsec.
+var ingestRateLimitPaths = []string{"/ingest/aws/events", "/ingest/otlp/v1/traces"}
+
+// pdpRateLimitPrefix is the agent gateway PDP (SPEC-agent-runtime-gateway.md
+// §10): gateways behind one NAT would share the general per-IP budget, and
+// a busy gateway asks once per uncached tool or model call, so it has its
+// own per-IP ceiling (PDPRateLimit); each gateway also has its own limit
+// after its credential is checked (AGENT_GATEWAY_PDP_RPS).
+const pdpRateLimitPrefix = "/pdp/"
+
+// PDPRateLimit bounds unauthenticated traffic to the PDP per client IP.
+var PDPRateLimit = RateLimitConfig{
+	Limit:    60000,
+	Window:   time.Minute,
+	Endpoint: "pdp",
+}
 
 // MennovRateLimitMiddleware creates rate limiting middleware using in-memory sliding window
 func MennovRateLimitMiddleware() gin.HandlerFunc {
@@ -181,36 +209,60 @@ func MennovRateLimitMiddleware() gin.HandlerFunc {
 	}
 }
 
-// selectRateLimitConfig determines which rate limit to apply based on path
-func selectRateLimitConfig(path string) RateLimitConfig {
-	// Authentication endpoints (login, register, forgot password, reset password, OTP)
-	authPaths := []string{
-		"/uflow/auth/enduser/login",
-		"/uflow/auth/enduser/register",
-		"/uflow/auth/enduser/forgot-password",
-		"/uflow/auth/enduser/reset-password",
-		"/uflow/auth/enduser/verify-otp",
-		"/uflow/auth/enduser/resend-otp",
-		"/uflow/auth/admin/login",
-		"/uflow/auth/admin/forgot-password",
-		"/uflow/auth/admin/reset-password",
-		"/uflow/auth/oidc/",
-		"/uflow/auth/saml/",
-		"/uflow/auth/webauthn/",
-		"/uflow/auth/totp/",
-		"/uflow/auth/device/",
-		"/uflow/auth/ciba/",
-		"/api/v1/auth/",
-	}
+// authRateLimitPrefixes are the credential-checking endpoints (sign-in,
+// registration, password reset, OTP, TOTP/CIBA/device sign-in), relative to
+// the /authsec mount point. They share the strict "auth" budget per client IP.
+var authRateLimitPrefixes = []string{
+	"/uflow/auth/admin/",
+	"/uflow/auth/enduser/",
+	"/uflow/auth/totp/login",
+	"/uflow/auth/totp/device-approve",
+	"/uflow/auth/workspace/totp/login",
+	"/uflow/auth/workspace/ciba/initiate",
+	"/uflow/auth/workspace/ciba/token",
+	"/uflow/auth/ciba/initiate",
+	"/uflow/auth/ciba/token",
+	"/uflow/auth/device/",
+	"/uflow/auth/voice/initiate",
+	"/uflow/auth/voice/verify",
+	"/uflow/auth/voice/token",
+	"/uflow/auth/oidc/",
+	"/uflow/auth/saml/",
+	"/uflow/login",
+	"/uflow/register",
+	"/uflow/verify-otp",
+	"/uflow/resend-otp",
+	"/uflow/user/login",
+	"/uflow/user/register",
+	"/uflow/user/forgot-password",
+	"/uflow/user/reset-password",
+	"/uflow/user/verify-otp",
+	"/uflow/user/resend-otp",
+	"/api/v1/auth/",
+}
 
-	for _, authPath := range authPaths {
-		if strings.HasPrefix(path, authPath) {
+// selectRateLimitConfig determines which rate limit to apply based on path.
+// Every route is mounted under /authsec, so the prefix is stripped before
+// matching (AS-034: the table used to list /uflow/... paths, which no real
+// request path starts with, so the strict limits never applied).
+func selectRateLimitConfig(path string) RateLimitConfig {
+	rel := strings.TrimPrefix(path, "/authsec")
+	for _, p := range ingestRateLimitPaths {
+		if rel == p {
+			return IngestRateLimit
+		}
+	}
+	if strings.HasPrefix(rel, pdpRateLimitPrefix) {
+		return PDPRateLimit
+	}
+	for _, authPath := range authRateLimitPrefixes {
+		if strings.HasPrefix(rel, authPath) {
 			return AuthRateLimit
 		}
 	}
 
 	// Admin endpoints
-	if strings.HasPrefix(path, "/api/v1/admin/") || strings.HasPrefix(path, "/uflow/admin/") {
+	if strings.HasPrefix(rel, "/api/v1/admin/") || strings.HasPrefix(rel, "/uflow/admin/") {
 		return AdminRateLimit
 	}
 
@@ -297,4 +349,13 @@ func PerUserRateLimitMiddleware(limit int, window time.Duration) gin.HandlerFunc
 
 		c.Next()
 	}
+}
+
+// ResetRateLimitsForTest clears the in-memory rate-limit counters. Tests share
+// one process and one client address, so without this a suite's later tests
+// inherit earlier tests' request counts. Never call it outside tests.
+func ResetRateLimitsForTest() {
+	memStore.mu.Lock()
+	memStore.items = make(map[string]*rateLimitEntry)
+	memStore.mu.Unlock()
 }

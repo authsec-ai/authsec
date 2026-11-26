@@ -58,12 +58,12 @@ type AWSScanWorker struct {
 	poll    time.Duration
 	nowFunc func() time.Time
 
-	// gate is IGA_GRAPH_PROJECTION (§2.8), and the ONLY thing that decides
+	// gate is the graph pipeline (§2.8), and the ONLY thing that decides
 	// whether this worker uses the barrier and enqueues projection jobs:
 	//
-	//	off                 Phase 1 exactly: no barrier, no job, no Phase 2 SQL
-	//	on, not verified    claims nothing (fail closed)
-	//	on, verified        barrier + job enqueue + hand-off to the job
+	//	off, or graph schema absent   Phase 1 exactly: no barrier, no job, no Phase 2 SQL
+	//	partial or unreadable schema  claims nothing (fail closed)
+	//	verified                      barrier + job enqueue + hand-off to the job
 	gate *GraphProjectionGate
 
 	// The Phase 2 pipeline (§2.10A). jobs enqueues the projection work inside
@@ -73,7 +73,7 @@ type AWSScanWorker struct {
 	jobs     repositories.IGAProjectionJobRepository
 	pipeline repositories.IGAPipelineLeaseRepository
 
-	// policy is IGA_POLICY (§4.3). Resource-policy collection (§3.9, T3.03b)
+	// policy is policy (§4.3). Resource-policy collection (§3.9, T3.03b)
 	// runs inside the scan, under the barrier, only when it is available:
 	// nothing Phase 3 runs half-on, and with it off the scan is exactly the
 	// Phase 2 scan.
@@ -117,7 +117,7 @@ func (w *AWSScanWorker) WithGraphProjection(g *GraphProjectionGate) *AWSScanWork
 	return w
 }
 
-// WithPolicyGate binds the worker to an IGA_POLICY gate. Without one it reads
+// WithPolicyGate binds the worker to an policy gate. Without one it reads
 // the process-wide gate, which defaults to off.
 func (w *AWSScanWorker) WithPolicyGate(g *PolicyGate) *AWSScanWorker { w.policy = g; return w }
 
@@ -171,10 +171,18 @@ func (w *AWSScanWorker) Run(ctx context.Context) {
 // polling loop.
 func (w *AWSScanWorker) RunOnce(ctx context.Context) (bool, error) {
 	gate := w.projectionGate()
+	// Read the schema again before a claim that would skip the barrier (the
+	// graph schema absent), so a migration applied since the last check moves
+	// this worker to the pipeline rather than letting it scan beside a new
+	// projector. A gate that is failing closed is left to its own retry.
+	if gate.Enabled() && gate.ClaimAllowed() && !gate.PipelineMode() {
+		_ = gate.Verify(w.db)
+	}
 	if !gate.ClaimAllowed() {
-		// FAIL CLOSED (§2.8). The switch is on and the schema is not verified.
-		// Falling back to Phase 1 here would scan without the barrier while a
-		// projector elsewhere may run, which is the overwrite it prevents.
+		// FAIL CLOSED (§2.8). The barrier table exists but the schema does not
+		// verify (or could not be read): a process on another schema version
+		// may be projecting, and scanning without the barrier would overwrite
+		// what it reads. /capabilities and the gate's log say why.
 		return false, nil
 	}
 	pipeline := gate.PipelineMode()
@@ -203,7 +211,7 @@ func (w *AWSScanWorker) RunOnce(ctx context.Context) (bool, error) {
 	}
 
 	if !pipeline {
-		// IGA_GRAPH_PROJECTION off: exactly the Phase 1 behaviour. No barrier,
+		// the graph pipeline off: exactly the Phase 1 behaviour. No barrier,
 		// no job, and nothing in this path names a Phase 2 table -- so it runs
 		// unchanged against any schema, any number of consecutive times (S1).
 		if err := w.execute(ctx, run, 0); err != nil {
@@ -413,6 +421,13 @@ func (w *AWSScanWorker) execute(ctx context.Context, run *models.CloudScanRun, b
 	written, skipped := evidence.Counts()
 	log.Printf("aws scan run %s published: evidence %d new, %d unchanged",
 		run.ID, written, skipped)
+	// Agent-runtime inference is NOT run here. It reads the graph
+	// (iga_workload) to label workloads and key suggestions, and the graph of
+	// this run does not exist until its projection job completes: running it
+	// now read the PREVIOUS scan's graph, so a new workload stayed
+	// "not_projected" for a whole scan interval. The projection service runs it
+	// when the job completes (ProjectionService.completeAndInfer). Without the
+	// graph schema (no pipeline) there is nothing for it to read.
 	return nil
 }
 

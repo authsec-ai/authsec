@@ -43,7 +43,7 @@ type ProjectionService struct {
 	// and the graph is exactly this service's own fencer.
 	beforeGraphTx func(job models.IGAProjectionJob)
 
-	// policyGate is the IGA_POLICY gate the evaluation step checks
+	// policyGate is the policy gate the evaluation step checks
 	// (SPEC-iga-phase3-policy.md §8.2): with it not on, no evaluation row is
 	// inserted and the step does nothing. Read on every pass.
 	policyGate func() *PolicyGate
@@ -85,7 +85,7 @@ func (s *ProjectionService) WithEvaluator(e *GovEvaluator) *ProjectionService {
 	return s
 }
 
-// policyOn reports whether the IGA_POLICY gate is on for this pass.
+// policyOn reports whether the policy gate is on for this pass.
 func (s *ProjectionService) policyOn() bool {
 	return s.policyGate != nil && s.evaluator != nil && s.policyGate().Available()
 }
@@ -152,7 +152,7 @@ func (f projectionFencer) AssertHeldTx(tx *gorm.DB, ws, runID uuid.UUID, version
 
 // Run claims jobs until the context ends.
 //
-// main starts it ONLY once IGA_GRAPH_PROJECTION is on and the schema verified
+// main starts it ONLY once the graph pipeline is available and the schema verified
 // (GraphProjectionGate.VerifyUntilReady), so it never runs against a schema it
 // cannot use -- the switch decides, not a probe here.
 func (s *ProjectionService) Run(ctx context.Context, poll time.Duration) {
@@ -374,7 +374,7 @@ func (s *ProjectionService) RunOnce(ctx context.Context) (bool, error) {
 	var done *igagraph.AlreadyPublished
 	if errors.As(err, &done) {
 		s.evaluate(ctx, job, version, done.Rev)
-		return true, s.completeAndRelease(ctx, job, version)
+		return true, s.completeAndInfer(ctx, job, version)
 	}
 	if errors.Is(err, igagraph.ErrSuperseded) {
 		return true, s.abandonAndRelease(ctx, job, version, "superseded by a newer publication")
@@ -386,7 +386,19 @@ func (s *ProjectionService) RunOnce(ctx context.Context) (bool, error) {
 	// finding evaluation (§8.2). Collection cannot run, so every connector's
 	// cloud_usage rows are still its manifest run's.
 	s.evaluate(ctx, job, version, rev)
-	return true, s.completeAndRelease(ctx, job, version)
+	return true, s.completeAndInfer(ctx, job, version)
+}
+
+// completeAndInfer completes the job and, once it has, runs agent-runtime
+// inference for the connector it projected: the graph (iga_workload) it reads
+// is this run's only now. It never fails or panics the projection
+// (RunAgentInferenceAfterScan logs); a job that did not complete runs nothing.
+func (s *ProjectionService) completeAndInfer(ctx context.Context, job *models.IGAProjectionJob, barrierVersion int64) error {
+	if err := s.completeAndRelease(ctx, job, barrierVersion); err != nil {
+		return err
+	}
+	RunAgentInferenceAfterScan(ctx, s.db, job.WorkspaceID, job.ConnectorID)
+	return nil
 }
 
 // holdBarrier returns the barrier version when the barrier is projecting this
@@ -533,7 +545,7 @@ func (s *ProjectionService) projectAndReconcile(
 		if err := projector.Events().Flush(tx, s.graph); err != nil {
 			return err
 		}
-		// §8.2 step 1: with IGA_POLICY on, the revision's evaluation row is
+		// §8.2 step 1: with policy on, the revision's evaluation row is
 		// inserted (running, attempt 1) IN the publication transaction, so a
 		// published revision always has one to continue after a crash.
 		if policy {

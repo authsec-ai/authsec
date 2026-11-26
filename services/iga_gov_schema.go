@@ -12,7 +12,7 @@ import (
 
 // Phase 3 schema verification (SPEC-iga-phase3-policy.md §4.3, T3.02).
 //
-// IGA_POLICY=on requires a verified Phase 3 schema, checked by existence
+// policy available requires a verified Phase 3 schema, checked by existence
 // as VerifyGraphSchema checks the graph's -- relations and added columns --
 // and, since the R1a review fix ("gate leaks"), every trigger and key
 // CHECK / UNIQUE constraint of 047-056 by name (triggers enabled,
@@ -21,9 +21,8 @@ import (
 // check; the gate that runs it is iga_gov_gate.go (PolicyGate), its routes
 // and the capabilities block controllers/platform/iga_gov_policy_controller.go.
 
-// PolicySchemaHead is the last Phase 3 migration (047-059; the spec's
-// original 044-053, moved up as a unit when 044-046 landed first).
-const PolicySchemaHead = "059"
+// PolicySchemaHead is the migration required by the independent policy lifecycle.
+const PolicySchemaHead = "158"
 
 // policyRelations is every relation 047-056 create: each table, the sequence
 // behind iga_gov_event.id, and every explicitly named index. The indexes are
@@ -69,6 +68,8 @@ var policyRelations = []string{
 	"uq_iga_gov_acceptance_gate",
 	// 059_tidy_eval_pruned (fix/p3-tidy): finding reads answer 410 from it
 	"iga_gov_evaluation_pruned",
+	// 157_iga_gov_recovery_approval: a role-only recovery plan is approved on its own.
+	"uq_iga_gov_approval_recovery",
 }
 
 // policyColumns are columns a relation check cannot prove. 047-056 add no
@@ -76,14 +77,13 @@ var policyRelations = []string{
 // permission rows, data, not schema), but 055's iga_gov_settings gained the
 // notification channel columns after its first draft (p3-wire): a database
 // built from that draft has the table without them, so they are checked by
-// name: IGA_POLICY stays unavailable on such a database (rebuild it; 055
+// name: policy stays unavailable on such a database (rebuild it; 055
 // is CREATE TABLE IF NOT EXISTS and never alters an existing table).
 var policyColumns = []string{
 	"iga_gov_settings.notify_email_enabled",
 	"iga_gov_settings.notify_webhook_url",
 	"iga_gov_settings.notify_webhook_secret_ref",
 	"iga_gov_settings.notify_channels_source",
-	"iga_gov_settings.notify_channels_copied_at",
 }
 
 // policyTriggers is every trigger 047-056 create, as "table.trigger"
@@ -153,7 +153,8 @@ var policyConstraints = []string{
 	"iga_gov_owner_review.iga_gov_owner_review_workspace_id_id_key",
 	"iga_gov_owner_response.iga_gov_orr_response_chk", "iga_gov_owner_response.iga_gov_owner_response_review_id_user_id_key",
 	"iga_gov_owner_response.iga_gov_owner_response_workspace_id_id_key",
-	"iga_gov_approval.iga_gov_approval_reject_reason_chk", "iga_gov_approval.iga_gov_approval_workspace_id_id_key",
+	"iga_gov_approval.iga_gov_approval_reject_reason_chk", "iga_gov_approval.iga_gov_approval_scope_chk",
+	"iga_gov_approval.iga_gov_approval_recovery_plan_fkey", "iga_gov_approval.iga_gov_approval_workspace_id_id_key",
 	"iga_gov_approval.iga_gov_approval_workspace_id_id_version_id_key",
 	"iga_gov_revalidation.iga_gov_rv_result_chk", "iga_gov_revalidation.iga_gov_revalidation_workspace_id_id_key",
 	"iga_gov_revalidation.iga_gov_revalidation_workspace_id_id_plan_id_result_key",
@@ -188,7 +189,7 @@ var policyConstraints = []string{
 	"iga_gov_iac_change.iga_gov_iac_change_workspace_id_id_key",
 	// 054
 	"iga_gov_notification.iga_gov_pn_sent_chk", "iga_gov_notification.iga_gov_notification_workspace_id_id_key",
-	"iga_gov_notification.iga_gov_notification_subject_kind_subject_id_channel_recipi_key",
+	"iga_gov_notification.iga_gov_notification_ws_subject_channel_recipient_key", // 132 (was 054's global key)
 	// 056
 	"cloud_resource_policy_coverage.cloud_rpc_complete_chk", "cloud_resource_policy_coverage.cloud_rpc_reason_chk",
 	"cloud_resource_policy_observation.cloud_rpo_document_chk",
@@ -217,7 +218,7 @@ func PolicySchemaRelations() []string { return append([]string(nil), policyRelat
 //
 // As VerifyGraphSchema: a database ERROR is returned as an error for the
 // caller to retry (never treated as an answer), and a MISSING relation or
-// column is an error naming every one, because it means IGA_POLICY is on
+// column is an error naming every one, because it means policy is available
 // against a schema that cannot run it.
 func VerifyPolicySchema(db *gorm.DB) error {
 	var missing []string
@@ -253,7 +254,7 @@ func VerifyPolicySchema(db *gorm.DB) error {
 	}
 	missing = append(missing, absentNames(policyConstraints, haveConstraints, "constraint ")...)
 	if len(missing) > 0 {
-		return fmt.Errorf("IGA_POLICY=on needs migrations 047-%s; missing: %s",
+		return fmt.Errorf("policy needs migrations 047-%s; missing: %s",
 			PolicySchemaHead, strings.Join(missing, ", "))
 	}
 	return nil

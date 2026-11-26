@@ -60,8 +60,6 @@ import (
 	"context"
 	"net/url"
 
-	"github.com/google/uuid"
-
 	"github.com/authsec-ai/authsec/models"
 )
 
@@ -109,7 +107,7 @@ func (s *graphSide) exhausted() bool { return len(s.frontier) == 0 }
 
 // Path serves GET /graph/path. include_ended is not a parameter here: a path
 // is declared among current and stale edges (§5.4, D-12).
-func (g *GraphTraversal) Path(ctx context.Context, ws uuid.UUID, vals url.Values) (any, error) {
+func (g *GraphTraversal) Path(ctx context.Context, vals url.Values) (any, error) {
 	if perr := graphCheckParams(vals, "from", "to"); perr != nil {
 		return nil, perr
 	}
@@ -130,7 +128,7 @@ func (g *GraphTraversal) Path(ctx context.Context, ws uuid.UUID, vals url.Values
 	}
 
 	var out Envelope
-	err := g.r.Read(ctx, ws, Pin{}, func(q *Query) error {
+	err := g.r.Read(ctx, Pin{}, func(q *Query) error {
 		// D-4 is readRoot's (an AWS end needs a publication, a Kubernetes
 		// one does not). The two ends may be of different providers: the
 		// paths between them run through a crossing (traverse_cross.go,

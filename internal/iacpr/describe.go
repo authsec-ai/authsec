@@ -31,6 +31,13 @@ func Describe(p igagov.Plan, role RoleTarget, ch *Change) Description {
 		d.Title = fmt.Sprintf("AuthSec: restrict AWS services for %s", role.Name)
 		d.Effect = fmt.Sprintf("Restricts these AWS services for this role: %s. Does not change actions or resources within kept services.",
 			strings.Join(nonEmpty(removed), ", "))
+		if acts := append(append([]string{}, p.Diff.NewlyExcludedActions...), p.Diff.AlreadyExcludedActions...); len(acts) > 0 {
+			// R1b: an action-level plan says what it removes inside kept services.
+			sort.Strings(acts)
+			d.Title = fmt.Sprintf("AuthSec: restrict AWS services and actions for %s", role.Name)
+			d.Effect = fmt.Sprintf("Restricts these AWS services for this role: %s. Removes these actions within kept services: %s. "+
+				"Does not change resources or any other action.", strings.Join(nonEmpty(removed), ", "), strings.Join(acts, ", "))
+		}
 	case igagov.PlanUndo:
 		d.Title = fmt.Sprintf("AuthSec: undo the change to %s", role.Name)
 		d.Effect = "Restores the boundary this role had before AuthSec's change."
@@ -47,6 +54,9 @@ func Describe(p igagov.Plan, role RoleTarget, ch *Change) Description {
 	}
 	if len(restored) > 0 && p.Kind != igagov.PlanApply {
 		d.Effect += " Services no longer excluded: " + strings.Join(restored, ", ") + "."
+	}
+	if ra := p.Diff.NewlyUnexcludedActions; len(ra) > 0 && p.Kind != igagov.PlanApply {
+		d.Effect += " Actions no longer excluded: " + strings.Join(ra, ", ") + "."
 	}
 	d.Recognition = recognition(p, role)
 	var b strings.Builder

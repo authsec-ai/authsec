@@ -3,7 +3,9 @@ package awsenforce
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -12,6 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
 	"github.com/aws/aws-sdk-go-v2/service/iam"
 	iamtypes "github.com/aws/aws-sdk-go-v2/service/iam/types"
+	"github.com/aws/aws-sdk-go-v2/service/lambda"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/aws/smithy-go/middleware"
 
@@ -64,10 +67,16 @@ func (LiveAssumer) AssumeEnforcement(ctx context.Context, in AssumeInput) (IAM, 
 		return nil, nil, err
 	}
 	client := iam.NewFromConfig(cfg, func(o *iam.Options) { o.Retryer = aws.NopRetryer{} })
-	return liveIAM{c: client}, &Identity{AccountID: aws.ToString(out.Account), ARN: aws.ToString(out.Arn)}, nil
+	return liveIAM{c: client, cfg: cfg}, &Identity{AccountID: aws.ToString(out.Account), ARN: aws.ToString(out.Arn)}, nil
 }
 
-type liveIAM struct{ c *iam.Client }
+// liveIAM is the enforcement session's client. cfg is the assumed-role
+// configuration it was built from, kept for the template v2 Lambda call
+// (UpdateFunctionRole), which needs a client in the function's region.
+type liveIAM struct {
+	c   *iam.Client
+	cfg aws.Config
+}
 
 func (l liveIAM) CreatePolicy(ctx context.Context, in CreatePolicyInput) (string, error) {
 	out, err := l.c.CreatePolicy(ctx, &iam.CreatePolicyInput{
@@ -142,6 +151,112 @@ func (l liveIAM) TagPolicy(ctx context.Context, policyARN string, tags map[strin
 		recordMetadata(ctx, out.ResultMetadata)
 	}
 	return err
+}
+
+/* ------------------------- enforcement template v2 ------------------------ */
+
+// liveIAM implements IAMv2 (template v2, DECISION R2-14 / R2-15). Whether AWS
+// allows each call is the stack's business; every call is one request with
+// SDK retries off, like the v1 methods.
+var _ IAMv2 = liveIAM{}
+
+func (l liveIAM) AttachRolePolicy(ctx context.Context, roleName, policyARN string) error {
+	out, err := l.c.AttachRolePolicy(ctx, &iam.AttachRolePolicyInput{
+		RoleName: aws.String(roleName), PolicyArn: aws.String(policyARN),
+	})
+	if err == nil {
+		recordMetadata(ctx, out.ResultMetadata)
+	}
+	return err
+}
+
+func (l liveIAM) DetachRolePolicy(ctx context.Context, roleName, policyARN string) error {
+	out, err := l.c.DetachRolePolicy(ctx, &iam.DetachRolePolicyInput{
+		RoleName: aws.String(roleName), PolicyArn: aws.String(policyARN),
+	})
+	if err == nil {
+		recordMetadata(ctx, out.ResultMetadata)
+	}
+	return err
+}
+
+func (l liveIAM) PutRolePolicy(ctx context.Context, roleName, policyName, document string) error {
+	out, err := l.c.PutRolePolicy(ctx, &iam.PutRolePolicyInput{
+		RoleName: aws.String(roleName), PolicyName: aws.String(policyName), PolicyDocument: aws.String(document),
+	})
+	if err == nil {
+		recordMetadata(ctx, out.ResultMetadata)
+	}
+	return err
+}
+
+func (l liveIAM) DeleteRolePolicy(ctx context.Context, roleName, policyName string) error {
+	out, err := l.c.DeleteRolePolicy(ctx, &iam.DeleteRolePolicyInput{
+		RoleName: aws.String(roleName), PolicyName: aws.String(policyName),
+	})
+	if err == nil {
+		recordMetadata(ctx, out.ResultMetadata)
+	}
+	return err
+}
+
+func (l liveIAM) CreateRole(ctx context.Context, in CreateRoleInput) (string, error) {
+	req := &iam.CreateRoleInput{
+		RoleName: aws.String(in.Name), AssumeRolePolicyDocument: aws.String(in.TrustDocument), Tags: iamTags(in.Tags),
+	}
+	if in.Path != "" {
+		req.Path = aws.String(in.Path)
+	}
+	if in.Description != "" {
+		req.Description = aws.String(in.Description)
+	}
+	out, err := l.c.CreateRole(ctx, req)
+	if err != nil {
+		return "", err
+	}
+	recordMetadata(ctx, out.ResultMetadata)
+	if out.Role == nil {
+		return "", nil
+	}
+	return aws.ToString(out.Role.Arn), nil
+}
+
+func (l liveIAM) DeleteRole(ctx context.Context, roleName string) error {
+	out, err := l.c.DeleteRole(ctx, &iam.DeleteRoleInput{RoleName: aws.String(roleName)})
+	if err == nil {
+		recordMetadata(ctx, out.ResultMetadata)
+	}
+	return err
+}
+
+// UpdateFunctionRole sets the function's ($LATEST) execution role, through a
+// Lambda client in the function ARN's region with SDK retries off.
+func (l liveIAM) UpdateFunctionRole(ctx context.Context, functionARN, roleARN string) error {
+	region, err := lambdaFunctionRegion(functionARN)
+	if err != nil {
+		return err
+	}
+	client := lambda.NewFromConfig(l.cfg, func(o *lambda.Options) {
+		o.Region = region
+		o.Retryer = aws.NopRetryer{}
+	})
+	out, err := client.UpdateFunctionConfiguration(ctx, &lambda.UpdateFunctionConfigurationInput{
+		FunctionName: aws.String(functionARN), Role: aws.String(roleARN),
+	})
+	if err == nil {
+		recordMetadata(ctx, out.ResultMetadata)
+	}
+	return err
+}
+
+// lambdaFunctionRegion is the region of a Lambda function ARN
+// (arn:<partition>:lambda:<region>:<account>:function:<name>[:<qualifier>]).
+func lambdaFunctionRegion(functionARN string) (string, error) {
+	parts := strings.SplitN(functionARN, ":", 7)
+	if len(parts) < 7 || parts[0] != "arn" || parts[2] != "lambda" || parts[3] == "" || parts[5] != "function" || parts[6] == "" {
+		return "", fmt.Errorf("%q is not a Lambda function ARN", functionARN)
+	}
+	return parts[3], nil
 }
 
 // iamTags converts a tag map into IAM tags, sorted by key so the request is

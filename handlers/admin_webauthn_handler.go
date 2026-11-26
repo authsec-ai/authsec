@@ -3,12 +3,12 @@ package handlers
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -23,6 +23,49 @@ import (
 	middleware "github.com/authsec-ai/authsec/middlewares"
 	repositories "github.com/authsec-ai/authsec/repository"
 )
+
+// adminLoginWorkspace is the workspace of the subject RequireLoginSubject
+// admitted (login ticket or console session); empty if there is none.
+func adminLoginWorkspace(c *gin.Context) string {
+	if s, ok := middleware.GetLoginSubject(c); ok {
+		return s.WorkspaceID
+	}
+	return ""
+}
+
+// adminLoginUser finds the admin in the signed-in subject's workspace. An
+// email alone names a user in every workspace that has one (AS-078).
+func adminLoginUser(c *gin.Context, repo *repositories.ClientRepository, email string) (*sharedmodels.User, error) {
+	ws := adminLoginWorkspace(c)
+	if ws == "" {
+		return nil, fmt.Errorf("no signed-in workspace")
+	}
+	return repo.GetClientByEmailAndTenant(&email, &ws, nil)
+}
+
+var errAmbiguousAdminEmail = errors.New("email exists in more than one workspace")
+
+// adminStatusUser finds the admin for the pre-login MFA status endpoints: by
+// (email, workspace) when the caller names the workspace; by email alone only
+// while that email exists in a single workspace (AS-078).
+func adminStatusUser(db *gorm.DB, email, workspaceID string) (*sharedmodels.User, error) {
+	repo := repositories.NewClientRepository(db)
+	if workspaceID != "" {
+		if _, err := uuid.Parse(workspaceID); err != nil {
+			return nil, gorm.ErrRecordNotFound
+		}
+		return repo.GetClientByEmailAndTenant(&email, &workspaceID, nil)
+	}
+	var n int64
+	// TENANT-EXEMPT: pre-login, counts the workspaces that hold this email
+	if err := db.Table("users").Where("email = ?", email).Count(&n).Error; err != nil {
+		return nil, err
+	}
+	if n > 1 {
+		return nil, errAmbiguousAdminEmail
+	}
+	return repo.GetClientByEmail(email)
+}
 
 // AdminWebAuthnHandler handles WebAuthn operations for admin users
 // Uses global database for all operations
@@ -94,7 +137,8 @@ func (h *AdminWebAuthnHandler) validateOriginAndCreateWebAuthn(c *gin.Context) (
 // GetMFAStatus returns the MFA status for admin users
 func (h *AdminWebAuthnHandler) GetMFAStatus(c *gin.Context) {
 	var req struct {
-		Email string `json:"email" binding:"required"`
+		Email       string `json:"email" binding:"required"`
+		WorkspaceID string `json:"workspace_id"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -108,9 +152,11 @@ func (h *AdminWebAuthnHandler) GetMFAStatus(c *gin.Context) {
 		return
 	}
 
-	// Get admin user by email (no tenant context)
-	clientRepo := repositories.NewClientRepository(globalDB)
-	user, err := clientRepo.GetClientByEmail(req.Email)
+	user, err := adminStatusUser(globalDB, req.Email, req.WorkspaceID)
+	if errors.Is(err, errAmbiguousAdminEmail) {
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "workspace_id is required for this email"})
+		return
+	}
 	if err != nil {
 		c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
 		return
@@ -133,7 +179,8 @@ func (h *AdminWebAuthnHandler) GetMFAStatus(c *gin.Context) {
 // GetMFAStatusForLogin returns MFA status for admin login flow
 func (h *AdminWebAuthnHandler) GetMFAStatusForLogin(c *gin.Context) {
 	var req struct {
-		Email string `json:"email" binding:"required"`
+		Email       string `json:"email" binding:"required"`
+		WorkspaceID string `json:"workspace_id"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -147,9 +194,11 @@ func (h *AdminWebAuthnHandler) GetMFAStatusForLogin(c *gin.Context) {
 		return
 	}
 
-	// Get admin user by email (no tenant context)
-	clientRepo := repositories.NewClientRepository(globalDB)
-	user, err := clientRepo.GetClientByEmail(req.Email)
+	user, err := adminStatusUser(globalDB, req.Email, req.WorkspaceID)
+	if errors.Is(err, errAmbiguousAdminEmail) {
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "workspace_id is required for this email"})
+		return
+	}
 	if err != nil {
 		c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
 		return
@@ -193,7 +242,7 @@ func (h *AdminWebAuthnHandler) GetMFAStatusForLogin(c *gin.Context) {
 		if hasWebAuthnMethod {
 			// Check if user has credentials that are valid for this custom domain
 			// Strategy: Check if credentials were created for this specific RP ID
-			hasValidCreds, err := clientRepo.HasCredentialsForRPID(user.ID.String(), customDomain)
+			hasValidCreds, err := repositories.NewClientRepository(globalDB).HasCredentialsForRPID(user.ID.String(), customDomain)
 			if err != nil {
 				log.Printf("GetMFAStatusForLogin: Error checking credentials for RP ID %s: %v", customDomain, err)
 			} else if hasValidCreds {
@@ -229,9 +278,11 @@ func (h *AdminWebAuthnHandler) GetMFAStatusForLoginGET(c *gin.Context) {
 		return
 	}
 
-	// Get admin user by email (no tenant context)
-	clientRepo := repositories.NewClientRepository(globalDB)
-	user, err := clientRepo.GetClientByEmail(email)
+	user, err := adminStatusUser(globalDB, email, c.Query("workspace_id"))
+	if errors.Is(err, errAmbiguousAdminEmail) {
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "workspace_id is required for this email"})
+		return
+	}
 	if err != nil {
 		c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
 		return
@@ -275,7 +326,7 @@ func (h *AdminWebAuthnHandler) GetMFAStatusForLoginGET(c *gin.Context) {
 		if hasWebAuthnMethod {
 			// Check if user has credentials that are valid for this custom domain
 			// Strategy: Check if credentials were created for this specific RP ID
-			hasValidCreds, err := clientRepo.HasCredentialsForRPID(user.ID.String(), customDomain)
+			hasValidCreds, err := repositories.NewClientRepository(globalDB).HasCredentialsForRPID(user.ID.String(), customDomain)
 			if err != nil {
 				log.Printf("GetMFAStatusForLoginGET: Error checking credentials for RP ID %s: %v", customDomain, err)
 			} else if hasValidCreds {
@@ -326,7 +377,7 @@ func (h *AdminWebAuthnHandler) BeginRegistration(c *gin.Context) {
 
 	// Get admin user by email
 	clientRepo := repositories.NewClientRepository(globalDB)
-	user, err := clientRepo.GetClientByEmail(req.Email)
+	user, err := adminLoginUser(c, clientRepo, req.Email)
 	if err != nil {
 		c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
 		return
@@ -374,7 +425,7 @@ func (h *AdminWebAuthnHandler) BeginRegistration(c *gin.Context) {
 
 	// Store session data
 	reqID := uuid.New().String()
-	challengeKey := buildChallengeKey("registration", req.Email, "admin") // Use "admin" as tenant
+	challengeKey := buildChallengeKey("registration", req.Email, adminLoginWorkspace(c))
 	if err := h.SessionManager.Save(challengeKey, sessionData); err != nil {
 		log.Printf("[%s] BeginRegistration: Failed to save session - %v", reqID, err)
 		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "Failed to save session"})
@@ -427,7 +478,7 @@ func (h *AdminWebAuthnHandler) FinishRegistration(c *gin.Context) {
 
 	// Get admin user
 	clientRepo := repositories.NewClientRepository(globalDB)
-	user, err := clientRepo.GetClientByEmail(req.Email)
+	user, err := adminLoginUser(c, clientRepo, req.Email)
 	if err != nil {
 		log.Printf("[%s] FinishRegistration: User not found - %v", reqID, err)
 		c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
@@ -435,7 +486,7 @@ func (h *AdminWebAuthnHandler) FinishRegistration(c *gin.Context) {
 	}
 
 	// Get session data
-	challengeKey := buildChallengeKey("registration", req.Email, "admin")
+	challengeKey := buildChallengeKey("registration", req.Email, adminLoginWorkspace(c))
 	sessionData, found := h.SessionManager.Get(challengeKey)
 	if !found {
 		log.Printf("[%s] FinishRegistration: No session found for key=%s", reqID, challengeKey)
@@ -491,36 +542,14 @@ func (h *AdminWebAuthnHandler) FinishRegistration(c *gin.Context) {
 		log.Printf("[%s] FinishRegistration: WebAuthn finish failed - %v", reqID, err)
 		log.Printf("[%s] FinishRegistration: Error type: %T", reqID, err)
 
-		if strings.Contains(err.Error(), "attestation") ||
-			strings.Contains(err.Error(), "Invalid attestation") ||
-			strings.Contains(err.Error(), "format") ||
-			strings.Contains(err.Error(), "validation") {
-
-			log.Printf("[%s] FinishRegistration: Attempting fallback credential creation", reqID)
-
-			var container CredentialContainer
-			if unmarshalErr := json.Unmarshal(req.Credential, &container); unmarshalErr != nil {
-				log.Printf("[%s] FinishRegistration: Failed to parse credential payload for fallback: %v", reqID, unmarshalErr)
-				c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid credential payload"})
-				return
-			}
-
-			fallbackCred, fbErr := buildFallbackCredentialFromContainer(&container)
-			if fbErr != nil {
-				log.Printf("[%s] FinishRegistration: Fallback credential creation failed: %v", reqID, fbErr)
-				c.JSON(http.StatusBadRequest, ErrorResponse{Error: "invalid attestation/public key"})
-				return
-			}
-
-			log.Printf("[%s] FinishRegistration: Fallback credential created successfully", reqID)
-			credential = fallbackCred
-		} else {
-			if protoErr, ok := err.(*protocol.Error); ok {
-				log.Printf("[%s] FinishRegistration: Protocol error type: %s, details: %s", reqID, protoErr.Type, protoErr.Details)
-			}
-			c.JSON(http.StatusBadRequest, ErrorResponse{Error: "registration failed"})
-			return
+		// A credential whose attestation, challenge or origin did not verify is
+		// rejected. The old fallback stored such a credential's public key
+		// anyway, which accepted forged registrations (AS-003).
+		if protoErr, ok := err.(*protocol.Error); ok {
+			log.Printf("[%s] FinishRegistration: Protocol error type: %s, details: %s", reqID, protoErr.Type, protoErr.Details)
 		}
+		c.JSON(http.StatusBadRequest, ErrorResponse{Error: "registration failed"})
+		return
 	}
 
 	if credential == nil {
@@ -652,7 +681,7 @@ func (h *AdminWebAuthnHandler) BeginAuthentication(c *gin.Context) {
 
 	// Get admin user by email
 	clientRepo := repositories.NewClientRepository(globalDB)
-	user, err := clientRepo.GetClientByEmail(req.Email)
+	user, err := adminLoginUser(c, clientRepo, req.Email)
 	if err != nil {
 		log.Printf("[%s] BeginAuthentication: user not found email=%s err=%v", reqID, req.Email, err)
 		c.JSON(http.StatusNotFound, ErrorResponse{Error: "user not found"})
@@ -706,7 +735,7 @@ func (h *AdminWebAuthnHandler) BeginAuthentication(c *gin.Context) {
 	}
 
 	// Save session data
-	challengeKey := buildChallengeKey("authentication", req.Email, "admin")
+	challengeKey := buildChallengeKey("authentication", req.Email, adminLoginWorkspace(c))
 	if err := h.SessionManager.Save(challengeKey, sessionData); err != nil {
 		log.Printf("[%s] BeginAuthentication: Failed to save session - %v", reqID, err)
 		c.JSON(http.StatusInternalServerError, ErrorResponse{Error: "Failed to save session"})
@@ -752,7 +781,7 @@ func (h *AdminWebAuthnHandler) FinishAuthentication(c *gin.Context) {
 	}
 
 	// Load session
-	challengeKey := buildChallengeKey("authentication", req.Email, "admin")
+	challengeKey := buildChallengeKey("authentication", req.Email, adminLoginWorkspace(c))
 	sessionData, found := h.SessionManager.Get(challengeKey)
 	if !found {
 		log.Printf("[%s] FinishAuthentication: no session found for key=%s", reqID, challengeKey)
@@ -769,7 +798,7 @@ func (h *AdminWebAuthnHandler) FinishAuthentication(c *gin.Context) {
 
 	// Load user from DB
 	clientRepo := repositories.NewClientRepository(globalDB)
-	user, err := clientRepo.GetClientByEmail(req.Email)
+	user, err := adminLoginUser(c, clientRepo, req.Email)
 	if err != nil {
 		log.Printf("[%s] FinishAuthentication: user lookup failed for email=%s: %v", reqID, req.Email, err)
 		c.JSON(http.StatusUnauthorized, ErrorResponse{Error: "user not found"})

@@ -79,6 +79,16 @@ ALLOWED_SHARED=(
   "cloud_policy_document:r"
   "cloud_resource_policy_coverage:r"
   "cloud_resource_policy_observation:r"
+  # The Azure collected model the Azure projection (internal/azuregraph) and
+  # its graph reads READ: Azure RBAC role assignments and Entra app
+  # permissions are cloud_permission rows, app and service-principal
+  # credentials cloud_secret rows, ARM resources cloud_resource rows. Read-only,
+  # one-way like the AWS rows above. (The AWS projection avoids cloud_resource
+  # because S3 ARNs name no account, so two accounts' scans collide on one row;
+  # an ARM resource id names its subscription, so Azure rows do not collide.)
+  "cloud_permission:r"
+  "cloud_secret:r"
+  "cloud_resource:r"
 
   # Phase 3's own tables whose names the spec fixed without the iga_ prefix
   # (053 cloud_enforcement_binding, 054 slack_user_link and
@@ -87,6 +97,13 @@ ALLOWED_SHARED=(
   "cloud_enforcement_binding:r"
   "slack_user_link:r"
   "workspace_slack_integration:r"
+
+  # Agent runtime visibility's own tables (148), named without the iga_
+  # prefix by its spec (SPEC-agent-runtime-visibility.md §10 Q2): suggestions
+  # keyed to iga_workload, and findings. Written only by agent runtime
+  # inference and its decision routes (services/agent_runtime_*.go).
+  "agent_suggestion:rw"
+  "agent_finding:rw"
 
   # The GitHub / Kubernetes collected model: discovery sources and their scan
   # runs (the IaC source FK, the connections view) and the repository / k8s

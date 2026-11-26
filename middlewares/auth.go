@@ -10,6 +10,8 @@ import (
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/database"
 	authz "github.com/authsec-ai/authsec/internal/authz"
+	"github.com/authsec-ai/authsec/internal/sessiontoken"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
@@ -69,12 +71,18 @@ func AuthMiddlewareWithConfig(cfg *AuthConfig) gin.HandlerFunc {
 			return
 		}
 
-		claims, err := validateJWTToken(tokenString, cfg)
+		claims, err := validateJWTTokenFor(tokenString, cfg, surfaceClasses(c.Request.URL.Path))
 		if err != nil {
 			fmt.Printf("WARN: JWT validation failed: %v\n", err)
 			c.Header("WWW-Authenticate", `Bearer realm="authsec", error="invalid_token", error_description="token is expired or invalid"`)
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired token"})
 			c.Abort()
+			return
+		}
+
+		if sessionRevoked(claims) {
+			c.Header("WWW-Authenticate", `Bearer realm="authsec", error="invalid_token", error_description="session has been revoked"`)
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "session has been revoked"})
 			return
 		}
 
@@ -94,21 +102,22 @@ func AuthMiddlewareWithConfig(cfg *AuthConfig) gin.HandlerFunc {
 		// Set all context values expected by downstream consumers
 		setContextValues(c, claims, info)
 
-		// Check admin access for admin paths (server auth)
-		if cfg.RequireServerAuth {
-			path := c.FullPath()
-			if path == "" {
-				path = c.Request.URL.Path
-			}
+		// A request may only name the workspace its token was issued for.
+		if !enforceTokenWorkspace(c, info.WorkspaceID) {
+			return
+		}
 
-			// Check admin access for admin paths
-			if strings.HasPrefix(path, "/admin/") {
-				if !stringSliceContains(info.Roles, "admin") {
-					c.JSON(http.StatusForbidden, gin.H{"error": "Admin access required"})
-					c.Abort()
-					return
-				}
-			}
+		// The user must still belong to the workspace the token names.
+		if ok, _ := principalActiveInWorkspace(info.WorkspaceID, info.UserID); !ok {
+			c.Header("WWW-Authenticate", `Bearer realm="authsec", error="invalid_token", error_description="session is no longer valid for this workspace"`)
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "session is no longer valid for this workspace"})
+			return
+		}
+
+		// The one request-scoped tenant context (ADR-0001 §4.2).
+		if ws, err := uuid.Parse(info.WorkspaceID); err == nil {
+			uid, _ := uuid.Parse(info.UserID)
+			tenancy.Set(c, tenancy.Context{WorkspaceID: ws, PrincipalID: uid, PrincipalKind: "user"})
 		}
 
 		// Backfill missing identifiers (workspace_id, user_id, etc.) for legacy controllers
@@ -307,46 +316,30 @@ func extractBearerToken(c *gin.Context) (string, error) {
 	return parts[1], nil
 }
 
-// validateJWTToken validates the JWT token and returns claims
+// validateJWTToken validates a user session token (admin, end-user or
+// legacy class) and returns its claims.
 func validateJWTToken(tokenString string, cfg *AuthConfig) (jwt.MapClaims, error) {
-	// Try parsing with different secrets - prioritize environment variables
-	// Use configured JWT secrets with minimal fallback
-	secrets := []string{
-		cfg.JWTSecret,        // Primary JWT secret (JWT_SDK_SECRET from env)
-		cfg.JWTDefaultSecret, // Secondary JWT secret (JWT_DEF_SECRET from env)
+	return validateJWTTokenFor(tokenString, cfg, userSessionClasses)
+}
+
+// validateJWTTokenFor validates a session token whose class is in allowed.
+// Each class verifies only under its own key, with typ and aud required; a
+// typ-less legacy token verifies under the legacy secrets until the legacy
+// deadline. The rule is documented in internal/sessiontoken (AS-033).
+func validateJWTTokenFor(tokenString string, cfg *AuthConfig, allowed []sessiontoken.Class) (jwt.MapClaims, error) {
+	secrets := sessiontoken.Secrets{
+		Default: cfg.JWTDefaultSecret, // JWT_DEF_SECRET
+		SDK:     cfg.JWTSecret,        // JWT_SDK_SECRET
+		Other:   os.Getenv("JWT_SECRET"),
 	}
-
-	// Add only essential fallback for cross-service compatibility
-	if jwtSecret := os.Getenv("JWT_SECRET"); jwtSecret != "" && jwtSecret != cfg.JWTSecret && jwtSecret != cfg.JWTDefaultSecret {
-		secrets = append(secrets, jwtSecret)
+	claims, _, err := sessiontoken.VerifyWith(secrets, tokenString, allowed...)
+	if err != nil {
+		return nil, err
 	}
-
-	var lastErr error
-	for _, secret := range secrets {
-		if secret == "" {
-			continue // Skip empty secrets
-		}
-
-		token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
-			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-				return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
-			}
-			return []byte(secret), nil
-		})
-
-		if err == nil && token.Valid {
-			if claims, ok := token.Claims.(jwt.MapClaims); ok {
-				// Validate issuer and audience
-				if err := validateClaims(claims, cfg); err != nil {
-					return nil, err
-				}
-				return claims, nil
-			}
-		}
-		lastErr = err
+	if err := validateClaims(claims, cfg); err != nil {
+		return nil, err
 	}
-
-	return nil, lastErr
+	return claims, nil
 }
 
 // validateClaims validates issuer, audience, and timing claims
@@ -376,16 +369,22 @@ func validateClaims(claims jwt.MapClaims, cfg *AuthConfig) error {
 		return fmt.Errorf("token missing required issuer (iss) claim")
 	}
 
-	// Validate audience (always enforced; skip only if no audience is configured)
-	if audClaim, exists := claims["aud"]; exists {
+	// Validate audience. A classed token's aud was checked against its class
+	// by sessiontoken; a legacy token keeps the configured audience check.
+	_, classed := claims["typ"]
+	if audClaim, exists := claims["aud"]; exists && !classed {
 		if cfg.ExpectedAudience != "" && !validateAudience(audClaim, cfg.ExpectedAudience) {
 			return fmt.Errorf("token audience mismatch")
 		}
 	}
 
-	// Validate timing - strict on expiration
+	// Validate timing - strict on expiration; a token must expire (AS-033).
 	now := time.Now().Unix()
-	if exp, ok := claims["exp"].(float64); ok && now > int64(exp) {
+	exp, ok := claims["exp"].(float64)
+	if !ok {
+		return fmt.Errorf("token missing required expiry (exp) claim")
+	}
+	if now > int64(exp) {
 		return fmt.Errorf("token expired")
 	}
 	if nbf, ok := claims["nbf"].(float64); ok && now < int64(nbf) {
@@ -536,15 +535,6 @@ func claimString(value interface{}) (string, bool) {
 	}
 }
 
-func stringSliceContains(values []string, target string) bool {
-	for _, v := range values {
-		if v == target {
-			return true
-		}
-	}
-	return false
-}
-
 // ensureUserContextIdentifiers backfills missing user-related identifiers (like user_id)
 func ensureUserContextIdentifiers(c *gin.Context) {
 	// First, extract all important claims from the JWT into context
@@ -644,18 +634,15 @@ func resolveUserIDFromEmail(c *gin.Context) (string, error) {
 
 	userRepo := database.NewUserRepository(dbConn)
 
-	// Use workspace-scoped lookup when workspace_id is available to avoid
-	// returning the wrong user in multi-workspace deployments.
+	// An email names a user only inside one workspace: without the token's
+	// workspace there is no lookup, and a miss there is never retried across
+	// all workspaces (AS-038).
+	wsUUID, parseErr := uuid.Parse(getContextString(c, "workspace_id"))
+	if parseErr != nil || wsUUID == uuid.Nil {
+		return "", fmt.Errorf("workspace_id not available in context")
+	}
 	var user *models.ExtendedUser
-	var lookupErr error
-	if wsID := getContextString(c, "workspace_id"); wsID != "" {
-		if wsUUID, parseErr := uuid.Parse(wsID); parseErr == nil {
-			user, lookupErr = userRepo.GetUserByEmailAndTenant(email, wsUUID)
-		}
-	}
-	if user == nil {
-		user, lookupErr = userRepo.GetUserByEmail(email)
-	}
+	user, lookupErr := userRepo.GetUserByEmailAndTenant(database.WithWorkspace(c.Request.Context(), wsUUID), email)
 	if lookupErr != nil || user == nil {
 		if lookupErr == nil {
 			lookupErr = fmt.Errorf("user not found")
@@ -750,7 +737,7 @@ func enrichRolesFromDB(c *gin.Context, claims jwt.MapClaims) {
 	}
 
 	repo := database.NewAdminUserRepository(dbConn)
-	userRoles, err := repo.GetUserRoles(userID, workspaceID)
+	userRoles, err := repo.GetUserRoles(database.WithWorkspace(c.Request.Context(), workspaceID), userID)
 	if err != nil || len(userRoles) == 0 {
 		return
 	}
@@ -795,8 +782,6 @@ func setWorkspaceContext(c *gin.Context, workspaceID string) {
 	if workspaceID == "" {
 		return
 	}
-
-	c.Set("workspace_id", workspaceID)
 
 	if claimsVal, exists := c.Get("claims"); exists {
 		switch claims := claimsVal.(type) {
@@ -862,8 +847,8 @@ func stringFromAny(value interface{}) string {
 
 // setContextValues sets user information in Gin context
 func setContextValues(c *gin.Context, claims jwt.MapClaims, userInfo *UserInfo) {
-	// Phase 6: workspace_id is canonical and the only identity context key.
-	c.Set("workspace_id", userInfo.WorkspaceID)
+	// Phase 6: the workspace is carried only by the tenancy context, which
+	// AuthMiddleware sets after its checks; the legacy "workspace_id" key is gone.
 	if userInfo.WorkspaceMembershipID != "" {
 		c.Set("workspace_membership_id", userInfo.WorkspaceMembershipID)
 	}
@@ -942,6 +927,9 @@ func WebSocketAuthMiddleware() gin.HandlerFunc {
 
 		// Validate the token
 		claims, err := validateJWTToken(tokenString, cfg)
+		if err == nil && sessionRevoked(claims) {
+			err = fmt.Errorf("session has been revoked")
+		}
 		if err != nil {
 			fmt.Printf("Token validation error: %v\n", err)
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired token"})
@@ -953,8 +941,12 @@ func WebSocketAuthMiddleware() gin.HandlerFunc {
 		c.Set("claims", claims)
 
 		// Extract and set individual claims
+		// The workspace of the verified token, as the tenancy context.
 		if workspaceID, ok := claims["workspace_id"].(string); ok {
-			c.Set("workspace_id", workspaceID)
+			if ws, err := uuid.Parse(workspaceID); err == nil && ws != uuid.Nil {
+				uid, _ := uuid.Parse(stringFromAny(claims["sub"]))
+				tenancy.Set(c, tenancy.Context{WorkspaceID: ws, PrincipalID: uid, PrincipalKind: "user"})
+			}
 		}
 		if clientID, ok := claims["client_id"].(string); ok {
 			c.Set("client_id", clientID)
@@ -979,16 +971,3 @@ func WebSocketAuthMiddleware() gin.HandlerFunc {
 	}
 }
 
-// ExtractTenantFromPath is a middleware that extracts the workspace_id from the URL path
-// and sets it in the Gin context. Phase 5.1 renamed the URL param from :workspace_id to
-// :workspace_id; the function name is kept (deprecated) to avoid churning route
-// registrations — Phase 10 sweeps it.
-func ExtractTenantFromPath() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		workspaceID := c.Param("workspace_id")
-		if workspaceID != "" {
-			c.Set("workspace_id", workspaceID)
-		}
-		c.Next()
-	}
-}

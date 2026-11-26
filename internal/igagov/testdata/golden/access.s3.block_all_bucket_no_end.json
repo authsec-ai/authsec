@@ -1,0 +1,1 @@
+{"Statement":[{"Action":"s3:*","Effect":"Deny","Resource":"arn:aws:s3:::acme-invoices/*","Sid":"AuthSecAccessObjects"},{"Action":"s3:*","Effect":"Deny","Resource":"arn:aws:s3:::acme-invoices","Sid":"AuthSecAccessBucket"}],"Version":"2012-10-17"}

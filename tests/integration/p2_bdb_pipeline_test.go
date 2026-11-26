@@ -61,7 +61,7 @@ func TestP2BdbSwitchOffLeavesTheIdleBarrier(t *testing.T) {
 	jobs := l.count(`SELECT count(*) FROM iga_projection_job WHERE workspace_id = ?`, l.ws)
 	pubs := l.count(`SELECT count(*) FROM iga_publication WHERE workspace_id = ?`, l.ws)
 
-	l.gate = services.NewGraphProjectionGate(false, "") // S2 -> S1: the switch turned off
+	l.gate = services.NewGraphProjectionGate(false) // S2 -> S1: the switch turned off
 	time.Sleep(10 * time.Millisecond)
 	for _, owner := range []string{"scan-worker-off-a", "scan-worker-off-b"} {
 		if run := l.scan(a, owner); run.Status != models.CloudScanRunPublished {

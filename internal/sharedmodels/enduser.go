@@ -80,7 +80,7 @@ type User struct {
 	Name             string         `json:"name"`
 	Username         *string        `json:"username,omitempty" gorm:"type:text"`
 	Email            string         `json:"email" gorm:"type:text;not null;uniqueIndex:idx_users_email_tenant"`
-	PasswordHash     string         `json:"password_hash,omitempty"`
+	PasswordHash     string         `json:"-"` // never serialized
 	WorkspaceDomain     string         `json:"workspace_domain" gorm:"type:text;not null"`
 	Provider         string         `json:"provider" gorm:"type:text;not null;index:idx_users_provider"`
 	ProviderID       string         `json:"provider_id" gorm:"type:text;not null;index:idx_users_provider"`

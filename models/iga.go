@@ -456,6 +456,10 @@ const (
 	// provider-neutral by design (SPEC §1.5) — and is partitioned only by this
 	// column.
 	ProviderK8s = "k8s"
+	// ProviderAzure is Microsoft Entra and Azure Resource Manager, projected
+	// from Azure discovery (internal/azuregraph). Same string as
+	// CloudProviderAzure, the cloud_connector provider it comes from.
+	ProviderAzure = "azure"
 )
 
 // IGAIdentityAccount is a programmatic principal. Never a credential, and never

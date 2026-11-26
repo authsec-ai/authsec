@@ -22,27 +22,37 @@ import (
 //     real; the set is not known to be whole. That is `partial`, and partial
 //     blocks deletion (§1.4). Reported as *ItemFailures.
 //
-//   - The service is not offered in the region at all. That is `unsupported`,
-//     which blocks nothing because nothing there is claimed (§1.4). Reported as
-//     ErrServiceNotInRegion.
+//   - AWS documents the service as absent from the region. That is
+//     `unsupported`, which blocks nothing because nothing there is claimed
+//     (§1.4). Reported as ErrServiceNotInRegion. A name that fails to resolve
+//     is NOT that answer unless the service/region pair is documented absent;
+//     it is ErrEndpointUnreachable, and partial.
 //
 // Both are returned as the reader's ERROR, beside whatever rows were read, so
 // no caller can mistake either for a clean read.
 
-// ErrServiceNotInRegion means the service's regional endpoint does not exist:
-// the name does not resolve (NXDOMAIN). AWS publishes an endpoint for every
-// region a service is offered in, so a regional endpoint that does not resolve
-// is the one unambiguous, table-free signal that the service is not offered
-// there. A static service/region table is the alternative and goes stale for
-// the same reason onboarding.go refuses a region allow-list.
+// ErrServiceNotInRegion means AWS documents the service as absent from the
+// region AND its regional endpoint does not resolve (EndpointNotOffered: a
+// definitive name-not-found for a host whose service/region pair is in the
+// documented-absent table, resource_policy_regions.go). It is NOT inferred
+// from a name that fails to resolve alone: a failing resolver, split-horizon
+// DNS or a DNS firewall produce the same NXDOMAIN for an endpoint that exists,
+// and a false "unsupported" licenses deletion and the first-attachment proof.
 //
-// Deliberately NOT inferred from AccessDenied or InvalidClientTokenId: an SCP
-// or a region opt-out produces those too (§2.14.13), and a false "unsupported"
-// is a state that licenses deletion.
+// Deliberately NOT inferred from AccessDenied or InvalidClientTokenId either:
+// an SCP or a region opt-out produces those too (§2.14.13).
 var ErrServiceNotInRegion = errors.New("the service is not offered in this region")
 
-// listErr classifies the error of a LIST call against a regional endpoint: an
-// endpoint that does not resolve is ErrServiceNotInRegion; anything else is
+// ErrEndpointUnreachable means the call never reached AWS: the name did not
+// resolve (and AWS does not document the service as absent there), the
+// resolver or connection timed out, or the connection failed. What the call
+// would have listed is unknown, so coverage is partial and every reader
+// treats the surface as not analysed -- never as "nothing there".
+var ErrEndpointUnreachable = errors.New("the service endpoint could not be reached")
+
+// listErr classifies the error of a LIST call against a regional endpoint:
+// AWS's documented "not offered in this region" is ErrServiceNotInRegion; a
+// resolver or connection failure is ErrEndpointUnreachable; anything else is
 // classify()'d exactly as before (ErrThrottled stays ErrThrottled, so the
 // state an ordinary denial or throttle maps to does not change). Either way
 // the call is NAMED, so coverage can stamp which call failed and AWS's own
@@ -55,10 +65,15 @@ func listErr(call string, err error) error {
 	if err == nil {
 		return nil
 	}
-	var dns *net.DNSError
-	if errors.As(err, &dns) && dns.IsNotFound {
+	if EndpointNotOffered(err) {
+		var dns *net.DNSError
+		errors.As(err, &dns)
 		return &namedCallError{call: call, raw: err,
 			classified: fmt.Errorf("%w: %s does not resolve", ErrServiceNotInRegion, dns.Name)}
+	}
+	if code := resolverCode(err); code != "" {
+		return &namedCallError{call: call, raw: err,
+			classified: fmt.Errorf("%w (%s): %v", ErrEndpointUnreachable, code, err)}
 	}
 	return withCallName(call, err)
 }
@@ -107,6 +122,8 @@ func ErrorCode(err error) string {
 		return apiErr.ErrorCode()
 	case errors.Is(err, ErrServiceNotInRegion):
 		return "ServiceNotInRegion"
+	case resolverCode(err) != "":
+		return resolverCode(err)
 	case errors.Is(err, ErrActivityJobFailed):
 		return "JobFailed"
 	case errors.Is(err, ErrActivityJobTimeout):

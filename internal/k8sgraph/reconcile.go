@@ -294,6 +294,7 @@ func (rc *Reconciler) retireUnsupported(tx *gorm.DB, in ReconcileInput, at time.
 		// NOT EXISTS over non-ended support is the multi-source rule (§2.10B)
 		// stated once, in SQL, rather than counted in Go where a miscount
 		// deletes a customer's graph.
+		// TENANT-EXEMPT: bound to the workspace and run on the caller's tenancy.RLSTransaction (k8s projection, DeleteSource)
 		r := tx.Exec(`
 			UPDATE `+t.table+` o
 			   SET lifecycle = ?, retired_reason = ?
@@ -339,6 +340,7 @@ func (rc *Reconciler) retireUnsupported(tx *gorm.DB, in ReconcileInput, at time.
 // clusters, passes the provider prefix alone.
 func (rc *Reconciler) cascade(tx *gorm.DB, ws uuid.UUID, clusterPrefix, table, supportCol,
 	reason string, at time.Time) error {
+	// TENANT-EXEMPT: bound to the workspace and run on the caller's tenancy.RLSTransaction (k8s projection, DeleteSource)
 	retired := `SELECT id FROM ` + table + `
 	             WHERE workspace_id = ? AND provider = ? AND lifecycle = ?
 	               AND left(source_key, ?) = ?`
@@ -426,6 +428,7 @@ func (rc *Reconciler) cascade(tx *gorm.DB, ws uuid.UUID, clusterPrefix, table, s
 		// additionally required to be a Kubernetes binding of the same cluster,
 		// which every assignment a Kubernetes grant points at is (the projector
 		// resolves it by this cluster's binding key).
+		// TENANT-EXEMPT: bound to the workspace and run on the caller's tenancy.RLSTransaction (k8s projection, DeleteSource)
 		if err := tx.Exec(`
 			UPDATE iga_access_edges e
 			   SET state = ?, valid_to = ?, ended_reason = ?
@@ -482,6 +485,7 @@ func RetireSource(tx *gorm.DB, workspaceID, sourceID uuid.UUID, at time.Time) (i
 
 	// Which objects this source supported, captured before its support ends.
 	for _, t := range nodeTables {
+		// TENANT-EXEMPT: bound to the workspace and run on the caller's tenancy.RLSTransaction (k8s projection, DeleteSource)
 		r := tx.Exec(`
 			UPDATE `+t.table+` o
 			   SET lifecycle = ?, retired_reason = ?

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"log"
 	"os"
 	"runtime/debug"
@@ -34,7 +35,7 @@ import (
 // are not given no-op handlers; only the periodic kinds the scheduler
 // produces are, so their rows do not pile up -- see RegisterPolicyJobNoops).
 //
-// It is started from cmd/main.go only when IGA_POLICY=on and the Phase 3
+// It is started from cmd/main.go only when policy available and the Phase 3
 // schema verified, and claims nothing while the gate reads unavailable.
 type PolicyJobWorker struct {
 	db    *gorm.DB
@@ -355,6 +356,7 @@ func (w *PolicyJobWorker) Sweep() {
 	} else if len(failed) > 0 {
 		log.Printf("[policy-worker] %d job(s) failed: lease expired with no attempts left", len(failed))
 		for _, j := range failed {
+			log.Printf("[policy-worker] workspace %s: %s %s failed: lease expired with no attempts left", j.WorkspaceID, j.Kind, j.ID)
 			w.exhausted(j, j.LastError)
 		}
 	}
@@ -426,7 +428,7 @@ func (w *PolicyJobWorker) execute(parent context.Context, job *models.IGAGovJob)
 					return
 				}
 				if err != nil {
-					log.Printf("[policy-worker] renew %s %s: %v", job.Kind, job.ID, err)
+					log.Printf("[policy-worker] workspace %s: renew %s %s: %v", job.WorkspaceID, job.Kind, job.ID, err)
 				}
 			}
 		}
@@ -455,8 +457,8 @@ func (w *PolicyJobWorker) finish(parent context.Context, k PolicyJobKind, run *P
 	var werr error
 	switch {
 	case run.lost() || errors.Is(err, repositories.ErrPolicyJobLeaseLost):
-		log.Printf("[policy-worker] %s %s: lease lost at version %d; another worker owns it, nothing more written",
-			job.Kind, job.ID, fence.Version)
+		log.Printf("[policy-worker] workspace %s: %s %s: lease lost at version %d; another worker owns it, nothing more written",
+			job.WorkspaceID, job.Kind, job.ID, fence.Version)
 		return
 	case err == nil:
 		werr = w.jobs.Complete(fence)
@@ -472,7 +474,7 @@ func (w *PolicyJobWorker) finish(parent context.Context, k PolicyJobKind, run *P
 		if k.Backoff != nil {
 			backoff = k.Backoff(job.Attempts)
 		}
-		log.Printf("[policy-worker] %s %s attempt %d/%d failed: %v", job.Kind, job.ID, job.Attempts, job.MaxAttempts, err)
+		log.Printf("[policy-worker] workspace %s: %s %s attempt %d/%d failed: %v", job.WorkspaceID, job.Kind, job.ID, job.Attempts, job.MaxAttempts, err)
 		werr = w.jobs.Fail(fence, err.Error(), backoff)
 		if werr == nil && job.Attempts >= job.MaxAttempts {
 			// Fail decided terminal from the same counters (attempts at
@@ -481,7 +483,7 @@ func (w *PolicyJobWorker) finish(parent context.Context, k PolicyJobKind, run *P
 		}
 	}
 	if werr != nil && !errors.Is(werr, repositories.ErrPolicyJobLeaseLost) {
-		log.Printf("[policy-worker] %s %s: recording the outcome: %v", job.Kind, job.ID, werr)
+		log.Printf("[policy-worker] workspace %s: %s %s: recording the outcome: %v", job.WorkspaceID, job.Kind, job.ID, werr)
 	}
 }
 
@@ -496,7 +498,7 @@ func (w *PolicyJobWorker) exhausted(job models.IGAGovJob, lastError string) {
 	defer cancel()
 	defer func() {
 		if p := recover(); p != nil {
-			log.Printf("[policy-worker] %s %s exhausted hook panic: %v", job.Kind, job.ID, p)
+			log.Printf("[policy-worker] workspace %s: %s %s exhausted hook panic: %v", job.WorkspaceID, job.Kind, job.ID, p)
 		}
 	}()
 	k.OnExhausted(ctx, job, lastError)
@@ -539,17 +541,31 @@ func (r *PolicyJobRun) lost() bool {
 	return r.isLost
 }
 
-// DB is the worker's database, for READS. Writes go through InTx.
-func (r *PolicyJobRun) DB() *gorm.DB { return r.db }
+// DB is the worker's base database handle. Prefer ReadTx for reads and InTx
+// for writes: statements on DB are not under row-level security.
+func (r *PolicyJobRun) DB() *gorm.DB {
+	// TENANT-EXEMPT: the base handle for job handlers not yet moved to
+	// ReadTx/InTx (AS-108); it runs no statement itself.
+	return r.db
+}
+
+// ReadTx runs fn in one read-only transaction under row-level security for
+// the job's workspace (no fence: reads only). Do not make external calls in
+// fn.
+func (r *PolicyJobRun) ReadTx(ctx context.Context, fn func(tx *gorm.DB) error) error {
+	return tenancy.InWorkspaceRead(ctx, r.db, r.Job.WorkspaceID, fn)
+}
 
 // Jobs is the job repository (to enqueue follow-up jobs inside InTx).
 func (r *PolicyJobRun) Jobs() repositories.IGAGovJobRepository { return r.jobs }
 
 // InTx runs fn in one transaction that first locks the job row and proves the
 // fence (AssertOwnedTx): every write the job makes is fenced, and a reclaim
-// waits for this transaction rather than racing it.
+// waits for this transaction rather than racing it. The transaction runs
+// under row-level security for the job's workspace: nothing a job does can
+// read or write another workspace's rows.
 func (r *PolicyJobRun) InTx(ctx context.Context, fn func(tx *gorm.DB) error) error {
-	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	return tenancy.InWorkspace(ctx, r.db, r.Job.WorkspaceID, func(tx *gorm.DB) error {
 		if err := r.jobs.AssertOwnedTx(tx, r.Fence); err != nil {
 			if errors.Is(err, repositories.ErrPolicyJobLeaseLost) {
 				r.markLost()
@@ -680,6 +696,11 @@ func NewDefaultPolicyJobWorker(db *gorm.DB) *PolicyJobWorker {
 	// (cloud_enforcement_binding_jobs.go; the self-tester is installed by
 	// NewProductionGovDeployEnv).
 	RegisterEnforcementBindingJobs(w)
+	// R2: temp_grant, session_revoke and time_bound with their schedules
+	// (each handler and schedule checks R2 is available).
+	RegisterR2Jobs(w, db)
+	// Agent runtime visibility P3: agent_contain and its schedule.
+	RegisterAgentContainJobs(w, db)
 	return w
 }
 

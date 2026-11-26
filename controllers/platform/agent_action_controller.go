@@ -6,6 +6,7 @@ import (
 	"strconv"
 
 	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/services"
@@ -64,7 +65,7 @@ func (ctrl *AgentActionController) EvaluateAction(c *gin.Context) {
 		userEmail = email.(string)
 	}
 	workspaceIDStr := ""
-	if tid, exists := c.Get("workspace_id"); exists {
+	if tid, exists := middlewares.WorkspaceValue(c); exists {
 		workspaceIDStr = tid.(string)
 	}
 
@@ -115,7 +116,14 @@ func (ctrl *AgentActionController) PollActionStatus(c *gin.Context) {
 		return
 	}
 
-	resp, err := ctrl.actionService.PollActionStatus(actionReqID)
+	// Only a request of the caller's workspace is found (token's workspace).
+	workspaceID, err := tenancy.Workspace(c)
+	if err != nil {
+		c.JSON(tenancy.HTTPStatus(err), gin.H{"error": "workspace not resolved"})
+		return
+	}
+
+	resp, err := ctrl.actionService.PollActionStatus(workspaceID, actionReqID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to poll action status", "details": err.Error()})
 		return
@@ -154,7 +162,7 @@ func (ctrl *AgentActionController) RespondToAction(c *gin.Context) {
 	}
 	userID, _ := uuid.Parse(userIDStr)
 
-	workspaceIDStr, _ := c.Get("workspace_id")
+	workspaceIDStr, _ := middlewares.WorkspaceValue(c)
 	workspaceID, _ := uuid.Parse(fmt.Sprintf("%v", workspaceIDStr))
 
 	approverEmail := ""
@@ -479,7 +487,7 @@ func (ctrl *AgentActionController) GetAuditLog(c *gin.Context) {
 // ========================================
 
 func (ctrl *AgentActionController) getWorkspaceID(c *gin.Context) uuid.UUID {
-	workspaceIDStr, exists := c.Get("workspace_id")
+	workspaceIDStr, exists := middlewares.WorkspaceValue(c)
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id not found"})
 		return uuid.Nil

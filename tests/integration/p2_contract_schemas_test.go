@@ -275,6 +275,7 @@ var contractWorkloadDetail = contractExtend(contractWorkloadRow,
 		contractReq("decided_by", contractDecidedBy),
 		contractReq("decided_at", contractTime),
 	))),
+	contractOpt("agent_runtime", contractAgentRuntime), // additive (agent runtime visibility)
 )
 
 // The identity brief every tab row names an identity with.
@@ -559,6 +560,7 @@ func contractIdentityDetailData(kind string) contractShape {
 		contractReq("immutable_key", contractStr),
 		contractReq("provider_attrs", contractObj(attrs...)),
 		contractReq("sources", contractArrMin(1, contractSource)),
+		contractOpt("agent_runtime", contractAgentRuntime), // additive (agent runtime visibility)
 	}
 	if kind == "iam_user" {
 		more = append(more, contractReq("credentials", contractArr(contractObj(
@@ -828,6 +830,33 @@ var contractResourceAccess = contractObj(
 	contractReq("meta", contractListMeta()),
 )
 
+/* ------------------------------ agent runtime ------------------------------ */
+
+// An AWS identity's or workload's agent-runtime picture (agent_runtime.go),
+// additive and optional on graph nodes and on the identity and workload
+// details: present only when there is something to say.
+var contractAgentRuntime = contractObj(
+	contractReq("label", contractNullable(contractEnum("possible_ai_workload", "ai_workload", "suggested_agent", "agent"))),
+	contractReq("model_calls", contractNullable(contractObj(
+		contractReq("calls", contractInt),
+		contractReq("denied", contractInt),
+		contractReq("last_call_at", contractNullable(contractTime)),
+		contractReq("models", contractArr(contractObj(contractReq("model", contractNonEmpty), contractReq("calls", contractInt)))),
+	))),
+	contractReq("open_alerts", contractObj(contractReq("count", contractInt),
+		contractReq("highest_severity", contractNullable(contractEnum("high", "medium"))))),
+	contractReq("open_findings", contractInt),
+	contractReq("suggestion", contractNullable(contractObj(contractReq("id", contractNonEmpty),
+		contractReq("state", contractEnum("pending", "confirmed", "dismissed", "superseded"))))),
+	contractReq("containment", contractNullable(contractObj(contractReq("id", contractNonEmpty),
+		contractReq("level", contractEnum("identity", "model", "workload")),
+		contractReq("state", contractEnum("previewed", "containing", "contained", "partially_contained", "releasing")),
+		contractReq("effective", contractNullable(contractBool))))),
+)
+
+// A grant edge of an identity under a containment in force.
+var contractContained = contractObj(contractReq("id", contractNonEmpty), contractReq("level", contractEnum("identity", "model")))
+
 /* ---------------------------------- graph ---------------------------------- */
 
 var contractRestrictions = contractObj(
@@ -853,11 +882,12 @@ var contractGraphNode = contractFunc(func(path string, v any, errs *[]string) {
 	switch typ {
 	case "workload":
 		more = []contractField{contractReq("kind", contractConst("workload")), contractReq("account", contractAccount),
-			contractReq("arn", contractNonEmpty), contractReq("runtime_kind", contractRuntimeKind)}
+			contractReq("arn", contractNonEmpty), contractReq("runtime_kind", contractRuntimeKind),
+			contractOpt("agent_runtime", contractAgentRuntime)}
 	case "identity":
 		more = []contractField{contractReq("kind", contractIdentityKind), contractReq("account", contractAccount),
 			contractReq("arn", contractNonEmpty), contractReq("restrictions", contractRestrictions),
-			contractReq("used_by_count", contractExact)}
+			contractReq("used_by_count", contractExact), contractOpt("agent_runtime", contractAgentRuntime)}
 	case "statement":
 		// No account: statements have none (D-36).
 		more = []contractField{contractReq("kind", contractConst("statement")), contractReq("policy", contractNonEmpty),
@@ -891,7 +921,7 @@ var contractGraphEdge = contractFunc(func(path string, v any, errs *[]string) {
 		more = append(more, contractReq("mechanism", contractMechanism))
 	case "grant":
 		claimType = "grant"
-		more = append(more, contractReq("policy", contractNonEmpty))
+		more = append(more, contractReq("policy", contractNonEmpty), contractOpt("contained", contractContained))
 	case "target":
 		claimType = "target"
 		more = append(more, contractReq("mode", contractConst("resource")))
@@ -1080,10 +1110,36 @@ var contractCapabilities = contractObj(contractReq("data", contractObj(
 	contractReq("schema_head", contractNullable(contractNonEmpty)),
 	// Phase 3 (SPEC-iga-phase3-policy.md §4.3, T3.02).
 	contractReq("policy", contractPolicyCapabilities),
+	// Agent runtime visibility P3 (SPEC-agent-runtime-visibility.md §10 Q4).
+	contractOpt("agent_containment", contractAgentContainCapabilities),
+	// Agent runtime visibility: alerts (150) and the runtime routes (147-149, 153).
+	contractOpt("agent_alerts", contractAgentSchemaCapabilities),
+	contractOpt("agent_runtime", contractAgentSchemaCapabilities),
 )))
 
-// The /capabilities policy block (§4.3): the IGA_POLICY gate, one boolean per
-// feature with a reason for each false one, and provider support.
+// The /capabilities agent_alerts and agent_runtime blocks: available, and the
+// reason when not.
+var contractAgentSchemaCapabilities = contractObj(
+	contractReq("available", contractBool), contractReq("reason", contractNullable(contractNonEmpty)),
+)
+
+// The /capabilities agent_containment block: the server's state and, per AWS
+// account, the identity/model levels and the workload level
+// (EnableWorkloadContainment), each with its reason when unavailable.
+var contractAgentContainCapabilities = contractObj(
+	contractReq("available", contractBool), contractReq("reason", contractNullable(contractNonEmpty)),
+	contractReq("levels", contractArrMin(1, contractNonEmpty)),
+	contractReq("workload_containment", contractObj(contractReq("available", contractBool),
+		contractReq("reason", contractNullable(contractNonEmpty)))),
+	contractReq("accounts", contractArr(contractObj(
+		contractReq("connector_id", contractNonEmpty), contractReq("account_id", contractNonEmpty),
+		contractReq("identity_and_model", contractBool), contractOpt("identity_and_model_reason", contractNonEmpty),
+		contractReq("workload_containment", contractBool), contractOpt("workload_containment_reason", contractNonEmpty)))),
+)
+
+// The /capabilities policy block (§4.3): the policy gate, one boolean per
+// feature with a reason for each false one (R1b, R2 and R3 included), the
+// access-policy block, and provider support.
 var contractPolicyCapabilities = contractObj(
 	contractReq("state", contractEnum("on", "off", "misconfigured")),
 	contractReq("reason", contractNullable(contractNonEmpty)),
@@ -1091,6 +1147,17 @@ var contractPolicyCapabilities = contractObj(
 	contractReq("findings", contractBool), contractReq("proposals", contractBool),
 	contractReq("export", contractBool), contractReq("iac", contractBool),
 	contractReq("enforcement", contractBool), contractReq("slack", contractBool),
+	contractReq("actions", contractBool),
+	contractReq("temporary_grants", contractBool), contractReq("session_revoke", contractBool),
+	contractReq("time_bound", contractBool), contractReq("lambda_split_direct", contractBool),
+	contractReq("runtime_controls", contractBool), contractReq("brokered_sessions", contractBool),
+	contractOpt("access_policies", contractObj(
+		contractReq("available", contractBool), contractReq("reason", contractNullable(contractNonEmpty)),
+		contractReq("resource_types", contractArrMin(1, contractNonEmpty)), contractReq("block_only", contractArr(contractNonEmpty)),
+		contractReq("types", contractArrMin(1, contractObj(contractReq("type", contractNonEmpty), contractReq("service", contractNonEmpty),
+			contractReq("noun", contractNonEmpty), contractReq("prefix", contractBool), contractReq("block_only", contractBool),
+			contractReq("allow_levels", contractArr(contractNonEmpty)), contractReq("levels", contractArrMin(1, contractNonEmpty))))),
+		contractReq("k8s", contractObj(contractReq("available", contractBool), contractReq("reason", contractNullable(contractNonEmpty)))))),
 	contractReq("reasons", contractMap(contractNonEmpty)),
 	contractReq("providers", contractObj(
 		contractReq("aws", contractConst("supported")), contractReq("k8s", contractConst("not_supported")))),

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 	"github.com/authsec-ai/authsec/services"
 	"github.com/gin-gonic/gin"
@@ -267,6 +268,13 @@ func (ctrl *ScopeMatrixController) ListScopes(c *gin.Context) {
 	rsUUID, err := uuid.Parse(rsID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid resource server ID"})
+		return
+	}
+
+	// Another workspace's resource server is not found, before anything
+	// (including the permission backfill below, which writes) runs.
+	if _, err := ctrl.rsService.GetByIDAndTenant(rsUUID.String(), workspaceID.String()); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
 		return
 	}
 
@@ -561,9 +569,10 @@ func (ctrl *ScopeMatrixController) UpdateToolScopeMap(c *gin.Context) {
 		} else {
 			// Correctness fix #7: upsert with source='admin_override' and auto_matched=false.
 			// FirstOrCreate kept the old auto_matched=true value on conflict — this fixes that.
-			config.DB.Exec(`
-				INSERT INTO mcp_tool_scope_map (tool_id, scope_id, auto_matched, source)
-				VALUES (?, ?, false, 'admin_override')
+			tenancy.GormExec(c.Request.Context(), config.DB, `
+				INSERT INTO mcp_tool_scope_map (workspace_id, tool_id, scope_id, auto_matched, source)
+				SELECT t.workspace_id, t.id, $3, false, 'admin_override'
+				  FROM mcp_tools t WHERE t.workspace_id = $1 AND t.id = $2
 				ON CONFLICT (tool_id, scope_id)
 				DO UPDATE SET source = 'admin_override', auto_matched = false
 			`, toolID, scopeID)
@@ -908,9 +917,10 @@ func (ctrl *ScopeMatrixController) PutSDKManifest(c *gin.Context) {
 				} else if findScopeErr != nil {
 					return fmt.Errorf("find manifest scope %s: %w", scopeStr, findScopeErr)
 				}
-				if err := tx.Exec(`
-					INSERT INTO mcp_tool_scope_map (tool_id, scope_id, auto_matched, source)
-					VALUES (?, ?, true, 'sdk_suggested')
+				if err := tenancy.GormExec(inWorkspace(rs.WorkspaceID), tx, `
+					INSERT INTO mcp_tool_scope_map (workspace_id, tool_id, scope_id, auto_matched, source)
+					SELECT t.workspace_id, t.id, $3, true, 'sdk_suggested'
+					  FROM mcp_tools t WHERE t.workspace_id = $1 AND t.id = $2
 					ON CONFLICT (tool_id, scope_id) DO NOTHING
 				`, tool.ID, scope.ID).Error; err != nil {
 					return fmt.Errorf("map manifest scope %s to %s: %w", scopeStr, name, err)
@@ -1071,6 +1081,11 @@ func (ctrl *ScopeMatrixController) Activate(c *gin.Context) {
 	userID := extractUserIDRequired(c)
 	if userID == nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "user_id required"})
+		return
+	}
+
+	if _, err := ctrl.rsService.GetByIDAndTenant(rsID.String(), workspaceID.String()); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "resource server not found"})
 		return
 	}
 
@@ -3387,39 +3402,6 @@ func (ctrl *ScopeMatrixController) AccessChangePreview(c *gin.Context) {
 		},
 		"warnings":      []string{},
 		"safe_to_apply": true,
-	})
-}
-
-func (ctrl *ScopeMatrixController) EvidenceExport(c *gin.Context) {
-	workspaceID, err := extractWorkspaceID(c)
-	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required in JWT"})
-		return
-	}
-	rs, err := ctrl.rsService.GetByIDAndTenant(c.Param("id"), workspaceID.String())
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "application not found"})
-		return
-	}
-	var toolsCount, scopesCount, rolesCount, bindingsCount int64
-	config.DB.Table("mcp_tools").Where("workspace_id = ? AND resource_server_id = ?", workspaceID, rs.ID).Count(&toolsCount)
-	config.DB.Table("oauth_scopes").Where("workspace_id = ? AND resource_server_id = ?", workspaceID, rs.ID).Count(&scopesCount)
-	config.DB.Table("roles").Where("workspace_id = ? AND name LIKE ?", workspaceID, "rs-"+rs.ID.String()+":%").Count(&rolesCount)
-	config.DB.Table("role_bindings rb").
-		Joins("JOIN roles r ON r.id = rb.role_id").
-		Where("rb.workspace_id = ? AND r.name LIKE ?", workspaceID, "rs-"+rs.ID.String()+":%").
-		Count(&bindingsCount)
-	c.JSON(http.StatusAccepted, gin.H{
-		"export_id":    uuid.NewString(),
-		"status":       "ready",
-		"generated_at": time.Now().UTC().Format(time.RFC3339),
-		"application":  accessApplicationRef{ID: rs.ID.String(), Name: rs.Name, ResourceURI: rs.ResourceURI},
-		"evidence": gin.H{
-			"tools":              toolsCount,
-			"access_labels":      scopesCount,
-			"application_roles":  rolesCount,
-			"access_assignments": bindingsCount,
-		},
 	})
 }
 

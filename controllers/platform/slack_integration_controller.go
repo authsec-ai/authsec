@@ -17,7 +17,7 @@ import (
 )
 
 // The Slack app routes, SPEC-iga-phase3-policy.md §7.11 (T3.14), under
-// /authsec/integrations/slack, behind the IGA_POLICY gate (§7 intro: every
+// /authsec/integrations/slack, behind the policy gate (§7 intro: every
 // Phase 3 route answers 503 policy_unavailable while it is off):
 //
 //	GET    /install          governance:enforce   Slack OAuth v2: the authorize URL; sets the install cookie
@@ -82,7 +82,7 @@ func MountSlackIntegrationRoutes(authsec gin.IRouter, ctl *SlackIntegrationContr
 	a.POST("/link/confirm", ctl.ConfirmLink)
 }
 
-// Gate is the IGA_POLICY middleware (fail closed).
+// Gate is the policy middleware (fail closed).
 func (ctl *SlackIntegrationController) Gate() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var gate *services.PolicyGate
@@ -99,8 +99,8 @@ func (ctl *SlackIntegrationController) Gate() gin.HandlerFunc {
 }
 
 func (ctl *SlackIntegrationController) configured(c *gin.Context) bool {
-	if ok, reason := ctl.service().Configured(); !ok {
-		policyErr(c, http.StatusServiceUnavailable, services.SlackCodeNotConfigured, reason, nil)
+	if ok, _ := ctl.service().Configured(); !ok {
+		policyErr(c, http.StatusServiceUnavailable, services.SlackCodeNotConfigured, services.SlackNotSetUp, nil)
 		return false
 	}
 	return true
@@ -112,6 +112,8 @@ func (ctl *SlackIntegrationController) member(c *gin.Context) (ws, user uuid.UUI
 	if !ok {
 		return
 	}
+	// TENANT-EXEMPT: not a statement here: humanActor reads through
+	// tenancy.QueryRowContext, bound to workspace_id = ws.
 	uid, err := humanActor(c, ctl.db, ws)
 	if err != nil {
 		if errors.Is(err, errNotWorkspaceHuman) {
@@ -287,6 +289,11 @@ func (ctl *SlackIntegrationController) Disconnect(c *gin.Context) {
 	}
 	before, err := ctl.service().Disconnect(c.Request.Context(), ws, user)
 	if err != nil {
+		if before != nil {
+			// Disconnected, but the token was not destroyed: audited as
+			// the disconnect it is, answered as the failure it is.
+			auditAdminMutation(c, ws.String(), "disconnect", "workspace_slack_integration", ws.String(), http.StatusBadGateway, before, nil)
+		}
 		govError(c, err)
 		return
 	}

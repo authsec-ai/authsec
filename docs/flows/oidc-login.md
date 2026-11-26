@@ -12,6 +12,7 @@
 3. Hydra login + consent → browser returns to AuthSec redirect_uri?code=...
 4. Client → POST /oauth/token (authorization_code)
 5. AuthSec → proxies to Hydra → validates context + RBAC → returns tokens
+   (with XAA_NATIVE_SEALER on, the access token is AuthSec-native)
 ```
 
 ## Step 1: Authorization request (`GET /oauth/authorize`)
@@ -49,7 +50,9 @@ Hydra redirects back to `redirect_uri?code=...&state=...`.
 
 Handler: `tokenAuthCodeGrant`.
 
-1. Rewrite `client_id → hydra_client_id`, proxy to Hydra `/oauth2/token`.
+1. Rewrite `client_id → hydra_client_id`, proxy to Hydra `/oauth2/token`. With the
+   native sealer on, `resource` and `audience` are not forwarded: Hydra is never asked
+   about an audience (consent grants it none either, `hmgr_controller.go`).
 2. Parse Hydra 200 response — capture `access_token` + `refresh_token`.
 3. **Introspect access token** via Hydra admin → extract `context_id` from session claims.
 4. **Lookup `auth_request_contexts`** by `context_id` — must be `consent_completed=true`,
@@ -62,13 +65,23 @@ Handler: `tokenAuthCodeGrant`.
    - Hydra downtime = fail closed (cannot verify permissions → deny).
 7. **Consume `auth_request_contexts`** atomically before returning.
 8. Strip `refresh_token` if client `SupportsRefreshToken=false`.
-9. Forward Hydra response to client.
+9. With the native sealer on, replace Hydra's access token with a native one
+   (`mintBrowserAccessToken`, family `auth_code`) and set `token_type`, `expires_in`
+   (1 hour) and `scope`. If minting fails, the Hydra set is revoked and the client gets
+   500. With the sealer off, forward Hydra's response as is.
 
 ## Token types returned
 
-- **`access_token`** — Hydra-minted JWT (`FamilyHydra`, not a native token). Validated
-  via Hydra introspect (not native path).
+- **`access_token`** — with `XAA_NATIVE_SEALER` on (production), an AuthSec-native
+  JWT (RFC 9068, `typ: at+jwt`, `native:` kid): `iss` = AuthSec's issuer, `sub` = the
+  user, `aud` = the RFC 8707 resource bound in the `AuthRequestContext`, `client_id`,
+  the issued `scope`, `tf=auth_code`, no `act` (the user authorised the client directly).
+  It has a `native_tokens` row, so resource servers introspect it on the native path and
+  the SDKs' issuer check passes. With the sealer off, Hydra's own token (`FamilyHydra`),
+  which a resource server cannot use (wrong issuer, no resource audience).
 - **`refresh_token`** — Hydra-minted, returned only if client registered with `offline_access`.
+  The native access token's row links to it by SHA-256 (`source_grant_jti`,
+  `source_grant_iss='urn:authsec:hydra-refresh-token'`; never in the JWT).
 - **`id_token`** — Hydra-minted OIDC ID token (when `openid` scope granted).
 
 ## Refresh token flow (`POST /oauth/token`, `grant_type=refresh_token`)
@@ -77,10 +90,22 @@ Handler: `tokenRefreshGrant`.
 
 Same fail-closed RBAC enforcement pattern:
 1. Validate `resource` (cannot widen audience on refresh).
-2. Proxy to Hydra (rewrite client_id).
+2. Proxy to Hydra (rewrite client_id; with the sealer on, without `resource`/`audience`).
 3. Admin-introspect new access token → get issued scope + sub.
 4. `ScopeResolver.ResolveGrantableScopes` — strict-subset check.
 5. Scope loss → revoke new token set + `insufficient_scope`.
+6. With the sealer on: the refreshed grant's `ext.resource_server_id` must equal the
+   resource's (else `invalid_target`); a new native token is minted, linked to the new
+   refresh token, and the native token linked to the presented (rotated) one is revoked.
+
+**Revocation (RFC 7009 §2.1).** `POST /oauth/revoke` with a refresh token also revokes
+the native access token linked to it (`RevokeAuthCodeTokensForRefresh`).
+
+**Userinfo (OIDC Core §5.3).** `/oauth/userinfo` accepts the native access token when
+its scope includes `openid`; claims come from the user record (`EnrichUserinfoClaims`).
+
+**Sessions consented before this change** carry the audience Hydra stored at consent
+and fail to refresh at Hydra ("not whitelisted"). The user signs in again once.
 
 ## When you're building
 

@@ -1,6 +1,8 @@
 package igagraph
 
 import (
+	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"time"
@@ -9,6 +11,7 @@ import (
 	"github.com/lib/pq"
 	"gorm.io/gorm"
 
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/models"
 )
 
@@ -44,13 +47,17 @@ func (rc *Reconciler) Reconcile(tx *gorm.DB, snap *Snapshot, ex Exclusions, even
 	if events != nil {
 		at = events.At()
 	}
+	ut, err := loadUnreadableTargets(tx, snap.Run.WorkspaceID, ex.UnreadablePolicies)
+	if err != nil {
+		return fmt.Errorf("reconcile: unreadable policies: %w", err)
+	}
 	for _, part := range Partitions(snap) {
 		stale := !rc.canEnd(snap, part)
 		var err error
 		if part.Target == "" {
-			err = rc.reconcileNodes(tx, part, snap, ex, stale)
+			err = rc.reconcileNodes(tx, part, snap, ex, ut, stale)
 		} else {
-			err = rc.reconcileEdges(tx, part, snap, ex, stale, at)
+			err = rc.reconcileEdges(tx, part, snap, ex, ut, stale, at)
 		}
 		if err != nil {
 			return fmt.Errorf("reconcile %s: %w", part.Key(), err)
@@ -132,6 +139,45 @@ func (rc *Reconciler) ScopeForTest(tx *gorm.DB, part Partition, snap *Snapshot) 
 	return err
 }
 
+// unreadableTargets is what the unreadable policies of a run declared, read
+// once per Reconcile on its transaction: their statements, and the resources
+// those statements name. Never nil, so an empty set is the empty array and
+// matches nothing (a NULL array would make NOT (x = ANY(...)) NULL and keep
+// every row of the partition from ending).
+type unreadableTargets struct {
+	entitlements []uuid.UUID
+	resources    []uuid.UUID
+}
+
+// loadUnreadableTargets reads the statements of the workspace's unreadable
+// policies and the resources they name, through the tenancy layer.
+func loadUnreadableTargets(tx *gorm.DB, ws uuid.UUID, policies []uuid.UUID) (unreadableTargets, error) {
+	ut := unreadableTargets{entitlements: []uuid.UUID{}, resources: []uuid.UUID{}}
+	if len(policies) == 0 {
+		return ut, nil
+	}
+	ctx, q, err := txTenant(tx, ws)
+	if err != nil {
+		return ut, err
+	}
+	rows, err := tenancy.QueryContext(ctx, q, `SELECT id FROM iga_entitlements WHERE workspace_id = $1 AND policy_id = ANY($2)`,
+		pq.Array(policies))
+	if err != nil {
+		return ut, err
+	}
+	if ut.entitlements, err = scanIDs(rows, ut.entitlements); err != nil {
+		return ut, err
+	}
+	rows, err = tenancy.QueryContext(ctx, q, `SELECT DISTINCT t.resource_id FROM iga_entitlement_target t
+		  JOIN iga_entitlements e ON e.workspace_id = t.workspace_id AND e.id = t.entitlement_id
+		 WHERE t.workspace_id = $1 AND e.policy_id = ANY($2)`, pq.Array(policies))
+	if err != nil {
+		return ut, err
+	}
+	ut.resources, err = scanIDs(rows, ut.resources)
+	return ut, err
+}
+
 // protected returns the predicate for rows of this partition that an
 // UNREADABLE document declared. Exhaustive: every partition answers.
 //
@@ -140,13 +186,14 @@ func (rc *Reconciler) ScopeForTest(tx *gorm.DB, part Partition, snap *Snapshot) 
 // excludes them. So an unreadable document's statements, grants and the
 // support of resources only it names are never ended, while a genuinely
 // detached policy in the same account still ends.
-func protected(part Partition, ex Exclusions) (string, []any, bool) {
+//
+// ut is what the unreadable policies declared (loadUnreadableTargets): their
+// statements, and the resources those name.
+func protected(part Partition, ex Exclusions, ut unreadableTargets) (string, []any, bool) {
 	pol := ex.UnreadablePolicies
 	switch {
 	case part.Target == "access_edge":
-		return `entitlement_id IN (SELECT id FROM iga_entitlements
-		          WHERE workspace_id = iga_access_edges.workspace_id AND policy_id = ANY(?))`,
-			[]any{pq.Array(pol)}, len(pol) > 0
+		return `entitlement_id = ANY(?)`, []any{pq.Array(ut.entitlements)}, len(pol) > 0
 	case part.Target == "relationship" && part.RelationshipType == models.RelTypeCanAssume && part.Kind == "trust":
 		return `target_identity_account_id = ANY(?)`,
 			[]any{pq.Array(ex.UnreadableTrust)}, len(ex.UnreadableTrust) > 0
@@ -158,16 +205,11 @@ func protected(part Partition, ex Exclusions) (string, []any, bool) {
 		return `target_identity_account_id = ANY(?)`,
 			[]any{pq.Array(ex.UnattributedPodIdentity)}, len(ex.UnattributedPodIdentity) > 0
 	case part.Class == models.ObjectEntitlement:
-		return `entitlement_id IN (SELECT id FROM iga_entitlements
-		          WHERE workspace_id = iga_object_support.workspace_id AND policy_id = ANY(?))`,
-			[]any{pq.Array(pol)}, len(pol) > 0
+		return `entitlement_id = ANY(?)`, []any{pq.Array(ut.entitlements)}, len(pol) > 0
 	case part.Class == models.ObjectResource:
 		// A resource another statement still names is confirmed anyway; one
 		// named ONLY by an unreadable policy must not lose this source's support.
-		return `resource_id IN (SELECT t.resource_id FROM iga_entitlement_target t
-		          JOIN iga_entitlements e ON e.workspace_id = t.workspace_id AND e.id = t.entitlement_id
-		          WHERE t.workspace_id = iga_object_support.workspace_id AND e.policy_id = ANY(?))`,
-			[]any{pq.Array(pol)}, len(pol) > 0
+		return `resource_id = ANY(?)`, []any{pq.Array(ut.resources)}, len(pol) > 0
 	default:
 		// identities, workloads, policies (still listed), assignments
 		// (attachment lists are read independently of documents), member_of,
@@ -178,11 +220,11 @@ func protected(part Partition, ex Exclusions) (string, []any, bool) {
 
 // reconcileEdges: stale when we could not look, ended when we could and it was
 // not there. Protected rows first: stale, never ended.
-func (rc *Reconciler) reconcileEdges(tx *gorm.DB, part Partition, snap *Snapshot, ex Exclusions, stale bool, at time.Time) error {
+func (rc *Reconciler) reconcileEdges(tx *gorm.DB, part Partition, snap *Snapshot, ex Exclusions, ut unreadableTargets, stale bool, at time.Time) error {
 	if stale {
 		return rc.markStale(tx, part, snap, "")
 	}
-	if p, args, ok := protected(part, ex); ok {
+	if p, args, ok := protected(part, ex, ut); ok {
 		if err := rc.markStale(tx, part, snap, p, args...); err != nil {
 			return err
 		}
@@ -208,17 +250,22 @@ func (rc *Reconciler) reconcileCredentials(tx *gorm.DB, snap *Snapshot, at time.
 		return nil
 	}
 	col := models.SupportColumn(models.ObjectIdentity)
-	return tx.Exec(`
+	ctx, q, err := txTenant(tx, snap.Run.WorkspaceID)
+	if err != nil {
+		return err
+	}
+	_, err = tenancy.ExecContext(ctx, q, `
 		UPDATE iga_credentials c
-		   SET lifecycle = 'revoked', retired_reason = ?, updated_at = ?
-		 WHERE c.workspace_id = ? AND c.provider = ? AND c.lifecycle = ?
-		   AND c.last_seen_at < ?
+		   SET lifecycle = 'revoked', retired_reason = $2, updated_at = $3
+		 WHERE c.workspace_id = $1 AND c.provider = $4 AND c.lifecycle = $5
+		   AND c.last_seen_at < $3
 		   AND EXISTS (SELECT 1 FROM iga_object_support s
-		                WHERE s.workspace_id = c.workspace_id AND s.connector_id = ?
+		                WHERE s.workspace_id = c.workspace_id AND s.connector_id = $6
 		                  AND s.`+col+` = c.identity_account_id
-		                  AND s.last_confirmed_run_id = ?)`,
-		models.EndedNotSeen, at, snap.Run.WorkspaceID, models.ProviderAWS, models.LifecycleActive,
-		at, snap.Run.ConnectorID, snap.Run.ID).Error
+		                  AND s.last_confirmed_run_id = $7)`,
+		models.EndedNotSeen, at, models.ProviderAWS, models.LifecycleActive,
+		snap.Run.ConnectorID, snap.Run.ID)
+	return err
 }
 
 // markStale: we could not look at THIS partition. Rows this run DID confirm
@@ -259,7 +306,7 @@ func (rc *Reconciler) endOlderThan(tx *gorm.DB, part Partition, snap *Snapshot, 
 
 // reconcileNodes -- STEP 1: end this partition's SUPPORT, never the object. A
 // node touched here may still be held by another account (§2.10B).
-func (rc *Reconciler) reconcileNodes(tx *gorm.DB, part Partition, snap *Snapshot, ex Exclusions, stale bool) error {
+func (rc *Reconciler) reconcileNodes(tx *gorm.DB, part Partition, snap *Snapshot, ex Exclusions, ut unreadableTargets, stale bool) error {
 	col := models.SupportColumn(part.Class)
 	if col == "" {
 		return fmt.Errorf("no support column for node class %q", part.Class) // a programming error, never a no-op
@@ -276,7 +323,7 @@ func (rc *Reconciler) reconcileNodes(tx *gorm.DB, part Partition, snap *Snapshot
 		return base().Where("state = ?", models.RelCurrent).Update("state", models.RelStale).Error
 	}
 	q := base()
-	if p, args, ok := protected(part, ex); ok {
+	if p, args, ok := protected(part, ex, ut); ok {
 		if err := base().Where("state = ?", models.RelCurrent).Where(p, args...).
 			Update("state", models.RelStale).Error; err != nil {
 			return err
@@ -298,6 +345,10 @@ func (rc *Reconciler) reconcileNodes(tx *gorm.DB, part Partition, snap *Snapshot
 //	resource     nothing: targets are statement content
 func (rc *Reconciler) retireUnsupported(tx *gorm.DB, snap *Snapshot, events *EventLog, now time.Time) error {
 	ws := snap.Run.WorkspaceID
+	ctx, q, err := txTenant(tx, ws)
+	if err != nil {
+		return err
+	}
 	retiredBy := map[string][]uuid.UUID{}
 	for _, class := range models.NodeClasses {
 		col, table := models.SupportColumn(class), models.NodeTable(class)
@@ -307,19 +358,22 @@ func (rc *Reconciler) retireUnsupported(tx *gorm.DB, snap *Snapshot, events *Eve
 		// The first EXISTS matters: an object with NO support rows at all is
 		// pre-graph, not unsupported. provider = 'aws': GitHub's rows share
 		// these tables and are never retired by this pass.
-		stmt := fmt.Sprintf(`
+		rows, err := tenancy.QueryContext(ctx, q, fmt.Sprintf(`
 			UPDATE %[1]s n
-			   SET lifecycle = 'retired', retired_reason = ?
-			 WHERE n.workspace_id = ? AND n.provider = 'aws'
+			   SET lifecycle = 'retired', retired_reason = $2
+			 WHERE n.workspace_id = $1 AND n.provider = 'aws'
 			   AND n.lifecycle = 'active'
 			   AND EXISTS (SELECT 1 FROM iga_object_support s
 			                WHERE s.workspace_id = n.workspace_id AND s.%[2]s = n.id)
 			   AND NOT EXISTS (SELECT 1 FROM iga_object_support s
 			                    WHERE s.workspace_id = n.workspace_id AND s.%[2]s = n.id
 			                      AND s.state <> 'ended')
-			RETURNING n.id`, table, col)
-		var ids []uuid.UUID
-		if err := tx.Raw(stmt, models.RetiredUnsupported, ws).Scan(&ids).Error; err != nil {
+			RETURNING n.id`, table, col), models.RetiredUnsupported)
+		if err != nil {
+			return fmt.Errorf("retire unsupported %s: %w", table, err)
+		}
+		ids, err := scanIDs(rows, nil)
+		if err != nil {
 			return fmt.Errorf("retire unsupported %s: %w", table, err)
 		}
 		for _, id := range ids {
@@ -361,10 +415,11 @@ func (rc *Reconciler) retireUnsupported(tx *gorm.DB, snap *Snapshot, events *Eve
 		}
 	}
 	if ids := retiredBy[models.ObjectPolicy]; len(ids) > 0 {
-		if err := tx.Model(&models.IGAAccessEdge{}).
-			Where(`workspace_id = ? AND state <> ? AND assignment_id IN
-			       (SELECT id FROM iga_policy_assignment WHERE workspace_id = ? AND policy_id IN ?)`,
-				ws, models.RelEnded, ws, ids).Updates(endWith(models.EndedPolicyRetired)).Error; err != nil {
+		if _, err := tenancy.ExecContext(ctx, q, `UPDATE iga_access_edges
+			   SET state = $2, valid_to = $3, ended_reason = $4, updated_at = $5
+			 WHERE workspace_id = $1 AND state <> $2 AND assignment_id IN
+			       (SELECT id FROM iga_policy_assignment WHERE workspace_id = $1 AND policy_id = ANY($6))`,
+			models.RelEnded, now, models.EndedPolicyRetired, time.Now(), pq.Array(ids)); err != nil {
 			return err
 		}
 		if err := tx.Model(&models.IGAPolicyAssignment{}).
@@ -397,16 +452,16 @@ func (rc *Reconciler) retireUnsupported(tx *gorm.DB, snap *Snapshot, events *Eve
 		if len(ids) == 0 {
 			continue
 		}
-		if err := tx.Exec(`UPDATE iga_external_principal SET resolution_state = ?
-		                    WHERE workspace_id = ? AND resolution_basis = ? AND resolution_state = ?
-		                      AND `+epCol+` IN ?`,
-			models.ResolutionSuspended, ws, models.BasisAsserted, models.ResolutionActive, ids).Error; err != nil {
+		if _, err := tenancy.ExecContext(ctx, q, `UPDATE iga_external_principal SET resolution_state = $2
+		                    WHERE workspace_id = $1 AND resolution_basis = $3 AND resolution_state = $4
+		                      AND `+epCol+` = ANY($5)`,
+			models.ResolutionSuspended, models.BasisAsserted, models.ResolutionActive, pq.Array(ids)); err != nil {
 			return fmt.Errorf("suspend assertions on retired %s: %w", class, err)
 		}
-		if err := tx.Exec(`UPDATE iga_external_principal
+		if _, err := tenancy.ExecContext(ctx, q, `UPDATE iga_external_principal
 		                      SET `+epCol+` = NULL, resolution_basis = '', resolution_rule = ''
-		                    WHERE workspace_id = ? AND resolution_basis = ? AND `+epCol+` IN ?`,
-			ws, models.BasisDerived, ids).Error; err != nil {
+		                    WHERE workspace_id = $1 AND resolution_basis = $2 AND `+epCol+` = ANY($3)`,
+			models.BasisDerived, pq.Array(ids)); err != nil {
 			return fmt.Errorf("re-derive resolutions on retired %s: %w", class, err)
 		}
 	}
@@ -425,6 +480,35 @@ func (rc *Reconciler) markReconciled(tx *gorm.DB, snap *Snapshot) error {
 		}
 	}
 	return nil
+}
+
+// txTenant returns ws as the tenant context, on tx's own context, and tx's
+// connection, so the raw statements of the projection transaction run
+// through the tenancy layer: workspace_id = $1 is bound to ws. A context
+// already carrying another workspace is refused rather than overridden.
+func txTenant(tx *gorm.DB, ws uuid.UUID) (context.Context, tenancy.Querier, error) {
+	ctx := tx.Statement.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if tc, err := tenancy.FromContext(ctx); err == nil && tc.WorkspaceID != ws {
+		return nil, nil, fmt.Errorf("tenancy: a transaction of workspace %s used for workspace %s", tc.WorkspaceID, ws)
+	}
+	return tenancy.WithContext(ctx, tenancy.Context{WorkspaceID: ws}), tx.Statement.ConnPool, nil
+}
+
+// scanIDs appends a one-column result of ids (a RETURNING id) to into, and
+// closes rows.
+func scanIDs(rows *sql.Rows, into []uuid.UUID) ([]uuid.UUID, error) {
+	defer rows.Close()
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		into = append(into, id)
+	}
+	return into, rows.Err()
 }
 
 // LastGenerationFor reads a partition's watermark -- keyed exactly as 033 keys

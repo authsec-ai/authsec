@@ -3,6 +3,7 @@ package platform
 import (
 	"context"
 	"crypto/rsa"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -20,6 +21,7 @@ import (
 	"github.com/authsec-ai/authsec/config"
 	"github.com/authsec-ai/authsec/internal/gcp"
 	"github.com/authsec-ai/authsec/internal/policy"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"github.com/authsec-ai/authsec/internal/tokens"
 	"github.com/authsec-ai/authsec/middlewares"
 	"github.com/authsec-ai/authsec/models"
@@ -85,7 +87,12 @@ func (ctrl *OAuthASController) evalPDP(ctx context.Context, req policy.PolicyReq
 		mode = config.AppConfig.PolicyEngineMode
 	}
 
-	decision, _ := ctrl.pdp.Decide(ctx, req)
+	decision, err := ctrl.pdp.Decide(ctx, req)
+	if err != nil && mode == "enforce" {
+		// Fail closed: policies that could not be read cannot be honoured.
+		log.Printf("[PDP] policy evaluation failed, denying: %v", err)
+		return true
+	}
 
 	// thin gates passed → gateEffect is always permit at this point
 	pdpAgrees := decision.Effect != policy.EffectDeny
@@ -129,12 +136,7 @@ func (ctrl *OAuthASController) CanonicalIssuerOnly() gin.HandlerFunc {
 			return
 		}
 
-		requestHost := c.Request.Host
-		if forwardedHost := c.GetHeader("X-Forwarded-Host"); forwardedHost != "" {
-			requestHost = strings.TrimSpace(strings.Split(forwardedHost, ",")[0])
-		}
-
-		if strings.EqualFold(requestHost, parsed.Host) {
+		if strings.EqualFold(requestHost(c), parsed.Host) {
 			c.Next()
 			return
 		}
@@ -145,16 +147,12 @@ func (ctrl *OAuthASController) CanonicalIssuerOnly() gin.HandlerFunc {
 	}
 }
 
-// requestHost reads the effective Host this request arrived on, preferring
-// X-Forwarded-Host (set by the tunnel/proxy in front of local dev, or any
-// production load balancer) over the raw connection Host — the same
-// resolution CanonicalIssuerOnly uses, kept identical on purpose so the two
-// never disagree about what host a request came in on.
+// requestHost reads the effective Host this request arrived on: the
+// X-Forwarded-Host of a trusted proxy (TRUSTED_PROXIES), otherwise the
+// connection's Host (AS-064). CanonicalIssuerOnly uses the same resolution
+// so the two never disagree about what host a request came in on.
 func requestHost(c *gin.Context) string {
-	if forwardedHost := c.GetHeader("X-Forwarded-Host"); forwardedHost != "" {
-		return strings.TrimSpace(strings.Split(forwardedHost, ",")[0])
-	}
-	return c.Request.Host
+	return middlewares.EffectiveHost(c)
 }
 
 // issuerBaseForRequest picks which base URL this request's OIDC metadata
@@ -536,25 +534,102 @@ func (ctrl *OAuthASController) Token(c *gin.Context) {
 	}
 }
 
+// browserAccessTokenTTL is the lifetime of the access token minted for a
+// browser login. It matches the other native grants; the client renews it with
+// its refresh token.
+const browserAccessTokenTTL = time.Hour
+
+// nativeBrowserTokens reports whether the authorization_code and refresh_token
+// grants return an AuthSec-native access token. That needs the native sealer:
+// it is what makes /oauth/introspect, /oauth/jwks, /oauth/userinfo and
+// /oauth/revoke handle native tokens. Off, both grants pass Hydra's token
+// through unchanged.
+func (ctrl *OAuthASController) nativeBrowserTokens() bool {
+	return config.AppConfig != nil && config.AppConfig.XAANativeSealer
+}
+
+// hydraTokenForm is the form sent to Hydra's token endpoint. When AuthSec mints
+// the access token, Hydra is only the internal login engine: the RFC 8707
+// resource (already bound to the grant in AuthSec) and any audience stay with
+// AuthSec, so Hydra never validates an audience against its client record.
+func (ctrl *OAuthASController) hydraTokenForm(form url.Values, hydraClientID string) url.Values {
+	out := form
+	if ctrl.nativeBrowserTokens() {
+		out = make(url.Values, len(form))
+		for k, v := range form {
+			if k == "resource" || k == "audience" {
+				continue
+			}
+			out[k] = append([]string(nil), v...)
+		}
+	}
+	out.Set("client_id", hydraClientID)
+	return out
+}
+
+// mintBrowserAccessToken mints the access token for a browser login: an RFC
+// 9068 JWT from AuthSec's own issuer, its audience the resource server bound to
+// the grant, its subject the user. It has no act claim: the user authorised
+// this client directly (act is for RFC 8693 delegation, i.e. ID-JAG).
+// refreshToken, when the client holds one, links the access token to it, so
+// revoking or rotating the refresh token revokes this access token.
+func (ctrl *OAuthASController) mintBrowserAccessToken(
+	ctx context.Context, rs *models.ResourceServer, userID uuid.UUID,
+	client *models.MCPOAuthClient, scope, refreshToken string,
+) (string, error) {
+	claims := tokens.NativeClaims{
+		Family:           models.TokenFamilyAuthCode,
+		WorkspaceID:      rs.WorkspaceID,
+		SubjectType:      tokens.SubjectTypeUser,
+		SubjectID:        userID,
+		ClientID:         client.ClientID,
+		ResourceServerID: rs.ID,
+		Audience:         rs.ResourceURI,
+		Scope:            scope,
+		TTL:              browserAccessTokenTTL,
+	}
+	if refreshToken != "" {
+		ref := tokens.RefreshTokenGrantRef(refreshToken)
+		claims.GrantRefHash = &ref
+	}
+	token, _, err := ctrl.nativeIssuer.Issue(ctx, claims)
+	return token, err
+}
+
+// browserTokenResponse replaces Hydra's access token in its token response with
+// the native one and sets scope to the issued scope. The id_token and
+// refresh_token stay Hydra's.
+func browserTokenResponse(tokenResp map[string]interface{}, accessToken, scope string) []byte {
+	tokenResp["access_token"] = accessToken
+	tokenResp["token_type"] = "Bearer"
+	tokenResp["expires_in"] = int(browserAccessTokenTTL / time.Second)
+	tokenResp["scope"] = scope
+	body, _ := json.Marshal(tokenResp)
+	return body
+}
+
 // tokenAuthCodeGrant handles authorization_code exchange for MCP clients.
 //
 // Flow:
-//  1. Rewrite client_id → hydra_client_id
+//  1. Rewrite client_id → hydra_client_id (with the native sealer on, resource
+//     and audience are not forwarded: Hydra is never asked about an audience)
 //  2. Proxy to Hydra (capture response)
 //  3. If Hydra returns 200, introspect the access token to extract context_id from session claims
 //  4. Look up auth context by context_id (requires consent_completed=true, consumed=false)
 //  5. If not found → FAIL CLOSED (do NOT forward token to client)
-//  6. Validate RS registration
+//  6. Validate RS registration, RBAC and scopes
 //  7. Consume auth context
-//  8. Forward Hydra's response
+//  8. With the native sealer on, replace Hydra's access token with an
+//     AuthSec-native one (family auth_code: AuthSec issuer, aud = the bound
+//     resource) linked to Hydra's refresh token; the id_token and refresh
+//     token stay Hydra's. With it off, forward Hydra's response.
 func (ctrl *OAuthASController) tokenAuthCodeGrant(c *gin.Context, oauthClient *models.MCPOAuthClient) {
 	redirectURI := c.PostForm("redirect_uri")
 	resourceParam := c.PostForm("resource")
 
 	// 1. Proxy to Hydra
-	c.Request.PostForm.Set("client_id", oauthClient.HydraClientID)
 	statusCode, body, respHeader, err := ctrl.service.ProxyFormToHydraPublicCapture(
-		"/oauth2/token", c.Request.PostForm, c.Request.Header,
+		"/oauth2/token", ctrl.hydraTokenForm(c.Request.PostForm, oauthClient.HydraClientID), c.Request.Header,
 	)
 	if err != nil {
 		log.Printf("[MCP_AUTH] tokenAuthCodeGrant: Hydra unavailable: %v", err)
@@ -689,6 +764,7 @@ func (ctrl *OAuthASController) tokenAuthCodeGrant(c *gin.Context, oauthClient *m
 	// tokenScopes MUST come from Hydra's admin introspection of the issued access token —
 	// NOT from arcCtx.RequestedScopes. The user may have consented to a subset of the
 	// original request; using the request scopes would over-reject valid partial consents.
+	var tokenSubject, issuedScopeStr string
 	{
 		tokenInfo, introErr := ctrl.service.IntrospectViaHydraAdmin(accessToken)
 		if introErr != nil {
@@ -701,8 +777,8 @@ func (ctrl *OAuthASController) tokenAuthCodeGrant(c *gin.Context, oauthClient *m
 			})
 			return
 		}
-		tokenSubject, _ := tokenInfo["sub"].(string)
-		issuedScopeStr, _ := tokenInfo["scope"].(string)
+		tokenSubject, _ = tokenInfo["sub"].(string)
+		issuedScopeStr, _ = tokenInfo["scope"].(string)
 		if tokenSubject == "" || issuedScopeStr == "" {
 			log.Printf("[MCP_AUTH] tokenAuthCodeGrant: introspection returned no sub/scope context_id=%s — failing closed",
 				contextID)
@@ -745,6 +821,23 @@ func (ctrl *OAuthASController) tokenAuthCodeGrant(c *gin.Context, oauthClient *m
 		}
 	}
 
+	// The native access token's subject is the user's UUID. Checked before the
+	// context is consumed, so a bad subject fails without spending it.
+	var userID uuid.UUID
+	if ctrl.nativeBrowserTokens() {
+		parsed, perr := uuid.Parse(tokenSubject)
+		if perr != nil {
+			log.Printf("[MCP_AUTH] tokenAuthCodeGrant: subject %q is not a user id context_id=%s — failing closed", tokenSubject, contextID)
+			revokeIssuedTokens("non-UUID subject at exchange")
+			c.JSON(http.StatusForbidden, gin.H{
+				"error":             "access_denied",
+				"error_description": "token subject is not a user",
+			})
+			return
+		}
+		userID = parsed
+	}
+
 	// 7. Atomically consume the auth context BEFORE returning the token.
 	// If this fails (already consumed = concurrent request), reject.
 	if err := ctrl.service.ConsumeAuthRequestContext(arcCtx.State); err != nil {
@@ -760,11 +853,27 @@ func (ctrl *OAuthASController) tokenAuthCodeGrant(c *gin.Context, oauthClient *m
 	// 8. Conditionally strip refresh tokens.
 	// Clients without offline_access/SupportsRefreshToken get refresh_token stripped.
 	// OIDC clients that opted into offline_access keep it.
+	clientRefreshToken := refreshToken
 	if !oauthClient.SupportsRefreshToken {
+		clientRefreshToken = ""
 		if _, ok := tokenResp["refresh_token"]; ok {
 			delete(tokenResp, "refresh_token")
 			body, _ = json.Marshal(tokenResp)
 		}
+	}
+
+	// 8b. AuthSec issues the access token the resource server sees (iss = this
+	// issuer, aud = the bound resource), like every other grant. Hydra's access
+	// token never leaves this process; its id_token and refresh token do.
+	if ctrl.nativeBrowserTokens() {
+		nativeToken, mintErr := ctrl.mintBrowserAccessToken(c.Request.Context(), rs, userID, oauthClient, issuedScopeStr, clientRefreshToken)
+		if mintErr != nil {
+			log.Printf("[MCP_AUTH] tokenAuthCodeGrant: native mint failed context_id=%s: %v", contextID, mintErr)
+			revokeIssuedTokens("native mint failure at exchange")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "server_error"})
+			return
+		}
+		body = browserTokenResponse(tokenResp, nativeToken, issuedScopeStr)
 	}
 
 	log.Printf("[MCP_AUTH] tokenAuthCodeGrant: success context_id=%s client=%s rs=%s", contextID, oauthClient.ClientID, arcCtx.ResourceURI)
@@ -830,10 +939,13 @@ func (ctrl *OAuthASController) tokenRefreshGrant(c *gin.Context, oauthClient *mo
 		return
 	}
 
+	// The presented refresh token is rotated by Hydra below; the native access
+	// token minted with it is revoked once the new one exists (step at the end).
+	presentedRefreshToken := c.PostForm("refresh_token")
+
 	// Rewrite client_id to Hydra client_id
-	c.Request.PostForm.Set("client_id", oauthClient.HydraClientID)
 	statusCode, body, respHeader, err := ctrl.service.ProxyFormToHydraPublicCapture(
-		"/oauth2/token", c.Request.PostForm, c.Request.Header,
+		"/oauth2/token", ctrl.hydraTokenForm(c.Request.PostForm, oauthClient.HydraClientID), c.Request.Header,
 	)
 	if err != nil {
 		log.Printf("[MCP_AUTH] tokenRefreshGrant: Hydra unavailable: %v", err)
@@ -919,6 +1031,21 @@ func (ctrl *OAuthASController) tokenRefreshGrant(c *gin.Context, oauthClient *mo
 		return
 	}
 
+	// Consent the user withdrew (or an admin revoked) ends the refresh chain
+	// even if Hydra still honours it (AS-068). A failed lookup refuses.
+	if subUUID, perr := uuid.Parse(sub); perr == nil {
+		withdrawn, cErr := ctrl.consentService.ConsentWithdrawn(rs.WorkspaceID, subUUID, oauthClient.ID, rs.ID)
+		if cErr != nil || withdrawn {
+			log.Printf("[MCP_AUTH] tokenRefreshGrant: consent withdrawn sub=%s rs=%s err=%v", sub, resourceParam, cErr)
+			revokeRefreshed("consent withdrawn")
+			c.JSON(http.StatusForbidden, gin.H{
+				"error":             "access_denied",
+				"error_description": "consent for this client has been revoked",
+			})
+			return
+		}
+	}
+
 	issuedScopes := strings.Fields(issuedScopeStr)
 	currentScopes, rbacErr := ctrl.scopeResolver.ResolveGrantableScopes(
 		c.Request.Context(),
@@ -949,8 +1076,55 @@ func (ctrl *OAuthASController) tokenRefreshGrant(c *gin.Context, oauthClient *mo
 		return
 	}
 
+	// AuthSec mints the access token (as for the authorization_code grant).
+	if ctrl.nativeBrowserTokens() {
+		// RFC 8707 / RFC 6749 §6: a refresh may not move the grant to another
+		// resource. The resource the user consented to is in the session.
+		if ext, ok := tokenInfo["ext"].(map[string]interface{}); ok {
+			if grantRS, _ := ext["resource_server_id"].(string); grantRS != "" && grantRS != rs.ID.String() {
+				log.Printf("[MCP_AUTH] tokenRefreshGrant: resource %s is not the grant's resource server %s client=%s",
+					resourceParam, grantRS, oauthClient.ClientID)
+				revokeRefreshed("refresh for a different resource")
+				c.JSON(http.StatusBadRequest, gin.H{
+					"error":             "invalid_target",
+					"error_description": "resource does not match the resource this grant was issued for",
+				})
+				return
+			}
+		}
+		userID, perr := uuid.Parse(sub)
+		if perr != nil {
+			log.Printf("[MCP_AUTH] tokenRefreshGrant: subject %q is not a user id — failing closed", sub)
+			revokeRefreshed("non-UUID subject on refresh")
+			c.JSON(http.StatusForbidden, gin.H{
+				"error":             "access_denied",
+				"error_description": "token subject is not a user",
+			})
+			return
+		}
+		nativeToken, mintErr := ctrl.mintBrowserAccessToken(c.Request.Context(), rs, userID, oauthClient, issuedScopeStr, newRefreshToken)
+		if mintErr != nil {
+			log.Printf("[MCP_AUTH] tokenRefreshGrant: native mint failed client=%s: %v", oauthClient.ClientID, mintErr)
+			revokeRefreshed("native mint failure on refresh")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "server_error"})
+			return
+		}
+		// Hydra rotated the presented refresh token; the access token minted
+		// with it goes too, as Hydra does for its own tokens on rotation.
+		wsID := rs.WorkspaceID
+		if err := ctrl.service.RevokeAuthCodeTokensForRefresh(c.Request.Context(), &wsID, presentedRefreshToken, "refresh_token_rotated"); err != nil {
+			log.Printf("[MCP_AUTH] tokenRefreshGrant: revoking the rotated grant's access token failed client=%s: %v", oauthClient.ClientID, err)
+		}
+		body = browserTokenResponse(refreshResp, nativeToken, issuedScopeStr)
+	}
+
 	// All checks passed — return the refreshed token set.
 	log.Printf("[MCP_AUTH] tokenRefreshGrant: success client=%s resource=%s", oauthClient.ClientID, resourceParam)
+	// A client used only through refresh is in use (AS-037).
+	if dbErr := config.DB.Model(&models.MCPOAuthClient{}).Where("id = ?", oauthClient.ID).
+		Update("last_token_issued_at", time.Now()).Error; dbErr != nil {
+		log.Printf("[MCP_AUTH] tokenRefreshGrant: failed to stamp last_token_issued_at for client=%s: %v", oauthClient.ClientID, dbErr)
+	}
 	writeProxiedResponse(c.Writer, statusCode, body, respHeader)
 }
 
@@ -1056,9 +1230,10 @@ func (ctrl *OAuthASController) tokenClientCredentialsGrant(c *gin.Context, _ *mo
 		return
 	}
 
-	// ── 6. PDP gate (shadow/enforce).
+	// ── 6. PDP gate (shadow/enforce). Policies of the resource server's
+	// workspace govern access to it (ADR-0001 §5.2).
 	if ctrl.evalPDP(ctx, policy.PolicyRequest{
-		WorkspaceID:      sa.WorkspaceID,
+		WorkspaceID:      rs.WorkspaceID,
 		ClientID:         client.ClientID,
 		SubjectType:      "service_account",
 		SubjectID:        sa.ID,
@@ -1095,21 +1270,28 @@ func (ctrl *OAuthASController) tokenClientCredentialsGrant(c *gin.Context, _ *mo
 	log.Printf("[M2M] tokenClientCredentialsGrant: issued jti=%s sa=%s client=%s rs=%s scopes=%q",
 		jti, sa.ID, client.ClientID, rs.ID, claims.Scope)
 
+	// The client is authenticated and its service account resolved: the
+	// follow-up writes run in that service account's workspace, under RLS.
+	saCtx := tenancy.WithContext(ctx, tenancy.Context{WorkspaceID: sa.WorkspaceID})
+	sqlDB := config.GetDatabase().DB
+
 	// Best-effort: advance attested → token_issued in application_spiffe_identities
 	// for SPIFFE-backed service accounts.
 	if sa.SpiffeID != nil {
-		config.DB.WithContext(ctx).Exec(
-			`UPDATE application_spiffe_identities
-			    SET status = 'token_issued', last_token_issued_at = NOW()
-			  WHERE spiffe_id = ? AND status IN ('attested', 'token_issued')`,
-			*sa.SpiffeID,
-		)
+		if _, err := tenancy.ExecContext(saCtx, sqlDB, `
+			UPDATE application_spiffe_identities SET status = 'token_issued', last_token_issued_at = NOW()
+			 WHERE workspace_id = $1 AND spiffe_id = $2 AND status IN ('attested', 'token_issued')`,
+			*sa.SpiffeID); err != nil {
+			log.Printf("[M2M] tokenClientCredentialsGrant: spiffe identity status sa=%s: %v", sa.ID, err)
+		}
 	}
 
 	// Best-effort: record activity on the service account so Agent 360 can show
 	// "last seen" instead of NULL forever.
-	config.DB.WithContext(ctx).Exec(
-		`UPDATE service_accounts SET last_seen_at = NOW() WHERE id = ?`, sa.ID)
+	if _, err := tenancy.ExecContext(saCtx, sqlDB,
+		`UPDATE service_accounts SET last_seen_at = NOW() WHERE workspace_id = $1 AND id = $2`, sa.ID); err != nil {
+		log.Printf("[M2M] tokenClientCredentialsGrant: last_seen_at sa=%s: %v", sa.ID, err)
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"access_token": tokenStr,
@@ -1570,6 +1752,32 @@ func (ctrl *OAuthASController) tokenExchangeGrant(c *gin.Context, oauthClient *m
 		return
 	}
 
+	// ── 1b. Authenticate the client. A body client_id alone proves nothing;
+	// without this, anyone holding a user's token could name its client and
+	// mint an ID-JAG for that user.
+	tokenEndpoint := config.AppConfig.OAuthBaseURL() + "/oauth/token"
+	authClient, err := services.AuthenticateClient(ctx, config.DB, c.Request, tokenEndpoint)
+	if err != nil || authClient == nil {
+		log.Printf("[ISSUANCE] tokenExchangeGrant: client auth failed: %v", err)
+		desc := "client authentication failed"
+		if err != nil {
+			desc = err.Error()
+		}
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error":             "invalid_client",
+			"error_description": desc,
+		})
+		return
+	}
+	if oauthClient != nil && oauthClient.ClientID != authClient.ClientID {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error":             "invalid_client",
+			"error_description": "client_id does not match the authenticated client",
+		})
+		return
+	}
+	oauthClient = authClient
+
 	// ── 2. requested_token_type check.
 	requestedType := c.PostForm("requested_token_type")
 	if requestedType != tokens.IDJAGTokenType {
@@ -1635,50 +1843,22 @@ func (ctrl *OAuthASController) tokenExchangeGrant(c *gin.Context, oauthClient *m
 		}
 	} else if cls := tokens.Classify(subjectToken, tokens.NativeKeys().NativeKeyIDs()); cls.Family == tokens.FamilyNative {
 		// Native token path: verify signature, look up native_tokens row.
-		pub, ok := tokens.NativeKeys().PublicKeyForKID(cls.Kid)
-		if !ok {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"error":             "invalid_grant",
-				"error_description": "subject_token has unknown native kid",
-			})
-			return
-		}
-		nativeClaims := jwt.MapClaims{}
-		parsed, perr := jwt.ParseWithClaims(subjectToken, nativeClaims, func(t *jwt.Token) (interface{}, error) {
-			if _, isRSA := t.Method.(*jwt.SigningMethodRSA); !isRSA {
-				return nil, fmt.Errorf("unexpected alg %s", t.Method.Alg())
+		row, verr := verifyNativeUserToken(ctx, subjectToken, cls.Kid)
+		if verr != nil {
+			desc := "subject_token signature/claims invalid"
+			switch {
+			case errors.Is(verr, errNativeUnknownKid):
+				desc = "subject_token has unknown native kid"
+			case errors.Is(verr, errNativeNotFound):
+				desc = "subject_token not found or already revoked"
+			case errors.Is(verr, errNativeRevoked):
+				desc = "subject_token has been revoked"
+			case errors.Is(verr, errNativeNotUser):
+				desc = "subject_token must carry a user subject for ID-JAG issuance"
 			}
-			return pub, nil
-		})
-		if perr != nil || !parsed.Valid {
 			c.JSON(http.StatusBadRequest, gin.H{
 				"error":             "invalid_grant",
-				"error_description": "subject_token signature/claims invalid",
-			})
-			return
-		}
-		jti, _ := nativeClaims["jti"].(string)
-		row, lerr := tokens.LookupNativeToken(ctx, config.DB, jti)
-		if lerr != nil || row == nil {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"error":             "invalid_grant",
-				"error_description": "subject_token not found or already revoked",
-			})
-			return
-		}
-		// Check revocation.
-		issuerURL := config.AppConfig.OAuthBaseURL()
-		if rev, _ := tokens.IsRevoked(ctx, config.DB, issuerURL, "access_token", jti); rev {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"error":             "invalid_grant",
-				"error_description": "subject_token has been revoked",
-			})
-			return
-		}
-		if row.SubjectType != "user" {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"error":             "invalid_grant",
-				"error_description": "subject_token must carry a user subject for ID-JAG issuance",
+				"error_description": desc,
 			})
 			return
 		}
@@ -1738,19 +1918,48 @@ func (ctrl *OAuthASController) tokenExchangeGrant(c *gin.Context, oauthClient *m
 		return
 	}
 
+	resource := c.PostForm("resource")
+
 	// ── 5. Issuance brokering gate (a2a_brokering_policies side='issuance').
-	// Explicit-deny-wins: any deny row for (workspace, client) blocks issuance.
-	// No matching row = permit (ownership of a valid subject_token is sufficient consent).
-	type brokeringRow struct{ Effect string }
-	var brokeringRows []brokeringRow
-	config.DB.WithContext(ctx).Raw(`
+	// Explicit-deny-wins: a deny row for (workspace, client) blocks issuance,
+	// whether it names no resource server or the one this ID-JAG targets.
+	// No matching row = permit (ownership of a valid subject_token is
+	// sufficient consent). A failed lookup refuses issuance (AS-074).
+	// The workspace is the verified subject_token's. No RLS transaction: the
+	// policy may name a resource server of another workspace (resource_uri is
+	// globally unique, AS-060), which a deny must still match.
+	subjectTenant := tenancy.WithContext(ctx, tenancy.Context{WorkspaceID: subject.WorkspaceID})
+	var brokeringEffects []string
+	brokeringRows, err := tenancy.QueryContext(subjectTenant, config.GetDatabase().DB, `
 		SELECT effect FROM a2a_brokering_policies
-		WHERE workspace_id = ? AND side = 'issuance'
-		  AND (client_id IS NULL OR client_id = ?)`,
-		subject.WorkspaceID, oauthClient.ClientID,
-	).Scan(&brokeringRows)
-	for _, br := range brokeringRows {
-		if br.Effect == "deny" {
+		WHERE workspace_id = $1 AND side = 'issuance'
+		  AND (client_id IS NULL OR client_id = $2)
+		  AND (resource_server_id IS NULL OR resource_server_id IN (
+		        SELECT id FROM resource_servers WHERE resource_uri = $3 AND $3 <> '')) -- TENANT-EXEMPT: resource_uri is globally unique (AS-060); the outer query is scoped by workspace_id`,
+		oauthClient.ClientID, resource)
+	if err == nil {
+		for brokeringRows.Next() {
+			var effect string
+			if err = brokeringRows.Scan(&effect); err != nil {
+				break
+			}
+			brokeringEffects = append(brokeringEffects, effect)
+		}
+		if err == nil {
+			err = brokeringRows.Err()
+		}
+		brokeringRows.Close()
+	}
+	if err != nil {
+		log.Printf("[MCP_AUTH] tokenExchange: brokering gate lookup failed: %v", err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error":             "temporarily_unavailable",
+			"error_description": "could not evaluate brokering policy",
+		})
+		return
+	}
+	for _, effect := range brokeringEffects {
+		if effect == "deny" {
 			c.JSON(http.StatusForbidden, gin.H{
 				"error":             "access_denied",
 				"error_description": "ID-JAG issuance is not permitted for this client in this workspace",
@@ -1766,7 +1975,6 @@ func (ctrl *OAuthASController) tokenExchangeGrant(c *gin.Context, oauthClient *m
 	if targetIssuer == "" {
 		targetIssuer = selfIssuer
 	}
-	resource := c.PostForm("resource")
 	scope := strings.Join(strings.Fields(c.PostForm("scope")), " ")
 
 	// ── 7. Mint ID-JAG — NOT stored in native_tokens.
@@ -2026,6 +2234,7 @@ func (ctrl *OAuthASController) RequesterBootstrap(c *gin.Context) {
 	requesterWorkspaces := map[uuid.UUID]bool{}
 	var saWs []uuid.UUID
 	config.DB.WithContext(ctx).
+		// TENANT-EXEMPT: resolves the workspaces the authenticated client backs; the workspace is the result, not an input.
 		Raw(`SELECT workspace_id FROM service_accounts WHERE oauth_client_id = ?`, client.ID).
 		Scan(&saWs)
 	for _, w := range saWs {
@@ -2556,17 +2765,30 @@ func (ctrl *OAuthASController) introspectNative(c *gin.Context, token, kid strin
 		ext["act"] = gin.H{"client_id": authCtx.Actor.ClientID, "spiffe_id": authCtx.Actor.SpiffeID}
 	}
 
-	// G9: resolve role_ids for the subject+RS binding.
-	var roleIDs []string
+	// G9: resolve role_ids for the subject+RS binding, in the token's
+	// workspace (the native_tokens row's), under RLS.
+	roleIDs := []string{}
 	roleIDCol := "user_id"
 	if authCtx.Principal.SubjectType == "service_account" {
 		roleIDCol = "service_account_id"
 	}
-	config.DB.WithContext(ctx).
-		Raw("SELECT role_id::text FROM role_bindings WHERE scope_type = 'resource_server' AND scope_id = ? AND "+roleIDCol+" = ? AND (expires_at IS NULL OR expires_at > NOW())", rs.ID, authCtx.Principal.SubjectID).
-		Scan(&roleIDs)
-	if roleIDs == nil {
-		roleIDs = []string{}
+	principalCtx := tenancy.WithContext(ctx, tenancy.Context{WorkspaceID: authCtx.Principal.WorkspaceID})
+	if err := tenancy.WithTx(principalCtx, config.GetDatabase().DB, authCtx.Principal.WorkspaceID, func(tx *sql.Tx) error {
+		rows, err := tenancy.QueryContext(principalCtx, tx, "SELECT role_id::text FROM role_bindings WHERE workspace_id = $1 AND scope_type = 'resource_server' AND scope_id = $2 AND "+roleIDCol+" = $3 AND (expires_at IS NULL OR expires_at > NOW())", rs.ID, authCtx.Principal.SubjectID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				return err
+			}
+			roleIDs = append(roleIDs, id)
+		}
+		return rows.Err()
+	}); err != nil {
+		log.Printf("[MCP_AUTH] introspectNative: role_ids lookup failed rs=%s: %v", rs.ResourceURI, err)
 	}
 
 	resp := gin.H{
@@ -2625,13 +2847,13 @@ func (ctrl *OAuthASController) Userinfo(c *gin.Context) {
 	}
 	token := strings.TrimPrefix(authHeader, "Bearer ")
 
-	// Native tokens are not userinfo subjects in Phase 0: M2M has no user, and
-	// XAA/CIBA userinfo (gated on `openid`) lands with those families. A native
-	// kid here is rejected — never introspected against Hydra (§1, specifics (d)).
+	// A native token is verified locally, never introspected against Hydra.
+	// Browser login returns a native user token, and OIDC Core §5.3 requires
+	// userinfo to accept the access token the token endpoint issued. A token
+	// without a user subject (M2M) is invalid here.
 	if config.AppConfig != nil && config.AppConfig.XAANativeSealer {
 		if cls := tokens.Classify(token, tokens.NativeKeys().NativeKeyIDs()); cls.Family == tokens.FamilyNative {
-			c.Header("WWW-Authenticate", `Bearer error="invalid_token"`)
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid_token"})
+			ctrl.nativeUserinfo(c, token, cls.Kid)
 			return
 		}
 	}
@@ -2719,6 +2941,83 @@ func (ctrl *OAuthASController) Userinfo(c *gin.Context) {
 	c.JSON(http.StatusOK, claims)
 }
 
+// Failures of verifyNativeUserToken, distinguishable so each caller keeps its
+// own error response.
+var (
+	errNativeUnknownKid = errors.New("unknown native kid")
+	errNativeInvalid    = errors.New("native token signature or claims invalid")
+	errNativeNotFound   = errors.New("native token not found")
+	errNativeRevoked    = errors.New("native token revoked or expired")
+	errNativeNotUser    = errors.New("native token does not carry a user subject")
+)
+
+// verifyNativeUserToken verifies an AuthSec-native access token presented by a
+// client and returns its native_tokens row: the signature against the published
+// native key for kid (RS256 only; exp and nbf checked by the parser), the row
+// exists, it is not revoked (revoked_tokens is the source of truth, a lookup
+// error fails closed) and not expired, and its subject is a user. Used by token
+// exchange (subject_token) and by /oauth/userinfo.
+func verifyNativeUserToken(ctx context.Context, token, kid string) (*models.NativeToken, error) {
+	pub, ok := tokens.NativeKeys().PublicKeyForKID(kid)
+	if !ok {
+		return nil, errNativeUnknownKid
+	}
+	claims := jwt.MapClaims{}
+	parsed, err := jwt.ParseWithClaims(token, claims, func(t *jwt.Token) (interface{}, error) {
+		if _, isRSA := t.Method.(*jwt.SigningMethodRSA); !isRSA {
+			return nil, fmt.Errorf("unexpected alg %s", t.Method.Alg())
+		}
+		return pub, nil
+	})
+	if err != nil || !parsed.Valid {
+		return nil, errNativeInvalid
+	}
+	jti, _ := claims["jti"].(string)
+	row, err := tokens.LookupNativeToken(ctx, config.DB, jti)
+	if err != nil || row == nil {
+		return nil, errNativeNotFound
+	}
+	revoked, err := tokens.IsRevoked(ctx, config.DB, config.AppConfig.OAuthBaseURL(), "access_token", jti)
+	if err != nil || revoked || row.RevokedAt != nil || !row.ExpiresAt.After(time.Now()) {
+		return nil, errNativeRevoked
+	}
+	if row.SubjectType != tokens.SubjectTypeUser {
+		return nil, errNativeNotUser
+	}
+	return row, nil
+}
+
+// nativeUserinfo answers /oauth/userinfo for an AuthSec-native user access
+// token. The token must carry `openid`; claims come from the local user record
+// (EnrichUserinfoClaims), since a native token has no Hydra session claims.
+func (ctrl *OAuthASController) nativeUserinfo(c *gin.Context, token, kid string) {
+	row, err := verifyNativeUserToken(c.Request.Context(), token, kid)
+	if err != nil {
+		c.Header("WWW-Authenticate", `Bearer error="invalid_token"`)
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid_token"})
+		return
+	}
+	scopeSet := make(map[string]bool)
+	for _, sc := range strings.Fields(row.Scope) {
+		scopeSet[sc] = true
+	}
+	if !scopeSet["openid"] {
+		c.Header("WWW-Authenticate", `Bearer error="insufficient_scope"`)
+		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient_scope", "error_description": "openid scope required"})
+		return
+	}
+	sub := row.SubjectID.String()
+	claims := map[string]interface{}{"sub": sub}
+	ctrl.service.EnrichUserinfoClaims(claims, sub, scopeSet)
+	// As on the Hydra path: email_verified reflects a known state or is false.
+	if _, hasEmail := claims["email"]; hasEmail {
+		if _, ok := claims["email_verified"]; !ok {
+			claims["email_verified"] = false
+		}
+	}
+	c.JSON(http.StatusOK, claims)
+}
+
 // EndSession handles RP-Initiated Logout (OpenID Connect RP-Initiated Logout 1.0).
 // GET /oauth/logout
 //
@@ -2795,16 +3094,6 @@ func (ctrl *OAuthASController) EndSession(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "logged_out"})
 }
 
-// PAR is temporarily disabled while AuthSec is still backed by stock Hydra, which
-// does not expose /oauth2/par in self-hosted mode. A later AuthSec-owned PAR
-// implementation will re-enable this endpoint without depending on Hydra PAR.
-func (ctrl *OAuthASController) PAR(c *gin.Context) {
-	c.JSON(http.StatusNotImplemented, gin.H{
-		"error":             "unsupported_request",
-		"error_description": "PAR is temporarily disabled; use /oauth/authorize directly",
-	})
-}
-
 // OAuthPolicyResult holds the validated policy state from validateOAuthPolicy.
 type OAuthPolicyResult struct {
 	Client      *models.MCPOAuthClient
@@ -2847,22 +3136,11 @@ func (ctrl *OAuthASController) inferAuthorizeResource(clientID string) (string, 
 		return resourceURI, nil
 	}
 	if errors.Is(inferErr, services.ErrResourceInferenceAmbiguous) {
-		// List available resource URIs to help the client developer.
-		var uris []string
-		var servers []models.ResourceServer
-		if dbErr := config.DB.Where("active = true").Select("resource_uri").Find(&servers).Error; dbErr == nil {
-			for _, s := range servers {
-				uris = append(uris, s.ResourceURI)
-			}
-		}
-		desc := "resource parameter required because client maps to multiple resource servers"
-		if len(uris) > 0 {
-			desc += ". Available: " + strings.Join(uris, ", ")
-		}
+		// The caller is unauthenticated: name no resource servers (AS-070).
 		return "", &policyError{
 			Status:      http.StatusBadRequest,
 			Code:        "invalid_request",
-			Description: desc,
+			Description: "resource parameter required because client maps to multiple resource servers",
 		}
 	}
 	if errors.Is(inferErr, services.ErrResourceInferenceUnavailable) {
@@ -3073,6 +3351,16 @@ func (ctrl *OAuthASController) Revoke(c *gin.Context) {
 		}
 	}
 
+	// RFC 7009 §2.1: revoking a refresh token also invalidates the access tokens
+	// of the same grant. Hydra does that for its own tokens; a browser login's
+	// access token is AuthSec's, linked to its refresh token by hash. A token
+	// that is not such a refresh token matches nothing. The response stays 200.
+	if token := c.PostForm("token"); token != "" && ctrl.nativeBrowserTokens() {
+		if err := ctrl.service.RevokeAuthCodeTokensForRefresh(c.Request.Context(), nil, token, "refresh_token_revoked"); err != nil {
+			log.Printf("[MCP_AUTH] Revoke: revoking access tokens of the refresh token's grant failed: %v", err)
+		}
+	}
+
 	clientID := c.PostForm("client_id")
 	if clientID != "" {
 		oauthClient, err := ctrl.service.GetOAuthClient(clientID)
@@ -3124,14 +3412,12 @@ func isExpiryOnlyError(err error) bool {
 
 // --- Helpers ---
 
+// isValidRedirectURI applies the same structural rule as the PUT/CIMD paths
+// (services.ValidateRedirectURIs): an absolute URL without a fragment, https,
+// or http only when the host is exactly a loopback name. A prefix match let
+// http://localhost.evil.com through (AS-096).
 func isValidRedirectURI(uri string) bool {
-	if strings.HasPrefix(uri, "https://") {
-		return true
-	}
-	if strings.HasPrefix(uri, "http://localhost") || strings.HasPrefix(uri, "http://127.0.0.1") {
-		return true
-	}
-	return false
+	return services.ValidateRedirectURIs([]string{uri}) == nil
 }
 
 func containsString(slice []string, s string) bool {
@@ -3283,9 +3569,14 @@ func (ctrl *OAuthASController) RevokeConsentGrant(c *gin.Context) {
 	}
 
 	// RevokeConsentByTenant enforces tenant ownership — cross-tenant revocations are rejected.
-	if err := ctrl.consentService.RevokeConsentByTenant(grantID, workspaceID); err != nil {
+	grant, err := ctrl.consentService.RevokeConsentByTenant(grantID, workspaceID)
+	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "consent grant not found or already revoked"})
 		return
+	}
+	// Tokens issued under the grant stop working too (AS-068).
+	if err := ctrl.service.RevokeTokensForConsentGrant(c.Request.Context(), grant); err != nil {
+		log.Printf("[MCP_AUTH] RevokeConsentGrant: token revocation incomplete grant=%s: %v", grantID, err)
 	}
 
 	auditAdminMutation(c, workspaceID.String(), "consent_grant_revoked", "oauth_consent_grant",
@@ -3321,15 +3612,19 @@ func (ctrl *OAuthASController) RevokeUserConsentGrant(c *gin.Context) {
 		return
 	}
 
-	_, userID, err := ctrl.requireAuthenticatedUserContext(c)
+	workspaceID, userID, err := ctrl.requireAuthenticatedUserContext(c)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
 
-	if err := ctrl.consentService.RevokeConsentByUser(grantID, userID); err != nil {
+	grant, err := ctrl.consentService.RevokeConsentByUser(grantID, userID, workspaceID)
+	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "consent grant not found or already revoked"})
 		return
+	}
+	if err := ctrl.service.RevokeTokensForConsentGrant(c.Request.Context(), grant); err != nil {
+		log.Printf("[MCP_AUTH] RevokeUserConsentGrant: token revocation incomplete grant=%s: %v", grantID, err)
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "revoked"})

@@ -47,8 +47,3 @@ type CreateWorkspaceDBResponse struct {
 	Existed         bool      `json:"existed"`
 }
 
-// TemplateStatusResponse is returned by the template-status endpoint.
-type TemplateStatusResponse struct {
-	TemplateName string `json:"template_name"`
-	Ready        bool   `json:"ready"`
-}

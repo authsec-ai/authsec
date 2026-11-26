@@ -93,7 +93,7 @@ type DiscoveryScanWorker struct {
 	poll       time.Duration
 	lease      time.Duration
 	// graph projects each finished run's declared agents into the shared
-	// graph. It honours IGA_GRAPH_PROJECTION, so with the switch off it
+	// graph. It honours the graph pipeline, so with the switch off it
 	// writes nothing.
 	graph *GitHubGraphProjector
 }

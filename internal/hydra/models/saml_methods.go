@@ -17,8 +17,6 @@ import (
 	"time"
 
 	"github.com/authsec-ai/authsec/config"
-	"github.com/beevik/etree"
-	dsig "github.com/russellhaering/goxmldsig"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
@@ -100,8 +98,13 @@ type SAMLSubjectConfirmationData struct {
 }
 
 type SAMLConditions struct {
-	NotBefore    string `xml:"NotBefore,attr"`
-	NotOnOrAfter string `xml:"NotOnOrAfter,attr"`
+	NotBefore            string                    `xml:"NotBefore,attr"`
+	NotOnOrAfter         string                    `xml:"NotOnOrAfter,attr"`
+	AudienceRestrictions []SAMLAudienceRestriction `xml:"urn:oasis:names:tc:SAML:2.0:assertion AudienceRestriction"`
+}
+
+type SAMLAudienceRestriction struct {
+	Audiences []string `xml:"urn:oasis:names:tc:SAML:2.0:assertion Audience"`
 }
 
 type SAMLAttributeStatement struct {
@@ -435,6 +438,16 @@ func (s *OAuthLoginService) ValidateSAMLResponse(samlResponse string, relayState
 		return nil, "", "", "", fmt.Errorf("failed to unmarshal SAML response: %w", err)
 	}
 
+	// Verify the IdP's XML signature and read the assertion only from the
+	// signed element. A missing or invalid signature rejects the response.
+	now := time.Now()
+	signedAssertion, err := verifySignedAssertion(responseBytes, idpCert, now)
+	if err != nil {
+		log.Printf("[SAML] ValidateSAMLResponse: signature verification failed: %v", err)
+		return nil, "", "", "", fmt.Errorf("SAML signature verification failed: %w", err)
+	}
+	samlResp.Assertion = *signedAssertion
+
 	log.Printf("[SAML] ValidateSAMLResponse: raw_status=%s raw_issuer=%s raw_destination=%s",
 		samlResp.Status.StatusCode.Value,
 		samlResp.Assertion.Issuer.Value,
@@ -462,36 +475,35 @@ func (s *OAuthLoginService) ValidateSAMLResponse(samlResponse string, relayState
 		return nil, "", "", "", fmt.Errorf("SAML destination mismatch")
 	}
 
-	// Verify XML signature using the IdP certificate.
-	// This ensures the response was actually signed by the IdP and not tampered with.
-	sigValid := false
-	certStore := dsig.MemoryX509CertificateStore{Roots: []*x509.Certificate{idpCert}}
-	validationCtx := dsig.NewDefaultValidationContext(&certStore)
-	// Parse the XML document for signature verification
-	doc := etree.NewDocument()
-	if err := doc.ReadFromBytes(responseBytes); err == nil {
-		if _, sigErr := validationCtx.Validate(doc.Root()); sigErr == nil {
-			sigValid = true
-			log.Printf("[SAML] ValidateSAMLResponse: XML signature VALID")
-		} else {
-			log.Printf("[SAML] ValidateSAMLResponse: XML signature verification failed: %v (continuing — some IdPs sign only the assertion)", sigErr)
-			// Try validating the assertion element directly
-			for _, child := range doc.Root().ChildElements() {
-				if child.Tag == "Assertion" {
-					if _, sigErr2 := validationCtx.Validate(child); sigErr2 == nil {
-						sigValid = true
-						log.Printf("[SAML] ValidateSAMLResponse: assertion signature VALID")
-						break
-					}
-				}
-			}
-			if !sigValid {
-				log.Printf("[SAML] ValidateSAMLResponse: WARNING — no valid signature found, proceeding with caution")
-			}
-		}
+	if err := checkAssertionConditions(&samlResp.Assertion, spEntityID, spACSURL, now); err != nil {
+		log.Printf("[SAML] ValidateSAMLResponse: assertion conditions rejected: %v", err)
+		return nil, "", "", "", fmt.Errorf("SAML assertion rejected: %w", err)
 	}
 
-	log.Printf("[SAML] ValidateSAMLResponse: VALIDATION PASSED (sig_valid=%v)", sigValid)
+	// InResponseTo must name an unexpired AuthnRequest this SP issued for the
+	// same login challenge, provider and workspace; the request is consumed so
+	// a captured response cannot be replayed. Unsolicited (IdP-initiated)
+	// responses are refused: the relay state alone is not signed.
+	inResponseTo := strings.TrimSpace(samlResp.InResponseTo)
+	scdInResponseTo := strings.TrimSpace(samlResp.Assertion.Subject.SubjectConfirmation.SubjectConfirmationData.InResponseTo)
+	if inResponseTo == "" {
+		inResponseTo = scdInResponseTo
+	} else if scdInResponseTo != "" && scdInResponseTo != inResponseTo {
+		return nil, "", "", "", fmt.Errorf("SAML InResponseTo mismatch between response and assertion")
+	}
+	if inResponseTo == "" {
+		return nil, "", "", "", fmt.Errorf("unsolicited SAML responses are not accepted")
+	}
+	consumed := config.DB.
+		Where("id = ? AND login_challenge = ? AND provider_name = ? AND workspace_id = ? AND expires_at > ?",
+			inResponseTo, loginChallenge, providerName, workspaceID, now).
+		Delete(&SAMLRequest{})
+	if consumed.Error != nil || consumed.RowsAffected != 1 {
+		log.Printf("[SAML] ValidateSAMLResponse: InResponseTo did not match a pending request (err=%v)", consumed.Error)
+		return nil, "", "", "", fmt.Errorf("SAML response does not answer a pending request")
+	}
+
+	log.Printf("[SAML] ValidateSAMLResponse: VALIDATION PASSED (signature, audience, time window, InResponseTo)")
 
 	// 6. Extract user attributes from the validated assertion.
 	nameID := trimSpace(samlResp.Assertion.Subject.NameID.Value)

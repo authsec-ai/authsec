@@ -9,6 +9,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/authsec-ai/authsec/internal/safehttp"
+	"github.com/authsec-ai/authsec/internal/tenancy"
 	"io"
 	"log"
 	"math/big"
@@ -50,7 +52,7 @@ func AuthenticateClient(ctx context.Context, db *gorm.DB, r *http.Request, token
 	// type. The SVID's `sub` is the SPIFFE ID which maps to a service_account
 	// (via service_accounts.spiffe_id) and from there to an mcp_oauth_client.
 	if assertionType == "urn:authsec:params:oauth:client-assertion-type:spiffe-svid" && assertion != "" {
-		return authenticateSPIFFESVID(ctx, db, assertion, tokenEndpoint)
+		return authenticateSPIFFESVID(ctx, db, assertion, tokenEndpoint, strings.TrimSpace(r.FormValue("client_id")))
 	}
 
 	// ── 2. client_secret_basic ───────────────────────────────────────────────
@@ -132,16 +134,12 @@ func authenticatePrivateKeyJWT(ctx context.Context, db *gorm.DB, assertion, toke
 			return nil, fmt.Errorf("unsupported signing algorithm: %v", t.Header["alg"])
 		}
 		kid, _ := t.Header["kid"].(string)
-		if key, ok := keyMap[kid]; ok {
+		if key, ok := selectJWK(keyMap, kid); ok {
 			return key, nil
-		}
-		// No kid or kid not in JWKS — try any available key (single-key case).
-		for _, k := range keyMap {
-			return k, nil
 		}
 		return nil, fmt.Errorf("kid not found in client JWKS")
 	}, jwt.WithValidMethods([]string{"RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "ES512"}),
-		jwt.WithLeeway(30*time.Second))
+		jwt.WithLeeway(30*time.Second), jwt.WithExpirationRequired())
 	if err != nil || !parsed.Valid {
 		return nil, fmt.Errorf("invalid_client: client_assertion validation failed: %w", err)
 	}
@@ -168,6 +166,7 @@ func authenticatePrivateKeyJWT(ctx context.Context, db *gorm.DB, assertion, toke
 		JTI:       jti,
 		ExpiresAt: expiresAt,
 	}
+	// TENANT-EXEMPT: replay cache keyed by the globally unique client_id and the assertion's jti
 	res := db.WithContext(ctx).Exec(
 		`INSERT INTO client_assertion_replay_cache (client_id, jti, expires_at)
          VALUES (?, ?, ?)
@@ -200,7 +199,10 @@ func authenticatePrivateKeyJWT(ctx context.Context, db *gorm.DB, assertion, toke
 //
 // Only explicitly-registered (issuer, subject) pairs authenticate — an attacker
 // with a token from an unregistered issuer, or a subject we never mapped, fails.
-func authenticateSPIFFESVID(ctx context.Context, db *gorm.DB, svid, tokenEndpoint string) (*models.MCPOAuthClient, error) {
+// wantClientID, when the request names one, must be the client of the
+// workload the token maps to: a candidate whose mapping belongs to another
+// client does not count.
+func authenticateSPIFFESVID(ctx context.Context, db *gorm.DB, svid, tokenEndpoint, wantClientID string) (*models.MCPOAuthClient, error) {
 	// Step 1: parse without verification to extract iss + sub.
 	unverified, _, err := new(jwt.Parser).ParseUnverified(svid, jwt.MapClaims{})
 	if err != nil {
@@ -216,38 +218,24 @@ func authenticateSPIFFESVID(ctx context.Context, db *gorm.DB, svid, tokenEndpoin
 		return nil, fmt.Errorf("invalid_client: token must have iss and sub")
 	}
 
-	// Step 1b: resolve the issuer to a trusted provider (fail-closed). Prefer a
-	// registered workload_identity_provider; fall back to the legacy single
-	// global SPIFFE_OIDC_ISSUER env for spiffe. Anything else is rejected.
-	var (
-		kind                = "spiffe"
-		jwksURL             string
-		allowedAuds         []string
-		subjectClaim        = "sub"
-		providerWS          *uuid.UUID
-		providerTrustDomain string
-	)
-	var provider models.WorkloadIdentityProvider
-	perr := db.WithContext(ctx).
+	// Step 1b: resolve the issuer to its trusted providers (fail-closed). Every
+	// active workload_identity_provider registered for the issuer is a
+	// candidate: issuers are unique per workspace (AS-060), so a public issuer
+	// such as GitHub Actions may be federated by several workspaces. Without a
+	// provider row, only the legacy global SPIFFE_OIDC_ISSUER is trusted.
+	var providers []models.WorkloadIdentityProvider
+	// TENANT-EXEMPT: pre-workspace; the issuer selects the candidate providers of every workspace
+	if err := db.WithContext(ctx).
 		Where("issuer = ? AND status = 'active'", iss).
-		First(&provider).Error
-	if perr == nil {
-		kind = provider.Kind
-		if provider.JWKSUri != nil && *provider.JWKSUri != "" {
-			jwksURL = *provider.JWKSUri
-		} else {
-			jwksURL = jwksURLForIssuer(iss)
-		}
-		allowedAuds = []string(provider.AllowedAudiences)
-		if provider.SubjectClaim != "" {
-			subjectClaim = provider.SubjectClaim
-		}
-		ws := provider.WorkspaceID
-		providerWS = &ws
-		if provider.TrustDomain != nil {
-			providerTrustDomain = *provider.TrustDomain
-		}
-	} else if errors.Is(perr, gorm.ErrRecordNotFound) {
+		Order("created_at").
+		Find(&providers).Error; err != nil {
+		return nil, fmt.Errorf("invalid_client: %w", err)
+	}
+	var candidates []svidCandidate
+	for i := range providers {
+		candidates = append(candidates, candidateFromProvider(&providers[i], iss))
+	}
+	if len(candidates) == 0 {
 		expectedIssuer := ""
 		if config.AppConfig != nil {
 			expectedIssuer = config.AppConfig.SpiffeOIDCIssuer
@@ -260,112 +248,38 @@ func authenticateSPIFFESVID(ctx context.Context, db *gorm.DB, svid, tokenEndpoin
 			log.Printf("auth.unverified_caller: workload auth attempt with untrusted issuer iss=%q claimed_sub=%q", iss, sub)
 			return nil, fmt.Errorf("invalid_client: token issuer is not a trusted workload identity provider")
 		}
-		jwksURL = jwksURLForIssuer(iss)
-		kind = "spiffe"
-	} else {
-		return nil, fmt.Errorf("invalid_client: %w", perr)
+		candidates = []svidCandidate{{kind: "spiffe", jwksURL: jwksURLForIssuer(iss), subjectClaim: "sub"}}
 	}
 
-	if kind == "spiffe" && !strings.HasPrefix(sub, "spiffe://") {
-		return nil, fmt.Errorf("invalid_client: SVID sub must be a SPIFFE ID")
-	}
-
-	// Trust-domain binding (fail-closed): if the matched provider declares a trust
-	// domain, the SVID's SPIFFE ID must belong to it. Without this a token from
-	// trusted issuer A could assert a SPIFFE ID under a different trust domain B.
-	if kind == "spiffe" && providerTrustDomain != "" {
-		td := strings.TrimPrefix(sub, "spiffe://")
-		if i := strings.IndexByte(td, '/'); i >= 0 {
-			td = td[:i]
-		}
-		if td != providerTrustDomain {
-			log.Printf("auth.trust_domain_mismatch: SVID sub %q (td=%q) does not match provider trust domain %q", sub, td, providerTrustDomain)
-			return nil, fmt.Errorf("invalid_client: SVID trust domain does not match the registered provider")
-		}
-	}
-
-	// Step 2: fetch the issuer's JWKS and verify the signature.
-	jwksBody, err := fetchURL(jwksURL)
-	if err != nil {
-		return nil, fmt.Errorf("invalid_client: cannot fetch workload issuer JWKS: %w", err)
-	}
-	keyMap, err := parseJWKSKeys(string(jwksBody))
-	if err != nil {
-		return nil, fmt.Errorf("invalid_client: workload issuer JWKS parse error: %w", err)
-	}
-
-	parsed, err := jwt.Parse(svid, func(t *jwt.Token) (interface{}, error) {
-		switch t.Method.(type) {
-		case *jwt.SigningMethodRSA, *jwt.SigningMethodRSAPSS, *jwt.SigningMethodECDSA:
-		default:
-			return nil, fmt.Errorf("unsupported token alg: %v", t.Header["alg"])
-		}
-		kid, _ := t.Header["kid"].(string)
-		if key, ok := keyMap[kid]; ok {
-			return key, nil
-		}
-		for _, k := range keyMap {
-			return k, nil
-		}
-		return nil, fmt.Errorf("kid not found in workload issuer JWKS")
-	}, jwt.WithValidMethods([]string{"RS256", "RS384", "RS512", "PS256", "ES256", "ES384", "ES512"}),
-		jwt.WithLeeway(30*time.Second))
-	if err != nil || !parsed.Valid {
-		return nil, fmt.Errorf("invalid_client: token verification failed: %w", err)
-	}
-
-	// Step 2b: validate audience. If the provider declares allowed audiences,
-	// require one of them; otherwise require this token endpoint (the SPIFFE
-	// default — `spire-agent api fetch jwt -audience <token-endpoint>`).
-	if len(allowedAuds) > 0 {
-		matched := false
-		for _, a := range allowedAuds {
-			if validateAud(claims, a) == nil {
-				matched = true
-				break
+	// Steps 2-3 for each candidate: verify the token against the provider's
+	// JWKS, audiences and trust domain, then map the subject to an active
+	// service account of the provider's own workspace. Exactly one candidate
+	// must accept the token; a token several workspaces would accept is
+	// refused rather than guessed.
+	jwksCache := map[string]map[string]interface{}{}
+	var (
+		sa       models.ServiceAccount
+		kind     string
+		accepted int
+		firstErr error
+	)
+	for _, cand := range candidates {
+		got, err := cand.authenticate(ctx, db, svid, claims, sub, tokenEndpoint, wantClientID, jwksCache)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
 			}
+			continue
 		}
-		if !matched {
-			return nil, fmt.Errorf("invalid_client: token aud must include one of the provider's allowed audiences")
+		accepted++
+		if accepted > 1 {
+			log.Printf("auth.ambiguous_workload: token from iss=%q sub=%q is accepted by providers of more than one workspace", iss, sub)
+			return nil, fmt.Errorf("invalid_client: token matches workload identity providers of more than one workspace")
 		}
-	} else if tokenEndpoint != "" {
-		if err := validateAud(claims, tokenEndpoint); err != nil {
-			return nil, fmt.Errorf("invalid_client: token aud must include this token endpoint")
-		}
+		sa, kind = *got, cand.kind
 	}
-
-	// Step 3: map the verified subject to an ACTIVE service account.
-	var sa models.ServiceAccount
-	if kind == "oidc" {
-		// Extract the configured subject claim (defaults to "sub").
-		subjVal := sub
-		if subjectClaim != "sub" {
-			subjVal, _ = claims[subjectClaim].(string)
-		}
-		if subjVal == "" {
-			return nil, fmt.Errorf("invalid_client: token has no %q claim to map", subjectClaim)
-		}
-		q := db.WithContext(ctx).Where("external_subject = ? AND status = 'active'", subjVal)
-		if providerWS != nil {
-			q = q.Where("workspace_id = ?", *providerWS)
-		}
-		if err := q.First(&sa).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				log.Printf("auth.unknown_caller: verified federated token for unmapped subject %q (issuer %q)", subjVal, iss)
-				return nil, fmt.Errorf("invalid_client: no active workload mapped to this federated subject")
-			}
-			return nil, fmt.Errorf("invalid_client: %w", err)
-		}
-	} else {
-		if err := db.WithContext(ctx).
-			Where("spiffe_id = ? AND status = 'active'", sub).
-			First(&sa).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				log.Printf("auth.unknown_caller: verified SVID for unregistered SPIFFE ID sub=%q", sub)
-				return nil, fmt.Errorf("invalid_client: no active service account for SPIFFE ID")
-			}
-			return nil, fmt.Errorf("invalid_client: %w", err)
-		}
+	if accepted == 0 {
+		return nil, firstErr
 	}
 	if sa.OAuthClientID == nil {
 		return nil, fmt.Errorf("invalid_client: service account has no linked OAuth client")
@@ -386,7 +300,7 @@ func authenticateSPIFFESVID(ctx context.Context, db *gorm.DB, svid, tokenEndpoin
 		var revokedCount int64
 		if err := db.WithContext(ctx).
 			Table("application_spiffe_identities").
-			Where("spiffe_id = ? AND (revoked_at IS NOT NULL OR status IN ('revoked','disabled'))", sub).
+			Where("workspace_id = ? AND spiffe_id = ? AND (revoked_at IS NOT NULL OR status IN ('revoked','disabled'))", sa.WorkspaceID, sub).
 			Count(&revokedCount).Error; err != nil {
 			return nil, fmt.Errorf("invalid_client: %w", err)
 		}
@@ -401,14 +315,14 @@ func authenticateSPIFFESVID(ctx context.Context, db *gorm.DB, svid, tokenEndpoin
 		db.WithContext(ctx).Exec(
 			`UPDATE application_spiffe_identities
 			    SET status = 'attested', last_attested_at = ?, last_error = NULL, last_error_at = NULL
-			  WHERE spiffe_id = ? AND status = 'attestation_pending'`,
-			now, sub,
+			  WHERE workspace_id = ? AND spiffe_id = ? AND status = 'attestation_pending'`,
+			now, sa.WorkspaceID, sub,
 		)
 	}
 	// Best-effort: stamp last_seen_at so the inventory can age out stale workloads.
-	db.WithContext(ctx).Exec(
-		`UPDATE service_accounts SET last_seen_at = ? WHERE workspace_id = ? AND id = ?`,
-		now, sa.WorkspaceID, sa.ID,
+	tenancy.GormExec(inWorkspace(ctx, sa.WorkspaceID), db,
+		`UPDATE service_accounts SET last_seen_at = $2 WHERE workspace_id = $1 AND id = $3`,
+		now, sa.ID,
 	)
 
 	return &client, nil
@@ -447,6 +361,27 @@ func authenticateClientSecretBasic(ctx context.Context, db *gorm.DB, clientID, s
 }
 
 // ── JWKS helpers ─────────────────────────────────────────────────────────────
+
+// selectJWK picks the key that verifies a token whose header names kid. When
+// the JWKS names its keys, the kid must match one exactly; a token without a
+// kid, or a JWKS whose only key is unnamed, uses that single key. Falling back
+// to "any key" let a token signed for one kid verify under another (AS-066).
+func selectJWK(keyMap map[string]interface{}, kid string) (interface{}, bool) {
+	if key, ok := keyMap[kid]; ok && kid != "" {
+		return key, true
+	}
+	if len(keyMap) != 1 {
+		return nil, false
+	}
+	for name, k := range keyMap {
+		// A named kid may only fall back to a key the JWKS left unnamed
+		// (parseJWKSKeys calls those "key-N").
+		if kid == "" || strings.HasPrefix(name, "key-") {
+			return k, true
+		}
+	}
+	return nil, false
+}
 
 // resolveJWKS returns a map of kid → public key from the stored JWKS row.
 // It handles both inline JWKS JSON and a jwks_uri fetch.
@@ -537,15 +472,12 @@ func VerifySVID(svid, tokenEndpoint string) (string, error) {
 			return nil, fmt.Errorf("unsupported SVID alg: %v", t.Header["alg"])
 		}
 		kid, _ := t.Header["kid"].(string)
-		if key, ok := keyMap[kid]; ok {
+		if key, ok := selectJWK(keyMap, kid); ok {
 			return key, nil
-		}
-		for _, k := range keyMap {
-			return k, nil
 		}
 		return nil, fmt.Errorf("kid not found in SPIFFE JWKS")
 	}, jwt.WithValidMethods([]string{"RS256", "RS384", "RS512", "PS256", "ES256", "ES384", "ES512"}),
-		jwt.WithLeeway(30*time.Second))
+		jwt.WithLeeway(30*time.Second), jwt.WithExpirationRequired())
 	if err != nil || !parsed.Valid {
 		return sub, fmt.Errorf("SVID signature/expiry verification failed: %w", err)
 	}
@@ -587,7 +519,8 @@ func ProbeSpiffeOIDC() (string, error) {
 }
 
 func fetchURL(u string) ([]byte, error) {
-	resp, err := http.Get(u) //nolint:noctx
+	// Tenants choose these URLs: fetch through the SSRF-safe client (AS-042).
+	resp, err := safehttp.Client().Get(u) //nolint:noctx
 	if err != nil {
 		return nil, err
 	}
@@ -767,6 +700,17 @@ func ExtractClientIDFromBasicAuth(r *http.Request) string {
 	return clientID
 }
 
+// HasClientCredentials reports whether the request presents a client
+// credential (Basic auth or a client assertion), valid or not. Callers that
+// tolerate unauthenticated clients use it so a wrong credential is still
+// refused rather than treated as "none sent".
+func HasClientCredentials(r *http.Request) bool {
+	if _, _, ok := r.BasicAuth(); ok {
+		return true
+	}
+	return r.FormValue("client_assertion") != ""
+}
+
 // LookupClientByID loads an MCPOAuthClient by its client_id string.
 func LookupClientByID(ctx context.Context, db *gorm.DB, clientID string) (*models.MCPOAuthClient, error) {
 	var client models.MCPOAuthClient
@@ -794,4 +738,153 @@ func HashClientSecret(secret string) (string, error) {
 func GenerateClientSecret() (string, error) {
 	id := uuid.New()
 	return strings.ReplaceAll(id.String(), "-", "") + strings.ReplaceAll(uuid.New().String(), "-", ""), nil
+}
+
+// svidCandidate is one way a workload token's issuer can be trusted: a
+// registered workload_identity_provider (scoped to its workspace), or the
+// legacy global SPIFFE_OIDC_ISSUER (ws nil, instance-wide).
+type svidCandidate struct {
+	kind         string
+	jwksURL      string
+	allowedAuds  []string
+	subjectClaim string
+	ws           *uuid.UUID
+	trustDomain  string
+}
+
+func candidateFromProvider(p *models.WorkloadIdentityProvider, iss string) svidCandidate {
+	c := svidCandidate{kind: p.Kind, subjectClaim: "sub", allowedAuds: []string(p.AllowedAudiences)}
+	if p.JWKSUri != nil && *p.JWKSUri != "" {
+		c.jwksURL = *p.JWKSUri
+	} else {
+		c.jwksURL = jwksURLForIssuer(iss)
+	}
+	if p.SubjectClaim != "" {
+		c.subjectClaim = p.SubjectClaim
+	}
+	ws := p.WorkspaceID
+	c.ws = &ws
+	if p.TrustDomain != nil {
+		c.trustDomain = *p.TrustDomain
+	}
+	return c
+}
+
+// authenticate verifies the token as this candidate would and returns the
+// active service account it maps to in the candidate's workspace.
+func (cand svidCandidate) authenticate(ctx context.Context, db *gorm.DB, svid string, claims jwt.MapClaims,
+	sub, tokenEndpoint, wantClientID string, jwksCache map[string]map[string]interface{}) (*models.ServiceAccount, error) {
+
+	if cand.kind == "spiffe" && !strings.HasPrefix(sub, "spiffe://") {
+		return nil, fmt.Errorf("invalid_client: SVID sub must be a SPIFFE ID")
+	}
+
+	// Trust-domain binding (fail-closed): if the provider declares a trust
+	// domain, the SVID's SPIFFE ID must belong to it. Without this a token from
+	// trusted issuer A could assert a SPIFFE ID under a different trust domain B.
+	if cand.kind == "spiffe" && cand.trustDomain != "" {
+		td := strings.TrimPrefix(sub, "spiffe://")
+		if i := strings.IndexByte(td, '/'); i >= 0 {
+			td = td[:i]
+		}
+		if td != cand.trustDomain {
+			log.Printf("auth.trust_domain_mismatch: SVID sub %q (td=%q) does not match provider trust domain %q", sub, td, cand.trustDomain)
+			return nil, fmt.Errorf("invalid_client: SVID trust domain does not match the registered provider")
+		}
+	}
+
+	// Step 2: fetch the provider's JWKS (once per URL) and verify the signature.
+	keyMap, ok := jwksCache[cand.jwksURL]
+	if !ok {
+		jwksBody, err := fetchURL(cand.jwksURL)
+		if err != nil {
+			return nil, fmt.Errorf("invalid_client: cannot fetch workload issuer JWKS: %w", err)
+		}
+		keyMap, err = parseJWKSKeys(string(jwksBody))
+		if err != nil {
+			return nil, fmt.Errorf("invalid_client: workload issuer JWKS parse error: %w", err)
+		}
+		jwksCache[cand.jwksURL] = keyMap
+	}
+
+	parsed, err := jwt.Parse(svid, func(t *jwt.Token) (interface{}, error) {
+		switch t.Method.(type) {
+		case *jwt.SigningMethodRSA, *jwt.SigningMethodRSAPSS, *jwt.SigningMethodECDSA:
+		default:
+			return nil, fmt.Errorf("unsupported token alg: %v", t.Header["alg"])
+		}
+		kid, _ := t.Header["kid"].(string)
+		if key, ok := selectJWK(keyMap, kid); ok {
+			return key, nil
+		}
+		return nil, fmt.Errorf("kid not found in workload issuer JWKS")
+	}, jwt.WithValidMethods([]string{"RS256", "RS384", "RS512", "PS256", "ES256", "ES384", "ES512"}),
+		jwt.WithLeeway(30*time.Second), jwt.WithExpirationRequired())
+	if err != nil || !parsed.Valid {
+		return nil, fmt.Errorf("invalid_client: token verification failed: %w", err)
+	}
+
+	// Step 2b: validate audience. If the provider declares allowed audiences,
+	// require one of them; otherwise require this token endpoint (the SPIFFE
+	// default — `spire-agent api fetch jwt -audience <token-endpoint>`).
+	if len(cand.allowedAuds) > 0 {
+		matched := false
+		for _, a := range cand.allowedAuds {
+			if validateAud(claims, a) == nil {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return nil, fmt.Errorf("invalid_client: token aud must include one of the provider's allowed audiences")
+		}
+	} else if tokenEndpoint != "" {
+		if err := validateAud(claims, tokenEndpoint); err != nil {
+			return nil, fmt.Errorf("invalid_client: token aud must include this token endpoint")
+		}
+	}
+
+	// Step 3: map the verified subject to an ACTIVE service account. A
+	// registered provider belongs to one workspace; its tokens may only map to
+	// that workspace's workloads. Only the legacy global SPIFFE_OIDC_ISSUER (no
+	// provider row, operator-controlled) resolves instance-wide.
+	var sa models.ServiceAccount
+	var q *gorm.DB
+	if cand.kind == "oidc" {
+		subjVal := sub
+		if cand.subjectClaim != "sub" {
+			subjVal, _ = claims[cand.subjectClaim].(string)
+		}
+		if subjVal == "" {
+			return nil, fmt.Errorf("invalid_client: token has no %q claim to map", cand.subjectClaim)
+		}
+		q = db.WithContext(ctx).Where("external_subject = ? AND status = 'active'", subjVal)
+		sub = subjVal
+	} else {
+		q = db.WithContext(ctx).Where("spiffe_id = ? AND status = 'active'", sub)
+	}
+	if cand.ws != nil {
+		q = q.Where("workspace_id = ?", *cand.ws)
+	}
+	if err := q.First(&sa).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			log.Printf("auth.unknown_caller: verified workload token for unmapped subject %q (kind %s)", sub, cand.kind)
+			return nil, fmt.Errorf("invalid_client: no active workload mapped to this subject")
+		}
+		return nil, fmt.Errorf("invalid_client: %w", err)
+	}
+	if wantClientID != "" {
+		if sa.OAuthClientID == nil {
+			return nil, fmt.Errorf("invalid_client: service account has no linked OAuth client")
+		}
+		var n int64
+		if err := db.WithContext(ctx).Model(&models.MCPOAuthClient{}).
+			Where("id = ? AND client_id = ?", *sa.OAuthClientID, wantClientID).Count(&n).Error; err != nil {
+			return nil, fmt.Errorf("invalid_client: %w", err)
+		}
+		if n == 0 {
+			return nil, fmt.Errorf("invalid_client: client_id does not match the workload the token maps to")
+		}
+	}
+	return &sa, nil
 }

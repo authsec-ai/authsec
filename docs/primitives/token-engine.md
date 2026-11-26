@@ -7,8 +7,8 @@
 
 A bearer token belongs to exactly **one family**, decided by its JWT header `kid`:
 
-- **`FamilyNative`** — minted by AuthSec's native issuer (families **M2M / XAA / CIBA**). Header `kid` starts with **`native:`** (`NativeKIDPrefix`).
-- **`FamilyHydra`** — interactive OAuth (`authorization_code` / `refresh_token`) and anything opaque / unparseable / non-native → ORY Hydra's introspection path.
+- **`FamilyNative`** — minted by AuthSec's native issuer (families **M2M / XAA / CIBA / auth_code**). Header `kid` starts with **`native:`** (`NativeKIDPrefix`). `auth_code` is the access token of a browser login (`authorization_code` / `refresh_token` at `/oauth/token`, sealer on): Hydra runs the grant, AuthSec replaces Hydra's access token.
+- **`FamilyHydra`** — Hydra's refresh and id tokens, Hydra access tokens issued with the sealer off, and anything opaque / unparseable / non-native → ORY Hydra's introspection path.
 
 **A native `kid` commits to the native path** — a bad signature is *rejected*, never retried on Hydra. (`internal/tokens/classifier.go`, the package doc comment.)
 
@@ -29,7 +29,10 @@ A bearer token belongs to exactly **one family**, decided by its JWT header `kid
 `client_id` (authenticating client), `jti`, `iat`, `exp`, **`tf`** (token family),
 optional **`act`** (`{client_id, spiffe_id}` — the actor for XAA/workload), optional
 `source_grant_jti` / `source_grant_iss` (XAA provenance). Native tokens are **short-lived,
-non-refreshable**.
+non-refreshable**: an `auth_code` token is renewed by redeeming Hydra's refresh token, which
+mints a new one. Its row (only the row, never the JWT) links to that refresh token:
+`source_grant_jti` = its SHA-256, `source_grant_iss` = `urn:authsec:hydra-refresh-token`
+(`NativeClaims.GrantRefHash`), so rotating or revoking the refresh token revokes it.
 
 ## JWKS
 

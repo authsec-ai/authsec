@@ -1184,7 +1184,7 @@ func (ctl *CloudAWSController) GetScanRun(c *gin.Context) {
 	//
 	// The run gains projection: {status, rev} (§5.3): what became of its
 	// projection job, and the revision it published -- null when the run has
-	// no job (the switch was off, or it never published). Read in the SAME
+	// no job (it ran without the graph schema, or it never published). Read in the SAME
 	// statement as the run, so the two cannot straddle the projection's commit.
 	rec, err := repositories.NewCloudScanRunRepository(ctl.db).GetWithProjection(workspaceID, runID)
 	if err != nil {

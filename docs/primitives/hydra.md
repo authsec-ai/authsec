@@ -10,7 +10,8 @@ AuthSec is **not** a Hydra wrapper — it's a dual-path AS:
 
 | Token family | Minted by | Hydra involved? | Validated by |
 |---|---|---|---|
-| `authorization_code` access token | Hydra | Yes — Hydra runs the protocol | Hydra introspect |
+| `authorization_code` / `refresh_token` access token, sealer on (production) | `NativeIssuer` (family `auth_code`), after Hydra runs the grant | Yes — Hydra runs the protocol; its own access token is replaced | Native path |
+| `authorization_code` access token, sealer off | Hydra | Yes | Hydra introspect |
 | `refresh_token` | Hydra | Yes | Hydra introspect |
 | `FamilyNative` (M2M / XAA / CIBA) | `NativeIssuer` | **No** | Native path (local RS256 verify + `revoked_tokens`) |
 
@@ -23,6 +24,9 @@ signature is bad on the native path it's rejected — never retried on Hydra.
 - **Interactive `authorization_code` + PKCE** — the browser redirect + consent loop.
 - **`refresh_token`** issuance and rotation.
 - **`id_token`** (OIDC) minting.
+- Not the access-token audience: with the native sealer on, consent grants Hydra no
+  access-token audience and `/oauth/token` forwards no `resource`/`audience`, so Hydra's
+  per-client audience allow-list ("not whitelisted") never applies.
 - **Hydra client storage** — `mcp_oauth_clients.hydra_client_id` is the Hydra-side client
   identity. AuthSec's `mcp_oauth_clients` is the authoritative row; Hydra is the protocol
   runtime.

@@ -251,7 +251,7 @@ func rdetailPhase1Scan(l *p2Lab, a *p2Account, f *s3bFakes) models.CloudScanRun 
 		l.t.Fatalf("enqueue: %v", err)
 	}
 	w := services.NewAWSScanWorker(l.db, a.svc).WithOwner("scan-worker-rdetail-phase1").
-		WithGraphProjection(services.NewGraphProjectionGate(false, "")).WithScannerHook(f.hook(a))
+		WithGraphProjection(services.NewGraphProjectionGate(false)).WithScannerHook(f.hook(a))
 	if worked, err := w.RunOnce(context.Background()); err != nil || !worked {
 		l.t.Fatalf("phase 1 scan: worked=%v err=%v", worked, err)
 	}
@@ -707,7 +707,7 @@ func TestP2RDetailOptionalWork(t *testing.T) {
 	var out any
 	var err error
 	for attempt := 0; attempt < 20; attempt++ {
-		out, err = r.ResourceAccess(context.Background(), l.ws, res, url.Values{})
+		out, err = r.ResourceAccess(wsCtx(context.Background(), l.ws), res, url.Values{})
 		if e := igaread.AsError(err); e == nil || e.Code != "query_timeout" {
 			break
 		}
