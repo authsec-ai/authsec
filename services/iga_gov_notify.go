@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -123,6 +124,11 @@ type GovNoticeSubject struct {
 	// OnSent and OnDead run in the outcome's transaction (optional).
 	OnSent func(tx *gorm.DB, n *models.IGAGovNotification, recipientUser *uuid.UUID) error
 	OnDead func(tx *gorm.DB, n *models.IGAGovNotification, recipientUser *uuid.UUID) error
+	// WebhookTimestamped signs the workspace webhook as the agent runtime
+	// SIEM webhook is (X-AuthSec-Timestamp, HMAC over timestamp + "." +
+	// body, X-AuthSec-Delivery = the notification id): asks (W4). Off keeps
+	// the body-only signature existing receivers verify.
+	WebhookTimestamped bool
 }
 
 // GovNotificationChannel is a delivery channel beyond email and webhook:
@@ -469,8 +475,16 @@ func (g *GovNotifier) deliver(ctx context.Context, n *models.IGAGovNotification,
 		if err != nil {
 			return "", GovNotifyPermanent(err)
 		}
-		return "", g.Webhook.Send(ctx, notify.Message{Channel: notify.ChannelWebhook, To: target.URL, Body: body,
-			Secret: target.Secret, UserAgent: notify.DefaultUserAgent})
+		m := notify.Message{Channel: notify.ChannelWebhook, To: target.URL, Body: body,
+			Secret: target.Secret, UserAgent: notify.DefaultUserAgent}
+		if subj.WebhookTimestamped {
+			at := time.Now()
+			if g.now != nil {
+				at = g.now()
+			}
+			m.Timestamp, m.DeliveryID = strconv.FormatInt(at.Unix(), 10), n.ID.String()
+		}
+		return "", g.Webhook.Send(ctx, m)
 	default:
 		ch, ok := govNoticeChannel(n.Channel)
 		if !ok {

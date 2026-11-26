@@ -344,6 +344,13 @@ func main() {
 	// Agent runtime cases (W3): places alerts the sink left out of a case and
 	// backfills alerts raised before migration 186.
 	go services.RunAgentCaseClusterWorker(context.Background(), config.DB)
+	// Asks (W4): escalation of due asks every minute
+	// (AUTHSEC_DISABLE_ASK_ESCALATION=true turns it off) and the ticketing /
+	// paging sync (AUTHSEC_DISABLE_ASK_EXTERNAL_SYNC=true), leader-locked;
+	// integration secrets in Vault.
+	services.InstallAgentAsks()
+	go services.RunAgentAskEscalationWorker(context.Background(), config.DB)
+	go services.RunAgentAskExternalWorker(context.Background(), config.DB)
 	// History snapshots (SPEC-secops-backend-upgrade.md W9): daily snapshots
 	// and snapshot retention, leader-locked (AUTHSEC_DISABLE_SNAPSHOTS=true
 	// turns it off on a replica).

@@ -23,7 +23,7 @@ import (
 //  2. creates the default responder group with the workspace admins;
 //  3. marks an active agent deleted_at_source when every source it has
 //     reports it gone, writing agent.deleted_at_source and agent.ask_needed
-//     (TODO(W4): an ask); an agent seen again is active once more;
+//     (and an ask, W4); an agent seen again is active once more;
 //  4. hygiene, stale agents: an active agent whose instances act as cloud
 //     identities with recorded calls (cloud_usage), and whose last call is
 //     more than 30 days old, gets a stale_agent finding and its iga_agents
@@ -112,6 +112,7 @@ func sweepDeletedAtSource(tx *gorm.DB, ws uuid.UUID, res *AgentSweepResult) erro
 				"subject": map[string]any{"question": "The agent is gone from every source: retire it, or say where it went."}}); err != nil {
 			return err
 		}
+		raiseAgentAskNeeded(tx, ws, id, AskReasonDeletedAtSource, nil)
 		res.DeletedAtSource++
 	}
 	var back []uuid.UUID

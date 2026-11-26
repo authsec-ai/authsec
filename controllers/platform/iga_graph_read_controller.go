@@ -169,6 +169,7 @@ func (ctl *IGAGraphReadController) GetCapabilities(c *gin.Context) {
 		// of the agent runtime 147-149.
 		"agent_alerts":  services.AgentAlertsCapabilities(ctl.db()),
 		"agent_cases":   services.AgentCasesCapabilities(ctl.db()),
+		"agent_asks":    services.AgentAsksCapabilities(ctl.db()),
 		"agent_runtime": services.AgentRuntimeCapabilities(ctl.db()),
 	}})
 }

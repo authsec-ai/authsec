@@ -118,6 +118,11 @@ func SetupIGARoutes(r gin.IRouter, igaController *platformCtrl.IGAController, ig
 		// /api/iga/v1/agent-runtime/cases (agent_runtime_cases_controller.go).
 		platformCtrl.MountAgentRuntimeCaseRoutes(iga, platformCtrl.NewAgentRuntimeCasesControllerFor(igaGraphRead))
 
+		// Asks and their delivery (SPEC-secops-backend-upgrade.md W4):
+		// /api/iga/v1/agent-runtime/asks[/policy|/:id/...], case tickets and
+		// /api/iga/v1/integrations/{ticketing,paging} (agent_asks_controller.go).
+		platformCtrl.MountAgentAskRoutes(iga, platformCtrl.NewAgentAsksControllerFor(igaGraphRead))
+
 		// Model provider usage (SPEC-agent-runtime-provider-usage.md, opt-in):
 		// /api/iga/v1/agent-runtime/model-providers
 		// (agent_runtime_provider_controller.go).

@@ -1123,6 +1123,8 @@ var contractCapabilities = contractObj(contractReq("data", contractObj(
 	contractOpt("capabilities", contractArr(contractCapabilityScope)),
 	// Remediation (SPEC-secops-backend-upgrade.md W8, migration 230).
 	contractOpt("remediation", contractRemediationCapabilities),
+	// Asks (SPEC-secops-backend-upgrade.md W4, migration 220).
+	contractOpt("agent_asks", contractAgentSchemaCapabilities),
 )))
 
 // A /capabilities source: one delivering source and its silence state (W1).

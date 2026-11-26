@@ -172,3 +172,9 @@ services/agent_remediation_iac.go
 services/agent_remediation_proof.go
 services/agent_remediation_run.go
 controllers/platform/agent_remediation_controller.go
+services/agent_asks.go
+services/agent_asks_delivery.go
+services/agent_asks_policy.go
+services/agent_asks_needed.go
+services/agent_ask_connectors.go
+controllers/platform/agent_asks_controller.go

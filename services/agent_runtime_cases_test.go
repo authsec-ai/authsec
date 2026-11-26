@@ -94,7 +94,7 @@ func TestAgentCaseAlertIDsAndTitle(t *testing.T) {
 
 func TestAgentCaseBundleHashStable(t *testing.T) {
 	b := AgentCaseBundle{Format: AgentCaseExportFormat, Case: AgentCase{ID: uuid.New(), Number: 3, Title: "t <x>"},
-		Alerts: []AgentCaseAlert{}, Evidence: []AgentCaseEvidence{}, Asks: []any{}, Stops: []AgentCaseStop{},
+		Alerts: []AgentCaseAlert{}, Evidence: []AgentCaseEvidence{}, Asks: []AgentAskSummary{}, Stops: []AgentCaseStop{},
 		Notes: []AgentCaseNote{}, Links: []AgentCaseLink{}, Log: []AgentCaseLogEntry{{ID: 1, Payload: json.RawMessage(`{"a":1}`)}}}
 	r1, _ := json.Marshal(b)
 	r2, _ := json.Marshal(b)

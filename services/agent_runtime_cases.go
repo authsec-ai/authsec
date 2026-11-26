@@ -324,8 +324,8 @@ type AgentCaseView struct {
 	AgentCase
 	Alerts   []AgentCaseAlert    `json:"alerts"`
 	Evidence []AgentCaseEvidence `json:"evidence"`
-	// Asks are W4's; none yet.
-	Asks  []any               `json:"asks"`
+	// Asks are the case's asks (W4: agent_ask.case_id).
+	Asks  []AgentAskSummary   `json:"asks"`
 	Stops []AgentCaseStop     `json:"stops"`
 	Notes []AgentCaseNote     `json:"notes"`
 	Links []AgentCaseLink     `json:"links"`
@@ -901,7 +901,7 @@ func readAgentCaseView(tx *gorm.DB, ws, id uuid.UUID, forExport bool) (*AgentCas
 	if err != nil {
 		return nil, err
 	}
-	v := &AgentCaseView{AgentCase: *c, Alerts: []AgentCaseAlert{}, Evidence: []AgentCaseEvidence{}, Asks: []any{},
+	v := &AgentCaseView{AgentCase: *c, Alerts: []AgentCaseAlert{}, Evidence: []AgentCaseEvidence{}, Asks: []AgentAskSummary{},
 		Stops: []AgentCaseStop{}, Notes: []AgentCaseNote{}, Links: []AgentCaseLink{}, Log: []AgentCaseLogEntry{}}
 	var members []agentCaseMemberRow
 	if err := tx.Raw(`SELECT alert_id, indicators, added_by, added_at FROM agent_case_alert
@@ -946,6 +946,11 @@ func readAgentCaseView(tx *gorm.DB, ws, id uuid.UUID, forExport bool) (*AgentCas
 	                   ORDER BY l.created_at, l.id`, id, ws, id, id).Scan(&v.Links).Error; err != nil {
 		return nil, err
 	}
+	asks, err := readCaseAsks(tx, ws, id)
+	if err != nil {
+		return nil, err
+	}
+	v.Asks = asks
 	stops, err := readAgentCaseStops(tx, ws, id, v.Alerts)
 	if err != nil {
 		return nil, err
@@ -1471,7 +1476,7 @@ type AgentCaseBundle struct {
 	Case     AgentCase           `json:"case"`
 	Alerts   []AgentCaseAlert    `json:"alerts"`
 	Evidence []AgentCaseEvidence `json:"evidence"`
-	Asks     []any               `json:"asks"`
+	Asks     []AgentAskSummary   `json:"asks"`
 	Stops    []AgentCaseStop     `json:"stops"`
 	Notes    []AgentCaseNote     `json:"notes"`
 	Links    []AgentCaseLink     `json:"links"`
