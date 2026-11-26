@@ -4,6 +4,18 @@ Newest first. Each session records what was done, what was learned, and what's n
 
 ---
 
+## 2026-11-26 — SecOps backend upgrade, batch 2 and wiring (branch `secops/batch1`)
+
+- Built from `secops/batch1` in parallel worktrees, then merged into it (local only, nothing pushed):
+  - W5 (`secops/w5-tiers`, 210-212): one action -> tier map (`services/governance_tiers.go`) with `TierGuard` on every tiered route group (an unmapped write route answers 403 `tier_unmapped`); one second-person helper (`services/second_person.go`) used by all seven approval mechanisms (rule drift fixed: break-glass only for the sole approver, reviews everywhere, one set of error codes); approvals inbox `GET /api/iga/v1/approvals` and overdue break-glass reviews; `governance:remediate`; automation identities limited to tier 0/1 and never deciders; case subjects cannot approve requests about their case.
+  - W4 (`secops/w4-asks`, 220): asks with responder-group deciders, due times from policy only, escalation, Slack buttons with step-up, e-mail, webhook, Jira, ServiceNow, PagerDuty, Opsgenie (Vault secrets, safehttp); `agent.ask_needed` writers raise real asks; case detail shows asks.
+  - W8 (`secops/w8-remediation`, 230): remediation role template, prepared / IaC PR / write modes, writers remove_grant, rotate_secret, rotate_iam_key, rotate_provider_key (ask), retire_agent, revert_snapshot; proven only with the change event and an end-state read; apply is tier 4 plus a second person.
+  - W6 (`secops/w6-gateway-joins`, 240-243): provider keys in Vault, AuthSec-issued `agk_` agent keys bound to a workload identity (key and identity both), run id, model version, argument bounds and holds, DNS lookup rows, VPC flow summaries, per-minute provider usage, reconciliation (observed / bypass / outside_use) with USAGE-02/03 alerts.
+- Wiring after the merge: the tier map gained the 22 write routes merged after W5 branched and the W4/W6/W8 groups run `TierGuard`; `services/secops_wiring.go` installs remediation and gateway-hold asks (W4), gateway rule removal on retire (W6) and case evidence pins (W1); a platform stop raises an ask; migration 195 makes `agent_containment_hold.case_id` a same-workspace FK to `agent_case`.
+- Checks on the final branch (local Postgres 16, Docker hung): fresh bootstrap == old bootstrap + 163..243 (0 differences); every workspace table has forced RLS; ratchet 69 (baseline 72); tier-map route test passes; wiring tests pass. Full `tests/integration` package (758 s): everything passes except `TestP2EgatesE11HardBudgetsThroughTheRoutes` (the graph read hits its time budget before the 500-node budget on this machine; fails the same on the base commit) and `TestP2IdetailPermissionsStatementCap` (passes alone; load). W2 tests now open real cases (195 FK); W9 seeds `proof_state`. Not run: `tests/integration/flows` (AS-182).
+
+---
+
 ## 2026-11-25 — SecOps backend upgrade, batch 1 (branch `secops/batch1`)
 
 - Built in parallel worktrees from `fix/w0-combined`, each with its own migration block, then combined on `secops/batch1` (local only, nothing pushed):
