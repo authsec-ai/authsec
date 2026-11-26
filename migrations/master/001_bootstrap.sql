@@ -1839,7 +1839,7 @@ CREATE TABLE public.native_tokens (
     jti uuid PRIMARY KEY,
     iss text NOT NULL,                       -- = OAUTH_ISSUER_URL; keeps table honest with revoked_tokens(iss,…)
     workspace_id uuid NOT NULL,
-    token_family text NOT NULL CHECK (token_family IN ('xaa', 'm2m', 'ciba')),
+    token_family text NOT NULL CHECK (token_family IN ('xaa', 'm2m', 'ciba', 'auth_code')),
     subject_type text NOT NULL,              -- 'user' | 'service_account'
     subject_id uuid NOT NULL,
     actor_client_id text,                    -- XAA/CIBA: the acting agent client
@@ -1848,8 +1848,8 @@ CREATE TABLE public.native_tokens (
     resource_server_id uuid NOT NULL,
     aud text NOT NULL,                       -- = resource_servers.resource_uri
     scope text NOT NULL,
-    source_grant_jti text,                   -- XAA: the redeemed ID-JAG jti
-    source_grant_iss text,                   -- XAA: iss of the redeemed ID-JAG (for issuer bulk-revoke)
+    source_grant_jti text,                   -- XAA: the redeemed ID-JAG jti; auth_code: SHA-256 of the Hydra refresh token
+    source_grant_iss text,                   -- XAA: iss of the redeemed ID-JAG (for issuer bulk-revoke); auth_code: 'urn:authsec:hydra-refresh-token'
     rar_id uuid,                             -- CIBA: server-side RAR reference (RFC 9396)
     issued_at timestamptz NOT NULL,
     expires_at timestamptz NOT NULL,

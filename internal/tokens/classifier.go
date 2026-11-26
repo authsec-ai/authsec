@@ -1,12 +1,14 @@
-// Package tokens implements AuthSec's native token family (M2M / XAA / CIBA):
-// classification, a Vault-backed RS256 key manager, the narrow minting seam
-// (NativeIssuer), and a GrantHandler interface that lets the existing Hydra
-// orchestration coexist without being wrapped as a generic sealer.
+// Package tokens implements AuthSec's native token family (M2M / XAA / CIBA /
+// auth_code): classification, a Vault-backed RS256 key manager, the narrow
+// minting seam (NativeIssuer), and a GrantHandler interface that lets the
+// existing Hydra orchestration coexist without being wrapped as a generic sealer.
 //
-// Prime directive (Phase 0): recognize, introspect, revoke and publish keys for
-// two token families while leaving every Hydra authorization_code/refresh_token
-// behavior byte-for-byte intact. A token with a native `kid` commits to the
-// native path (validate or reject) and NEVER falls back to Hydra.
+// With the native sealer on, every access token a resource server sees is
+// native, including browser login: Hydra still runs the authorization_code and
+// refresh_token grants (code, PKCE, consent, id_token, refresh token), and
+// AuthSec replaces Hydra's access token with a native one. A token with a native
+// `kid` commits to the native path (validate or reject) and NEVER falls back to
+// Hydra.
 package tokens
 
 import (

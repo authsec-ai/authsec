@@ -8,9 +8,10 @@ import (
 
 // Token family constants for NativeToken.TokenFamily.
 const (
-	TokenFamilyXAA  = "xaa"  // ID-JAG redemption (agent acting for a user)
-	TokenFamilyM2M  = "m2m"  // client_credentials (service account)
-	TokenFamilyCIBA = "ciba" // backchannel-approved (user, via agent)
+	TokenFamilyXAA      = "xaa"       // ID-JAG redemption (agent acting for a user)
+	TokenFamilyM2M      = "m2m"       // client_credentials (service account)
+	TokenFamilyCIBA     = "ciba"      // backchannel-approved (user, via agent)
+	TokenFamilyAuthCode = "auth_code" // authorization_code / refresh_token (user signed in through the browser)
 )
 
 // Revoked-token kinds for RevokedToken.Kind.
@@ -20,7 +21,7 @@ const (
 )
 
 // NativeToken is the metadata-only registry for a token minted by the
-// NativeSealer (M2M / XAA / CIBA). It holds NO raw token material — the JWT
+// NativeSealer (M2M / XAA / CIBA / auth_code). It holds NO raw token material — the JWT
 // proves signature + jti, and this row is the authoritative source for
 // workspace / subject / resource-server / family / scope at introspection time.
 //
