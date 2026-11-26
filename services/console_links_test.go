@@ -16,7 +16,10 @@ var consoleRoutes = struct{ exact, prefix []string }{
 	exact: []string{"/iga/policy", "/iga/policy/setup/notifications", "/iga/connections"},
 	// /iga/policy/<id> is an access policy; /iga/policy/setup/<section>
 	// forwards to a connection's tab.
-	prefix: []string{"/iga/policy/", "/iga/policy/setup/notifications?", "/iga/connections/", "/iga/identities/", "/iga/agent-runtime/alerts/"},
+	prefix: []string{"/iga/policy/", "/iga/policy/setup/notifications?", "/iga/connections/", "/iga/identities/", "/iga/agent-runtime/alerts/",
+		// SecOps W4: an ask's page and a case's page (linked from ask notices
+		// and tickets). The console pages are a UI follow-up of W3/W4.
+		"/iga/agent-runtime/asks/", "/iga/agent-runtime/cases/"},
 }
 
 var reConsolePath = regexp.MustCompile(`"(/iga/[^"]*)"`)
