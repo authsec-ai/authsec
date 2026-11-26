@@ -1115,6 +1115,8 @@ var contractCapabilities = contractObj(contractReq("data", contractObj(
 	// Agent runtime visibility: alerts (150) and the runtime routes (147-149, 153).
 	contractOpt("agent_alerts", contractAgentSchemaCapabilities),
 	contractOpt("agent_runtime", contractAgentSchemaCapabilities),
+	// Asks (SPEC-secops-backend-upgrade.md W4, migration 220).
+	contractOpt("agent_asks", contractAgentSchemaCapabilities),
 )))
 
 // The /capabilities agent_alerts and agent_runtime blocks: available, and the
