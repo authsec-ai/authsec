@@ -732,3 +732,110 @@ func TestRemediationRevertSnapshot(t *testing.T) {
 		t.Fatalf("as of before the snapshot: %d", code)
 	}
 }
+
+// remVault is an in-memory Vault.
+type remVault struct {
+	mu sync.Mutex
+	m  map[string]map[string]interface{}
+}
+
+func (v *remVault) WriteSecret(path string, data map[string]interface{}) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.m[path] = data
+	return nil
+}
+func (v *remVault) ReadSecret(path string) (map[string]interface{}, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	d, ok := v.m[path]
+	if !ok {
+		return nil, fmt.Errorf("not found")
+	}
+	return d, nil
+}
+func (v *remVault) DeleteSecret(path string) error { delete(v.m, path); return nil }
+
+// remAssumer answers in one account, only with the right ExternalId.
+type remAssumer struct {
+	account, ext string
+	calls        int
+}
+
+func (a *remAssumer) AssumeRemediation(_ context.Context, in awsremediate.AssumeInput) (awsremediate.Writer, *awsremediate.Identity, error) {
+	a.calls++
+	if in.ExternalID != a.ext {
+		return nil, nil, fmt.Errorf("AccessDenied")
+	}
+	return nil, &awsremediate.Identity{AccountID: a.account, ARN: in.RoleARN}, nil
+}
+
+func TestRemediationBindingSetupVerifyRevokeAndReadiness(t *testing.T) {
+	db := igaDB(t)
+	w := remSeed(t, db, "bind", false)
+	b := remSeed(t, db, "bindb", false)
+	vc := &remVault{m: map[string]map[string]interface{}{}}
+	t.Cleanup(services.SetRemediationVault(vc))
+	as := &remAssumer{account: w.account}
+	t.Cleanup(services.SetRemediationAssumer(as))
+	api := newRemAPI(t, db).as(w.ws, w.requester, w.requesterM)
+	// A new workspace has no remediation role: prepared.
+	_, body := api.do("GET", "/remediations/readiness", nil)
+	acc := remData(body)["accounts"].([]any)[0].(map[string]any)
+	if acc["ready"] != false || acc["mode"] != "prepared" || acc["binding_state"] != "none" {
+		t.Fatalf("readiness before setup: %v", acc)
+	}
+	// Another workspace's connector is 404.
+	if code, _ := api.do("POST", "/remediations/bindings", map[string]any{"connector_id": b.conn.String()}); code != 404 {
+		t.Fatalf("B's connector: %d", code)
+	}
+	code, body := api.do("POST", "/remediations/bindings", map[string]any{"connector_id": w.conn.String()})
+	if code != 200 {
+		t.Fatalf("setup: %d %v", code, body)
+	}
+	s := remData(body)
+	ext := s["external_id"].(string)
+	if !strings.HasPrefix(ext, "rem") || services.VerifyRemediationExternalID(w.ws, ext) != nil ||
+		services.VerifyEnforcementExternalID(w.ws, ext) == nil || services.VerifyRemediationExternalID(b.ws, ext) == nil {
+		t.Fatalf("external id domain: %q", ext)
+	}
+	as.ext = ext
+	bid := s["binding"].(map[string]any)["id"].(string)
+	role := "arn:aws:iam::" + w.account + ":role/" + s["role_name"].(string)
+	// A role of another account, or not the stack's, is refused before any assume.
+	if code, _ := api.do("POST", "/remediations/bindings/"+bid+"/verify", map[string]any{"role_arn": "arn:aws:iam::999999999999:role/" + s["role_name"].(string)}); code != 422 {
+		t.Fatalf("wrong account: %d", code)
+	}
+	if code, _ := api.do("POST", "/remediations/bindings/"+bid+"/verify", map[string]any{"role_arn": "arn:aws:iam::" + w.account + ":role/Admin"}); code != 400 {
+		t.Fatalf("wrong role: %d", code)
+	}
+	if as.calls != 0 {
+		t.Fatal("assumed a role that is not the stack's")
+	}
+	if code, body := api.do("POST", "/remediations/bindings/"+bid+"/verify", map[string]any{"role_arn": role}); code != 200 {
+		t.Fatalf("verify: %d %v", code, body)
+	}
+	_, body = api.do("GET", "/remediations/readiness", nil)
+	acc = remData(body)["accounts"].([]any)[0].(map[string]any)
+	if acc["ready"] != true || acc["mode"] != "write" {
+		t.Fatalf("readiness after verify: %v", acc)
+	}
+	// B cannot verify or revoke A's binding.
+	bapi := newRemAPI(t, db).as(b.ws, b.requester, b.requesterM)
+	if code, _ := bapi.do("DELETE", "/remediations/bindings/"+bid, nil); code != 404 {
+		t.Fatalf("B revokes A's binding: %d", code)
+	}
+	if code, _ := api.do("DELETE", "/remediations/bindings/"+bid, nil); code != 200 {
+		t.Fatal("revoke")
+	}
+	_, body = api.do("GET", "/remediations/readiness", nil)
+	if acc = remData(body)["accounts"].([]any)[0].(map[string]any); acc["ready"] != false {
+		t.Fatalf("readiness after revoke: %v", acc)
+	}
+	// The ExternalId value is never in a row.
+	var rows []string
+	db.Raw(`SELECT row_to_json(r)::text FROM cloud_remediation_binding r WHERE workspace_id = ?`, w.ws).Scan(&rows)
+	if strings.Contains(strings.Join(rows, ""), ext) {
+		t.Fatal("the ExternalId is stored in a row")
+	}
+}
