@@ -1165,8 +1165,8 @@ func (s *AgentCoverageService) Review(ctx context.Context, ws, declID, reviewer 
 			return err
 		}
 		if d.ReviewedAt != nil {
-			out = d
-			return nil
+			// As every other kind (second_person.go): a review is recorded once.
+			return govConflict("already_reviewed", "The declaration was already reviewed.", nil)
 		}
 		if err := tx.Exec(`UPDATE agent_capability_declaration SET reviewed_by = ?, reviewed_at = ? WHERE workspace_id = ? AND id = ?`,
 			reviewer, now, ws, declID).Error; err != nil {
