@@ -43,6 +43,7 @@ import (
 
 type askAPI struct {
 	t      *testing.T
+	db     *gorm.DB
 	eng    *gin.Engine
 	ws     uuid.UUID
 	claims map[string]string
@@ -50,7 +51,7 @@ type askAPI struct {
 
 func newAskAPI(t *testing.T, db *gorm.DB) *askAPI {
 	gin.SetMode(gin.TestMode)
-	a := &askAPI{t: t, claims: map[string]string{}}
+	a := &askAPI{t: t, db: db, claims: map[string]string{}}
 	eng := gin.New()
 	g := eng.Group("/api/iga/v1")
 	g.Use(func(c *gin.Context) {
@@ -69,11 +70,12 @@ func newAskAPI(t *testing.T, db *gorm.DB) *askAPI {
 	return a
 }
 
+// as is a client acting as a member of ws (its own engine).
 func (a *askAPI) as(ws, user, membership uuid.UUID) *askAPI {
-	cp := *a
+	cp := newAskAPI(a.t, a.db)
 	cp.ws = ws
 	cp.claims = map[string]string{"user_id": user.String(), "workspace_membership_id": membership.String(), "client_id": "console"}
-	return &cp
+	return cp
 }
 
 func (a *askAPI) do(method, path string, body any) (int, map[string]any) {
@@ -156,6 +158,16 @@ func askGroup(t *testing.T, db *gorm.DB, ws, by, member uuid.UUID, name, scopeKi
 		t.Fatal(err)
 	}
 	return g.ID
+}
+
+func askMembership(t *testing.T, db *gorm.DB, ws, user uuid.UUID) uuid.UUID {
+	t.Helper()
+	var ids []uuid.UUID
+	db.Raw(`SELECT id FROM workspace_memberships WHERE workspace_id = ? AND user_id = ?`, ws, user).Scan(&ids)
+	if len(ids) != 1 {
+		t.Fatalf("membership of %s: %v", user, ids)
+	}
+	return ids[0]
 }
 
 func askCreate(t *testing.T, api *askAPI, body map[string]any) map[string]any {
@@ -272,8 +284,7 @@ func TestAgentAskDeciderPrecedenceDueAndRequester(t *testing.T) {
 		t.Fatalf("requester answered: %d %v", code, out)
 	}
 	// The admin (agent owners group) answers; a choice not offered is refused.
-	var adminM uuid.UUID
-	db.Raw(`SELECT id FROM workspace_memberships WHERE workspace_id = ? AND user_id = ?`, a.ws, a.admin).Scan(&adminM)
+	adminM := askMembership(t, db, a.ws, a.admin)
 	admin := api.as(a.ws, a.admin, adminM)
 	if code, _ := admin.do("POST", "/agent-runtime/asks/"+id.String()+"/answer", map[string]any{"choice": "maybe"}); code != 400 {
 		t.Fatalf("an unknown choice: %d", code)
@@ -328,8 +339,7 @@ func TestAgentAskEscalationNotMineWithdraw(t *testing.T) {
 	api := newAskAPI(t, db)
 	human := api.as(a.ws, a.human, a.membership)
 	approver := api.as(a.ws, a.approver, a.approverM)
-	var adminM uuid.UUID
-	db.Raw(`SELECT id FROM workspace_memberships WHERE workspace_id = ? AND user_id = ?`, a.ws, a.admin).Scan(&adminM)
+	adminM := askMembership(t, db, a.ws, a.admin)
 	admin := api.as(a.ws, a.admin, adminM)
 	ctx := context.Background()
 
@@ -384,8 +394,8 @@ func TestAgentAskEscalationNotMineWithdraw(t *testing.T) {
 		t.Fatalf("ask log %v", kinds)
 	}
 	// Still answerable by the last step's people.
-	if code, _ := admin.do("POST", "/agent-runtime/asks/"+id.String()+"/answer", map[string]any{"choice": "retire"}); code != 200 {
-		t.Fatal("the overdue ask could not be answered")
+	if code, out := admin.do("POST", "/agent-runtime/asks/"+id.String()+"/answer", map[string]any{"choice": "retire"}); code != 200 {
+		t.Fatalf("the overdue ask could not be answered: %d %v", code, out)
 	}
 
 	// Not mine: the account group's member passes it on and is excluded.
@@ -486,7 +496,11 @@ func TestAgentAskSlackAnswerStepUp(t *testing.T) {
 	aiLink(t, db, a.ws)
 	wa := aiAgentOf(t, db, a.ws, "iga_workload", a.workload)
 	askGroup(t, db, a.ws, a.human, a.approver, "Account responders", "account", a.account)
-	app := newP3sApp(t, db, services.NewPolicyGate(true, p3GraphOn(t, db)))
+	pg := services.NewPolicyGate(true, p3GraphOn(t, db))
+	if err := pg.Verify(db); err != nil {
+		t.Fatal(err)
+	}
+	app := newP3sApp(t, db, pg)
 	const team = "TASKS1"
 	app.connectDirect(a.ws, team, "CASKS", a.admin)
 	app.link(a.ws, "UAPPR", a.approver)
@@ -556,8 +570,7 @@ func TestAgentAskSlackAnswerStepUp(t *testing.T) {
 		t.Fatalf("pending: %+v", got)
 	}
 	api := newAskAPI(t, db)
-	var adminM uuid.UUID
-	db.Raw(`SELECT id FROM workspace_memberships WHERE workspace_id = ? AND user_id = ?`, a.ws, a.admin).Scan(&adminM)
+	adminM := askMembership(t, db, a.ws, a.admin)
 	if code, out := api.as(a.ws, a.admin, adminM).do("POST", "/agent-runtime/asks/"+id.String()+"/confirm", nil); code != 403 ||
 		askErrCode(out) != services.GovCodeStepUpOtherPerson {
 		t.Fatalf("another person confirmed: %d %v", code, out)
@@ -676,8 +689,7 @@ func TestAgentAskTicketingAndPaging(t *testing.T) {
 	t.Cleanup(services.SetAgentAskHTTPClient(tool.srv.Client()))
 	t.Cleanup(services.SetAgentAskProviderBases(map[string]string{"pagerduty": tool.srv.URL, "opsgenie": tool.srv.URL}))
 	api := newAskAPI(t, db)
-	var adminM uuid.UUID
-	db.Raw(`SELECT id FROM workspace_memberships WHERE workspace_id = ? AND user_id = ?`, a.ws, a.admin).Scan(&adminM)
+	adminM := askMembership(t, db, a.ws, a.admin)
 	admin := api.as(a.ws, a.admin, adminM)
 	human := api.as(a.ws, a.human, a.membership)
 	ctx := context.Background()

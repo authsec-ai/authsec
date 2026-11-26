@@ -370,11 +370,11 @@ type agentAskRow struct {
 	Role                   string         `gorm:"column:role"`
 	DeciderGroupID         *uuid.UUID     `gorm:"column:decider_group_id"`
 	DeciderUserID          *uuid.UUID     `gorm:"column:decider_user_id"`
-	Deciders               pq.StringArray `gorm:"column:deciders"`
+	Deciders               string         `gorm:"column:deciders"`
 	ResolvedVia            string         `gorm:"column:resolved_via"`
 	Path                   string         `gorm:"column:path"`
 	Step                   int            `gorm:"column:step"`
-	ExcludedUserIDs        pq.StringArray `gorm:"column:excluded_user_ids"`
+	ExcludedUserIDs        string         `gorm:"column:excluded_user_ids"`
 	RequesterUserID        *uuid.UUID     `gorm:"column:requester_user_id"`
 	DueAt                  time.Time      `gorm:"column:due_at"`
 	DueSource              string         `gorm:"column:due_source"`
@@ -404,15 +404,18 @@ type agentAskRow struct {
 }
 
 const agentAskCols = `id, workspace_id, about_kind, about_id, agent_id, case_id, question, choices::text AS choices, severity, tier,
-	role, decider_group_id, decider_user_id, deciders::text[] AS deciders, resolved_via, path::text AS path, step,
-	excluded_user_ids::text[] AS excluded_user_ids, requester_user_id, due_at, due_source, external_deadline_at,
+	role, decider_group_id, decider_user_id, array_to_json(deciders)::text AS deciders, resolved_via, path::text AS path, step,
+	array_to_json(excluded_user_ids)::text AS excluded_user_ids, requester_user_id, due_at, due_source, external_deadline_at,
 	external_deadline_source, hours_per_step, state, overdue, overdue_at, pending_choice, pending_by, pending_at,
 	answer_choice, answered_by, answered_at, answer_channel, answer_note, withdrawn_by, withdrawn_at, withdraw_reason,
 	created_by_kind, created_by, dedupe_key, context::text AS context, created_at, updated_at`
 
-func uuidsOf(a pq.StringArray) []uuid.UUID {
-	out := make([]uuid.UUID, 0, len(a))
-	for _, s := range a {
+// uuidsOf reads a uuid[] selected as array_to_json(...)::text.
+func uuidsOf(raw string) []uuid.UUID {
+	var ss []string
+	_ = json.Unmarshal([]byte(raw), &ss)
+	out := make([]uuid.UUID, 0, len(ss))
+	for _, s := range ss {
 		if id, err := uuid.Parse(s); err == nil {
 			out = append(out, id)
 		}
@@ -821,10 +824,10 @@ func readAskSubject(tx *gorm.DB, ws uuid.UUID, kind, id string) (askSubject, err
 			return s, err
 		}
 		var rows []struct {
-			ConnectorID uuid.UUID      `gorm:"column:connector_id"`
-			Workloads   pq.StringArray `gorm:"column:workloads"`
+			ConnectorID uuid.UUID `gorm:"column:connector_id"`
+			Workloads   string    `gorm:"column:workloads"`
 		}
-		if err := tx.Raw(`SELECT connector_id, workload_ids::text[] AS workloads FROM agent_containment
+		if err := tx.Raw(`SELECT connector_id, array_to_json(workload_ids)::text AS workloads FROM agent_containment
 		        WHERE workspace_id = ? AND id = ?`, ws, u).Scan(&rows).Error; err != nil {
 			return s, err
 		}
@@ -832,7 +835,9 @@ func readAskSubject(tx *gorm.DB, ws uuid.UUID, kind, id string) (askSubject, err
 			return s, askAboutNotFound(kind)
 		}
 		s.severity = "high"
-		if s.agentID, err = askAgentForWorkloads(tx, ws, rows[0].Workloads); err != nil {
+		var wl []string
+		_ = json.Unmarshal([]byte(rows[0].Workloads), &wl)
+		if s.agentID, err = askAgentForWorkloads(tx, ws, wl); err != nil {
 			return s, err
 		}
 		if s.scopes, err = askConnectorScopes(tx, ws, rows[0].ConnectorID); err != nil {
