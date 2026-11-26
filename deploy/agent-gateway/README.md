@@ -28,12 +28,20 @@ without traffic with `POST /tool-policies/evaluate`.
 
 ## 2. Configure and run
 
+Keys live in AuthSec (W6). Add each provider key once with
+`POST /api/iga/v1/agent-runtime/gateway-provider-keys {"name","provider","key"}`
+(stored in AuthSec's Vault; only a fingerprint is ever shown); the gateway
+fetches it with its credential and keeps it in memory only. Issue each agent
+its key with `POST /gateway-agent-keys {"name","spiffe_id"|"workload_id"}`
+(shown once): the gateway accepts it only from that workload identity.
+`provider_keys: local` (keys from api_key_env) and `legacy_agent_keys: true`
+(locally generated keys, `agent-gateway gen-key`) remain for migration only.
+
 ```sh
-agent-gateway gen-key        # one per agent: give the key to the agent, the sha256 to config.yaml
 cp config.example.yaml config.yaml   # edit
 docker build -f deploy/agent-gateway/Dockerfile -t authsec/agent-gateway:dev .
 docker run -p 8080:8080 -v $PWD/config.yaml:/etc/agent-gateway/config.yaml:ro \
-  -e AUTHSEC_GATEWAY_CREDENTIAL=agw_... -e OPENAI_API_KEY=sk-... authsec/agent-gateway:dev
+  -e AUTHSEC_GATEWAY_CREDENTIAL=agw_... authsec/agent-gateway:dev
 ```
 
 Kubernetes: `values.yaml` is a minimal values file for a generic

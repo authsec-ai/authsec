@@ -361,6 +361,12 @@ func main() {
 	// (AUTHSEC_DISABLE_MODEL_PROVIDER_SYNC=true turns it off).
 	services.InstallModelProviders()
 	go services.RunModelProviderSyncWorker(context.Background(), config.DB)
+	// W6: per-minute provider usage and the usage reconciliation every 5
+	// minutes (USAGE-02 outside use, USAGE-03 bypass;
+	// AUTHSEC_DISABLE_USAGE_RECONCILE=true turns it off), and the expiry of
+	// held gateway calls (AUTHSEC_DISABLE_GATEWAY_HOLD_SWEEP=true).
+	go services.RunUsageReconcileWorker(context.Background(), config.DB)
+	go services.RunGatewayHoldSweeper(context.Background(), config.DB)
 	// One agent id (W7): link sweep, deleted-at-source, stale agents and
 	// overdue keys, every 15 minutes per workspace
 	// (AUTHSEC_DISABLE_AGENT_IDENTITY_SWEEP=true turns it off).

@@ -99,6 +99,11 @@ type agentGatewayDecisionRow struct {
 	Usage          *string
 	UpstreamStatus *int
 	RequestID      string
+	RunID          string
+	ModelVersion   string
+	ProviderKeyRef *uuid.UUID
+	HoldID         *uuid.UUID
+	Violations     *string
 }
 
 func agwJSON(v any) string {
@@ -133,12 +138,12 @@ func pdpDecisionRow(p AgentGatewayPrincipal, id uuid.UUID, at time.Time, req age
 		SubjectType: agentgateway.SubjectTypeAgent, SubjectID: req.SubjectID, Subject: agwJSON(req.SubjectProps()),
 		Action: action, Kind: req.Kind, ResourceID: req.ResourceID(), Resource: agwJSON(req.ResourceProps()),
 		Decision: decisionWord(res.Allowed), Reason: res.Reason, PolicyID: nullUUID(res.PolicyID),
-		LatencyMS: &latencyMS, ArgsDigest: agwStrPtr(req.ArgsDigest), RequestID: req.RequestID}
+		LatencyMS: &latencyMS, ArgsDigest: agwStrPtr(req.ArgsDigest), RequestID: req.RequestID, RunID: req.RunID}
 }
 
 const agentGatewayDecisionInsertCols = `id, workspace_id, gateway_id, record_type, source, decided_at, subject_type,
 	subject_id, subject, action, kind, resource_id, resource, decision, reason, policy_id, decision_ref, latency_ms,
-	args_digest, usage, upstream_status, request_id`
+	args_digest, usage, upstream_status, request_id, run_id, model_version, provider_key_ref, hold_id, violations`
 
 // insertDecisions writes rows of one workspace in one transaction and
 // returns how many were new (a retried upload's rows are not).
@@ -148,36 +153,45 @@ func (s *AgentGatewayService) insertDecisions(ctx context.Context, ws uuid.UUID,
 	}
 	var inserted int64
 	err := tenancy.InWorkspace(ctx, s.db, ws, func(tx *gorm.DB) error {
-		for start := 0; start < len(rows); start += agentGatewayWriterBatch {
-			end := start + agentGatewayWriterBatch
-			if end > len(rows) {
-				end = len(rows)
-			}
-			var sb strings.Builder
-			args := make([]any, 0, (end-start)*22)
-			sb.WriteString(`INSERT INTO agent_gateway_decision (` + agentGatewayDecisionInsertCols + `) VALUES `)
-			for i, r := range rows[start:end] {
-				if i > 0 {
-					sb.WriteString(", ")
-				}
-				sb.WriteString(`(?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, ?, ?, ?, ?::jsonb, ?, ?, ?, ?, ?, ?, ?::jsonb, ?, ?)`)
-				args = append(args, r.ID, ws, r.GatewayID, r.RecordType, r.Source, r.DecidedAt, r.SubjectType,
-					r.SubjectID, r.Subject, r.Action, r.Kind, r.ResourceID, r.Resource, r.Decision, r.Reason,
-					r.PolicyID, r.DecisionRef, r.LatencyMS, r.ArgsDigest, r.Usage, r.UpstreamStatus, r.RequestID)
-			}
-			sb.WriteString(` ON CONFLICT (workspace_id, id) DO NOTHING`)
-			res := tx.Exec(sb.String(), args...)
-			if res.Error != nil {
-				return res.Error
-			}
-			inserted += res.RowsAffected
-		}
-		return nil
+		var err error
+		inserted, err = insertDecisionRowsTx(tx, ws, rows)
+		return err
 	})
 	if err == nil {
 		s.maybePurgeDecisions(ws)
 	}
 	return inserted, err
+}
+
+// insertDecisionRowsTx writes rows of ws in tx (idempotent by id).
+func insertDecisionRowsTx(tx *gorm.DB, ws uuid.UUID, rows []agentGatewayDecisionRow) (int64, error) {
+	var inserted int64
+	for start := 0; start < len(rows); start += agentGatewayWriterBatch {
+		end := start + agentGatewayWriterBatch
+		if end > len(rows) {
+			end = len(rows)
+		}
+		var sb strings.Builder
+		args := make([]any, 0, (end-start)*27)
+		sb.WriteString(`INSERT INTO agent_gateway_decision (` + agentGatewayDecisionInsertCols + `) VALUES `)
+		for i, r := range rows[start:end] {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			sb.WriteString(`(?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, ?, ?, ?, ?::jsonb, ?, ?, ?, ?, ?, ?, ?::jsonb, ?, ?, ?, ?, ?, ?, ?::jsonb)`)
+			args = append(args, r.ID, ws, r.GatewayID, r.RecordType, r.Source, r.DecidedAt, r.SubjectType,
+				r.SubjectID, r.Subject, r.Action, r.Kind, r.ResourceID, r.Resource, r.Decision, r.Reason,
+				r.PolicyID, r.DecisionRef, r.LatencyMS, r.ArgsDigest, r.Usage, r.UpstreamStatus, r.RequestID,
+				r.RunID, truncate(r.ModelVersion, 200), r.ProviderKeyRef, r.HoldID, r.Violations)
+		}
+		sb.WriteString(` ON CONFLICT (workspace_id, id) DO NOTHING`)
+		res := tx.Exec(sb.String(), args...)
+		if res.Error != nil {
+			return inserted, res.Error
+		}
+		inserted += res.RowsAffected
+	}
+	return inserted, nil
 }
 
 /* --------------------------------- writer --------------------------------- */
@@ -326,6 +340,14 @@ type AgentGatewayUploadRecord struct {
 	Usage          *AgentGatewayUsage   `json:"usage,omitempty"`
 	UpstreamStatus *int                 `json:"upstream_status,omitempty"`
 	RequestID      string               `json:"request_id,omitempty"`
+	// RunID is the call's X-AuthSec-Run-Id.
+	RunID string `json:"run_id,omitempty"`
+	// ModelVersion is the model the provider says answered (outcomes).
+	ModelVersion string `json:"model_version,omitempty"`
+	// ProviderKeyID is the AuthSec-held provider key used (outcomes).
+	ProviderKeyID string `json:"provider_key_id,omitempty"`
+	// Violations are the bounded argument paths a call broke (never values).
+	Violations []agentgateway.BoundViolation `json:"violations,omitempty"`
 }
 
 // AgentGatewayUpload is the upload body.
@@ -381,6 +403,9 @@ func uploadRow(p AgentGatewayPrincipal, rec AgentGatewayUploadRecord, now time.T
 	if rec.RequestID != "" {
 		ctx["request_id"] = rec.RequestID
 	}
+	if rec.RunID != "" {
+		ctx["run_id"] = rec.RunID
+	}
 	req, err := agentgateway.FromAuthZEN(agentgateway.EvaluationRequest{Subject: rec.Subject, Action: rec.Action,
 		Resource: rec.Resource, Context: ctx})
 	if err != nil {
@@ -391,7 +416,26 @@ func uploadRow(p AgentGatewayPrincipal, rec AgentGatewayUploadRecord, now time.T
 		SubjectType: agentgateway.SubjectTypeAgent, SubjectID: req.SubjectID, Subject: agwJSON(req.SubjectProps()),
 		Action: rec.Action.Name, Kind: req.Kind, ResourceID: req.ResourceID(), Resource: agwJSON(req.ResourceProps()),
 		Decision: rec.Decision, Reason: rec.Reason, PolicyID: nullUUID(rec.PolicyID), DecisionRef: nullUUID(rec.DecisionRef),
-		ArgsDigest: agwStrPtr(req.ArgsDigest), RequestID: req.RequestID}
+		ArgsDigest: agwStrPtr(req.ArgsDigest), RequestID: req.RequestID, RunID: req.RunID}
+	if rec.ModelVersion != "" {
+		if rec.RecordType != AgentGatewayRecordOutcome || req.Kind != agentgateway.KindModel || !validModelVersion(rec.ModelVersion) {
+			return agentGatewayDecisionRow{}, "model_version is a model name on a model call's outcome"
+		}
+		row.ModelVersion = rec.ModelVersion
+	}
+	if rec.ProviderKeyID != "" {
+		row.ProviderKeyRef = nullUUID(rec.ProviderKeyID)
+		if row.ProviderKeyRef == nil || req.Kind != agentgateway.KindModel {
+			return agentGatewayDecisionRow{}, "provider_key_id must be a UUID on a model call"
+		}
+	}
+	if len(rec.Violations) > 0 {
+		if why := checkViolations(rec.Violations); why != "" {
+			return agentGatewayDecisionRow{}, why
+		}
+		v := agwJSON(rec.Violations)
+		row.Violations = &v
+	}
 	if rec.PolicyID != "" && row.PolicyID == nil {
 		return agentGatewayDecisionRow{}, "policy_id must be a UUID"
 	}
@@ -479,6 +523,11 @@ type AgentGatewayDecisionView struct {
 	Usage          json.RawMessage `json:"usage,omitempty"`
 	UpstreamStatus *int            `json:"upstream_status,omitempty"`
 	RequestID      string          `json:"request_id,omitempty"`
+	RunID          string          `json:"run_id,omitempty"`
+	ModelVersion   string          `json:"model_version,omitempty"`
+	ProviderKeyRef *uuid.UUID      `json:"provider_key_id,omitempty"`
+	HoldID         *uuid.UUID      `json:"hold_id,omitempty"`
+	Violations     json.RawMessage `json:"violations,omitempty"`
 }
 
 // AgentGatewayDecisionFilter narrows a list.
@@ -489,6 +538,7 @@ type AgentGatewayDecisionFilter struct {
 	SubjectID  string
 	Source     string
 	RecordType string
+	RunID      string
 	Since      *time.Time
 	Until      *time.Time
 }
@@ -530,7 +580,7 @@ func (s *AgentGatewayService) ListDecisions(ctx context.Context, ws uuid.UUID, f
 		where, args = append(where, "gateway_id = ?"), append(args, *f.GatewayID)
 	}
 	for col, v := range map[string]string{"decision": f.Decision, "kind": f.Kind, "subject_id": f.SubjectID,
-		"source": f.Source, "record_type": f.RecordType} {
+		"source": f.Source, "record_type": f.RecordType, "run_id": f.RunID} {
 		if v != "" {
 			where, args = append(where, col+" = ?"), append(args, v)
 		}
@@ -572,11 +622,17 @@ func (s *AgentGatewayService) ListDecisions(ctx context.Context, ws uuid.UUID, f
 		Usage          *string
 		UpstreamStatus *int
 		RequestID      string
+		RunID          string
+		ModelVersion   string
+		ProviderKeyRef *uuid.UUID
+		HoldID         *uuid.UUID
+		Violations     *string
 	}
 	err := tenancy.InWorkspaceRead(ctx, s.db, ws, func(tx *gorm.DB) error {
 		return tx.Raw(`SELECT id, gateway_id, record_type, source, decided_at, received_at, subject_type, subject_id,
 			    subject::text AS subject, action, kind, resource_id, resource::text AS resource, decision, reason,
-			    policy_id, decision_ref, latency_ms, args_digest, usage::text AS usage, upstream_status, request_id
+			    policy_id, decision_ref, latency_ms, args_digest, usage::text AS usage, upstream_status, request_id,
+			    run_id, model_version, provider_key_ref, hold_id, violations::text AS violations
 			FROM agent_gateway_decision WHERE `+strings.Join(where, " AND ")+`
 			ORDER BY decided_at DESC, id DESC LIMIT ?`, args...).Scan(&rows).Error
 	})
@@ -596,11 +652,38 @@ func (s *AgentGatewayService) ListDecisions(ctx context.Context, ws uuid.UUID, f
 			Subject: json.RawMessage(r.Subject), Action: r.Action, Kind: r.Kind, ResourceID: r.ResourceID,
 			Resource: json.RawMessage(r.Resource), Decision: r.Decision, Reason: r.Reason, PolicyID: r.PolicyID,
 			DecisionRef: r.DecisionRef, LatencyMS: r.LatencyMS, ArgsDigest: r.ArgsDigest, UpstreamStatus: r.UpstreamStatus,
-			RequestID: r.RequestID}
+			RequestID: r.RequestID, RunID: r.RunID, ModelVersion: r.ModelVersion, ProviderKeyRef: r.ProviderKeyRef, HoldID: r.HoldID}
 		if r.Usage != nil {
 			v.Usage = json.RawMessage(*r.Usage)
+		}
+		if r.Violations != nil {
+			v.Violations = json.RawMessage(*r.Violations)
 		}
 		out = append(out, v)
 	}
 	return out, next, nil
+}
+
+var reModelVersion = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,199}$`)
+
+// validModelVersion admits a model name as providers return it.
+func validModelVersion(s string) bool { return reModelVersion.MatchString(s) }
+
+var violationRules = map[string]bool{"required": true, "type": true, "min": true, "max": true, "max_len": true,
+	"enum": true, "regex": true, "max_items": true, "unreadable": true}
+
+var reBoundPath = regexp.MustCompile(`^([A-Za-z0-9_\-]{1,64}(\.[A-Za-z0-9_\-]{1,64})*)?$`)
+
+// checkViolations admits bounded paths and rule names only: a value can
+// never ride in a violation.
+func checkViolations(vs []agentgateway.BoundViolation) string {
+	if len(vs) > agentgateway.MaxBoundFields {
+		return "too many violations"
+	}
+	for _, v := range vs {
+		if len(v.Path) > agentgateway.MaxBoundPathLen || !violationRules[v.Rule] || !reBoundPath.MatchString(v.Path) {
+			return "violations name bounded paths and rules only"
+		}
+	}
+	return ""
 }

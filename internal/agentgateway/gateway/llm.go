@@ -77,9 +77,10 @@ func (g *Gateway) llmHandler(l *LLMUpstream) http.Handler {
 		subj, err := g.identify(r)
 		if err != nil {
 			llmError(w, l.Provider, http.StatusUnauthorized, "authsec_agent_key_required",
-				"An AuthSec agent key is required (use it as the API key, or send X-AuthSec-Agent-Key).", nil)
+				identifyMessage(err)+" Use the key as the API key, or send X-AuthSec-Agent-Key.", nil)
 			return
 		}
+		subj.RunID = runID(w, r)
 		probe := subj
 		probe.Kind = agentgateway.KindModel
 		if g.pdp.StoppedBy(probe) != nil && !(r.Method == http.MethodPost && ops[suffix] != "") {
@@ -132,9 +133,32 @@ func (g *Gateway) llmHandler(l *LLMUpstream) http.Handler {
 	})
 }
 
+// upstreamKey is the provider key for l: from AuthSec's store (memory) or
+// the local environment, and the AuthSec key id when it is AuthSec's.
+func (g *Gateway) upstreamKey(r *http.Request, l *LLMUpstream) (string, string, error) {
+	if g.cfg.ProviderKeys == ProviderKeysLocal {
+		return l.apiKey, "", nil
+	}
+	k, err := g.pkeys.Key(r.Context(), l.PolicyProvider, l.ProviderKey)
+	if err != nil {
+		return "", "", err
+	}
+	return k.Key, k.ID, nil
+}
+
 // forwardLLM sends the call upstream with the provider key and streams the
 // response; for a decided call (req set) it records the outcome with usage.
 func (g *Gateway) forwardLLM(w http.ResponseWriter, r *http.Request, l *LLMUpstream, suffix string, body []byte, req *agentgateway.Request, d Decision) {
+	apiKey, keyID, kerr := g.upstreamKey(r, l)
+	if kerr != nil {
+		log.Printf("[agent-gateway] llm upstream provider=%s: no provider key: %v", l.Name, kerr)
+		llmError(w, l.Provider, http.StatusServiceUnavailable, "authsec_provider_key_unavailable",
+			"The gateway has no provider key for this upstream right now.", nil)
+		if req != nil {
+			g.up.Outcome(*req, d, http.StatusServiceUnavailable, 0, nil)
+		}
+		return
+	}
 	target := l.BaseURL + suffix
 	if r.URL.RawQuery != "" {
 		target += "?" + r.URL.RawQuery
@@ -150,12 +174,12 @@ func (g *Gateway) forwardLLM(w http.ResponseWriter, r *http.Request, l *LLMUpstr
 	}
 	copyHeaders(up.Header, r.Header, llmForwardHeaders)
 	if family(l.Provider) == ProviderAnthropic {
-		up.Header.Set("X-Api-Key", l.apiKey)
+		up.Header.Set("X-Api-Key", apiKey)
 		if up.Header.Get("Anthropic-Version") == "" {
 			up.Header.Set("Anthropic-Version", "2023-06-01")
 		}
 	} else {
-		up.Header.Set("Authorization", "Bearer "+l.apiKey)
+		up.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 	for k, v := range l.Headers {
 		up.Header.Set(k, v)
@@ -166,18 +190,19 @@ func (g *Gateway) forwardLLM(w http.ResponseWriter, r *http.Request, l *LLMUpstr
 		log.Printf("[agent-gateway] llm upstream provider=%s err=%v", l.Name, err)
 		llmError(w, l.Provider, http.StatusBadGateway, "upstream_unreachable", "The model provider could not be reached.", nil)
 		if req != nil {
-			g.up.Outcome(*req, d, http.StatusBadGateway, msSince(start), nil)
+			g.up.OutcomeWith(*req, d, http.StatusBadGateway, msSince(start), OutcomeInfo{ProviderKeyID: keyID})
 		}
 		return
 	}
 	defer resp.Body.Close()
 	usage := &Usage{}
+	model := ""
 	var tee io.Writer
 	var buf *boundedBuffer
 	var sse *sseParser
 	if req != nil {
 		if isEventStream(resp.Header.Get("Content-Type")) {
-			sse = newSSEParser(4<<20, func(data []byte) { mergeUsage(usage, data) })
+			sse = newSSEParser(4<<20, func(data []byte) { mergeUsage(usage, data); mergeModel(&model, data) })
 			tee = sse
 		} else {
 			buf = &boundedBuffer{max: 16 << 20}
@@ -195,12 +220,61 @@ func (g *Gateway) forwardLLM(w http.ResponseWriter, r *http.Request, l *LLMUpstr
 	}
 	if buf != nil && !buf.overflow {
 		mergeUsage(usage, buf.buf.Bytes())
+		mergeModel(&model, buf.buf.Bytes())
 	}
 	if usage.TotalTokens == nil && usage.InputTokens != nil && usage.OutputTokens != nil {
 		t := *usage.InputTokens + *usage.OutputTokens
 		usage.TotalTokens = &t
 	}
-	g.up.Outcome(*req, d, resp.StatusCode, msSince(start), usage)
+	info := OutcomeInfo{ModelVersion: model, ProviderKeyID: keyID}
+	if !usage.empty() {
+		info.Usage = usage
+	}
+	g.up.OutcomeWith(*req, d, resp.StatusCode, msSince(start), info)
+}
+
+// mergeModel reads the model the provider says answered: "model" of an
+// OpenAI response or chunk or an Anthropic message, response.model (the
+// Responses API's events) or message.model (Anthropic message_start). Only
+// a plain model name is kept (metadata; never text).
+func mergeModel(model *string, raw []byte) {
+	var ev struct {
+		Model    string `json:"model"`
+		Response *struct {
+			Model string `json:"model"`
+		} `json:"response"`
+		Message *struct {
+			Model string `json:"model"`
+		} `json:"message"`
+	}
+	if json.Unmarshal(raw, &ev) != nil {
+		return
+	}
+	m := ev.Model
+	if m == "" && ev.Response != nil {
+		m = ev.Response.Model
+	}
+	if m == "" && ev.Message != nil {
+		m = ev.Message.Model
+	}
+	if m != "" && validModelName(m) {
+		*model = m
+	}
+}
+
+func validModelName(s string) bool {
+	if len(s) == 0 || len(s) > 200 {
+		return false
+	}
+	for i, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case i > 0 && strings.ContainsRune("._:/@+-", r):
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // usageFields covers OpenAI chat/embeddings (prompt/completion/total),

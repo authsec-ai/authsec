@@ -46,6 +46,14 @@ const (
 	// It is raised by the coverage worker, never by Evaluate, so it is not in
 	// All (which the per-event detections and their settings range over).
 	COV01 ID = "COV-01"
+
+	// USAGE02 (outside use: a provider key used in a minute neither the
+	// gateway nor any estate lookup or flow explains) and USAGE03 (bypass:
+	// estate traffic to a provider in a minute the gateway saw no call) are
+	// raised by the usage reconciliation (SPEC-secops W6), never by
+	// Evaluate, so they are not in All. Both are signals (W3 clustering).
+	USAGE02 ID = "USAGE-02"
+	USAGE03 ID = "USAGE-03"
 )
 
 // All lists every detection, in order.
@@ -141,6 +149,10 @@ func Name(id ID) string {
 		return "Model call from an unexpected place"
 	case COV01:
 		return "Source silent"
+	case USAGE02:
+		return "Provider key used outside AuthSec's view"
+	case USAGE03:
+		return "Model provider reached around the gateway"
 	}
 	return string(id)
 }

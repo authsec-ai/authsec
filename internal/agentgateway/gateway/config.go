@@ -30,6 +30,28 @@ const (
 	FailOpen   = agentgateway.FailOpen
 )
 
+// Where provider keys come from (provider_keys).
+const (
+	// ProviderKeysAuthSec (the default): the gateway fetches the provider
+	// keys AuthSec holds for it (GET /pdp/v1/provider-keys, with its agw_
+	// credential) and keeps them in memory only, never on disk.
+	ProviderKeysAuthSec = "authsec"
+	// ProviderKeysLocal: each llm upstream's key is read from the
+	// environment variable api_key_env (the pre-W6 behaviour).
+	ProviderKeysLocal = "local"
+)
+
+// Hold modes (holds.mode): what the gateway does with a call held for a
+// person (argument bounds).
+const (
+	// HoldWait (default) waits up to holds.wait_timeout_s for the decision,
+	// then answers "held" (HTTP 202) if there is none yet.
+	HoldWait = "wait"
+	// HoldReturn answers "held" at once; the agent retries the same call
+	// with X-AuthSec-Hold-Id once it is approved.
+	HoldReturn = "return"
+)
+
 // Provider kinds of an LLM upstream.
 const (
 	ProviderOpenAI           = "openai"
@@ -56,6 +78,17 @@ type Config struct {
 	Cache  CacheConfig  `yaml:"cache"`
 	Upload UploadConfig `yaml:"upload"`
 	Agents AgentsConfig `yaml:"agents"`
+
+	// ProviderKeys is authsec (default: keys from AuthSec's secrets store)
+	// or local (keys from api_key_env).
+	ProviderKeys string `yaml:"provider_keys"`
+	// LegacyAgentKeys keeps agents.keys (agent keys generated locally, before
+	// AuthSec issued them) working, presented alone. Default false: such a
+	// configuration is refused until the agents move to AuthSec-issued keys,
+	// which are accepted only with their bound workload identity.
+	LegacyAgentKeys bool `yaml:"legacy_agent_keys"`
+	// Holds tunes how held calls are answered.
+	Holds HoldsConfig `yaml:"holds"`
 
 	MCPServers []MCPServer    `yaml:"mcp_servers"`
 	LLM        []LLMUpstream  `yaml:"llm"`
@@ -104,6 +137,16 @@ type UploadConfig struct {
 	MaxQueue   int `yaml:"max_queue"`
 }
 
+// HoldsConfig is what the gateway does with a held call.
+type HoldsConfig struct {
+	// Mode is wait (default) or return.
+	Mode string `yaml:"mode"`
+	// WaitTimeoutS bounds the wait (default 30, at most 300).
+	WaitTimeoutS int `yaml:"wait_timeout_s"`
+	// PollIntervalMS is how often a waiting call asks (default 1000).
+	PollIntervalMS int `yaml:"poll_interval_ms"`
+}
+
 // LimitsConfig bounds request bodies.
 type LimitsConfig struct {
 	MaxBodyBytes int64 `yaml:"max_body_bytes"`
@@ -116,9 +159,14 @@ type UpstreamConfig struct {
 
 // AgentsConfig is how the gateway knows which agent is calling.
 type AgentsConfig struct {
-	// Keys are per-agent gateway keys: the agent presents the key; only
-	// its sha256 is configured.
+	// Keys are LEGACY locally generated agent keys (only their sha256 is
+	// configured), honoured only with legacy_agent_keys: true. AuthSec-issued
+	// keys arrive in the policy hints and need no configuration.
 	Keys []AgentKey `yaml:"keys"`
+	// AllowSPIFFEOnly accepts a verified SPIFFE ID with no agent key.
+	// Default false: an agent presents its AuthSec-issued key AND the
+	// workload identity the key is bound to.
+	AllowSPIFFEOnly bool `yaml:"allow_spiffe_only"`
 	// SPIFFE maps verified SPIFFE IDs (mTLS, or the trusted header) to
 	// selector attributes; an unlisted SPIFFE ID is the subject with none.
 	SPIFFE []SPIFFEAgent `yaml:"spiffe"`
@@ -179,8 +227,13 @@ type LLMUpstream struct {
 	BaseURL string `yaml:"base_url"`
 	// PathPrefix is where agents reach it (default /llm/<name>).
 	PathPrefix string `yaml:"path_prefix"`
-	// APIKeyEnv names the variable holding the provider key.
+	// APIKeyEnv names the variable holding the provider key (provider_keys:
+	// local only).
 	APIKeyEnv string `yaml:"api_key_env"`
+	// ProviderKey picks one of the keys AuthSec holds for this gateway, by
+	// name or id (provider_keys: authsec). Empty: the only key of
+	// PolicyProvider.
+	ProviderKey string `yaml:"provider_key"`
 	// Headers are added upstream ("env:NAME" values read from the environment).
 	Headers map[string]string `yaml:"headers"`
 
@@ -297,6 +350,33 @@ func (c *Config) finish(getenv func(string) string) error {
 	if c.Agents.SPIFFEHeader == "" {
 		c.Agents.SPIFFEHeader = "X-Client-SPIFFE-ID"
 	}
+	switch c.ProviderKeys {
+	case "":
+		c.ProviderKeys = ProviderKeysAuthSec
+	case ProviderKeysAuthSec, ProviderKeysLocal:
+	default:
+		return errors.New("provider_keys must be authsec or local")
+	}
+	switch c.Holds.Mode {
+	case "":
+		c.Holds.Mode = HoldWait
+	case HoldWait, HoldReturn:
+	default:
+		return errors.New("holds.mode must be wait or return")
+	}
+	if c.Holds.WaitTimeoutS <= 0 {
+		c.Holds.WaitTimeoutS = 30
+	}
+	if c.Holds.WaitTimeoutS > 300 {
+		c.Holds.WaitTimeoutS = 300
+	}
+	if c.Holds.PollIntervalMS <= 0 {
+		c.Holds.PollIntervalMS = 1000
+	}
+	if len(c.Agents.Keys) > 0 && !c.LegacyAgentKeys {
+		return errors.New("agents.keys are locally generated (legacy) agent keys: issue AuthSec agent keys bound to each " +
+			"agent's workload identity, or set legacy_agent_keys: true to keep these working meanwhile")
+	}
 	ids := map[string]bool{}
 	for i, k := range c.Agents.Keys {
 		k.KeySHA256 = strings.ToLower(strings.TrimSpace(k.KeySHA256))
@@ -369,12 +449,20 @@ func (c *Config) finish(getenv func(string) string) error {
 			l.PathPrefix = "/llm/" + l.Name
 		}
 		l.PathPrefix = "/" + strings.Trim(l.PathPrefix, "/")
-		if l.APIKeyEnv == "" {
-			return fmt.Errorf("llm[%d]: api_key_env is required (the provider key stays in this process)", i)
-		}
-		l.apiKey = strings.TrimSpace(getenv(l.APIKeyEnv))
-		if l.apiKey == "" {
-			return fmt.Errorf("llm[%d]: %s is empty", i, l.APIKeyEnv)
+		if c.ProviderKeys == ProviderKeysLocal {
+			if l.APIKeyEnv == "" {
+				return fmt.Errorf("llm[%d]: api_key_env is required with provider_keys: local", i)
+			}
+			if l.ProviderKey != "" {
+				return fmt.Errorf("llm[%d]: provider_key names an AuthSec-held key; it is not read with provider_keys: local", i)
+			}
+			l.apiKey = strings.TrimSpace(getenv(l.APIKeyEnv))
+			if l.apiKey == "" {
+				return fmt.Errorf("llm[%d]: %s is empty", i, l.APIKeyEnv)
+			}
+		} else if l.APIKeyEnv != "" {
+			return fmt.Errorf("llm[%d]: api_key_env is read only with provider_keys: local; "+
+				"with provider_keys: authsec (the default) add the key in AuthSec and name it in provider_key", i)
 		}
 		if l.Headers, err = resolveHeaders(l.Headers, getenv); err != nil {
 			return fmt.Errorf("llm[%d]: %w", i, err)

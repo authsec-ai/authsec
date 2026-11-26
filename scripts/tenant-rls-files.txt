@@ -178,3 +178,9 @@ services/agent_asks_policy.go
 services/agent_asks_needed.go
 services/agent_ask_connectors.go
 controllers/platform/agent_asks_controller.go
+services/agent_gateway_keys.go
+services/agent_gateway_holds.go
+services/agent_runtime_joins.go
+services/model_usage_reconcile.go
+controllers/platform/agent_gateway_w6_controller.go
+controllers/platform/agent_gateway_w6_pdp_controller.go

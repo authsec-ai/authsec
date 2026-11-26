@@ -38,7 +38,14 @@ type Decision struct {
 	DecisionID string
 	Source     string
 	LatencyMS  float64
+	// ArgBounds are the deciding policy's argument bounds (P17): the
+	// gateway checks the call's arguments against them.
+	ArgBounds *agentgateway.ArgBounds
 }
+
+// ReasonInvalidArgBounds refuses a call whose policy's bounds this gateway
+// cannot read: a bound it cannot check is never skipped.
+const ReasonInvalidArgBounds = "invalid_arg_bounds"
 
 // Hints are what AuthSec tells a gateway between decisions
 // (GET /pdp/v1/policy-hints): the workspace mode and deny targets (auto fail
@@ -59,6 +66,9 @@ type Hints struct {
 	// PolicyVersion changes with any policy or setting: the cache is
 	// emptied when it does (a new deny is not served from an old allow).
 	PolicyVersion string `json:"policy_version,omitempty"`
+	// AgentKeys are the AuthSec-issued agent keys this gateway may accept,
+	// each with the workload identity it is bound to (W6).
+	AgentKeys []AgentKeyHint `json:"agent_keys,omitempty"`
 	// Version is the whole body's version (the ETag).
 	Version string `json:"version,omitempty"`
 }
@@ -194,6 +204,18 @@ type PDPClient struct {
 	etag       string
 	now        func() time.Time
 	up         *Uploader
+	// agentKeys are the hints' agent keys by sha256.
+	agentKeys atomic.Pointer[map[string]AgentKeyHint]
+}
+
+// AgentKey returns the AuthSec-issued agent key with this sha256.
+func (c *PDPClient) AgentKey(sha string) (AgentKeyHint, bool) {
+	m := c.agentKeys.Load()
+	if m == nil {
+		return AgentKeyHint{}, false
+	}
+	k, ok := (*m)[sha]
+	return k, ok
 }
 
 // NewPDPClient builds the client.
@@ -393,6 +415,16 @@ func (c *PDPClient) Decide(ctx context.Context, r agentgateway.Request) Decision
 		Reason:     ctxString(resp.Context, "reason_admin", "reason"),
 		PolicyID:   ctxString(resp.Context, "reason_admin", "policy_id"),
 		DecisionID: ctxString(resp.Context, "decision_id")}
+	if d.Allowed {
+		b, ok := agentgateway.BoundsFromContext(resp.Context)
+		if !ok {
+			log.Printf("[agent-gateway] unreadable argument bounds from AuthSec policy=%s: call refused", d.PolicyID)
+			d.Allowed, d.Reason, d.Source = false, ReasonInvalidArgBounds, SourceGateway
+			c.up.Decision(r, d, d.DecisionID)
+			return d
+		}
+		d.ArgBounds = b
+	}
 	if ttl, ok := resp.Context["ttl_seconds"].(float64); ok && ttl > 0 {
 		dur := time.Duration(ttl) * time.Second
 		if limit := c.CacheTTLCap(); dur > limit {
@@ -408,6 +440,11 @@ func (c *PDPClient) Decide(ctx context.Context, r agentgateway.Request) Decision
 // agents, and whatever outlives the cache lifetime cap. Hints are installed
 // first, so a request racing the purge already meets the new stop list.
 func (c *PDPClient) applyHints(h *Hints) {
+	keys := make(map[string]AgentKeyHint, len(h.AgentKeys))
+	for _, k := range h.AgentKeys {
+		keys[strings.ToLower(k.KeySHA256)] = k
+	}
+	c.agentKeys.Store(&keys)
 	old := c.hints.Swap(h)
 	c.hintsAt.Store(c.now().UnixNano())
 	if old == nil || old.PolicyVersion != h.PolicyVersion {
@@ -510,6 +547,13 @@ type Record struct {
 	Usage          *Usage               `json:"usage,omitempty"`
 	UpstreamStatus *int                 `json:"upstream_status,omitempty"`
 	RequestID      string               `json:"request_id,omitempty"`
+	RunID          string               `json:"run_id,omitempty"`
+	// ModelVersion is the model the provider says answered (outcomes).
+	ModelVersion string `json:"model_version,omitempty"`
+	// ProviderKeyID is the AuthSec-held provider key used (outcomes).
+	ProviderKeyID string `json:"provider_key_id,omitempty"`
+	// Violations are the bounded paths a call broke (never values).
+	Violations []agentgateway.BoundViolation `json:"violations,omitempty"`
 }
 
 // Uploader queues records and posts them in batches.
@@ -556,7 +600,7 @@ func (u *Uploader) push(r Record) {
 func baseRecord(r agentgateway.Request, now time.Time) Record {
 	e := r.ToAuthZEN()
 	return Record{ID: uuid.NewString(), DecidedAt: now.UTC(), Subject: e.Subject, Action: e.Action, Resource: e.Resource,
-		ArgsDigest: r.ArgsDigest, RequestID: r.RequestID}
+		ArgsDigest: r.ArgsDigest, RequestID: r.RequestID, RunID: r.RunID}
 }
 
 func word(allowed bool) string {
@@ -579,12 +623,40 @@ func (u *Uploader) Decision(r agentgateway.Request, d Decision, ref string) {
 	u.push(rec)
 }
 
-// Outcome queues the outcome of an allowed call (status, latency, usage).
-func (u *Uploader) Outcome(r agentgateway.Request, d Decision, status int, latencyMS float64, usage *Usage) {
+// DecisionViolations queues a gateway decision on a call outside its
+// argument bounds: the violated paths and rules, never the values.
+func (u *Uploader) DecisionViolations(r agentgateway.Request, d Decision, ref string, v []agentgateway.BoundViolation) {
 	if u == nil {
 		return
 	}
 	rec := baseRecord(r, u.now())
+	rec.RecordType, rec.Source, rec.Decision, rec.Reason = "decision", d.Source, word(d.Allowed), d.Reason
+	rec.PolicyID, rec.DecisionRef, rec.Violations = d.PolicyID, ref, v
+	lat := d.LatencyMS
+	rec.LatencyMS = &lat
+	u.push(rec)
+}
+
+// OutcomeInfo is what the gateway learned from the upstream's answer.
+type OutcomeInfo struct {
+	Usage         *Usage
+	ModelVersion  string
+	ProviderKeyID string
+}
+
+// Outcome queues the outcome of an allowed call (status, latency, usage).
+func (u *Uploader) Outcome(r agentgateway.Request, d Decision, status int, latencyMS float64, usage *Usage) {
+	u.OutcomeWith(r, d, status, latencyMS, OutcomeInfo{Usage: usage})
+}
+
+// OutcomeWith queues an outcome with the model version and provider key.
+func (u *Uploader) OutcomeWith(r agentgateway.Request, d Decision, status int, latencyMS float64, info OutcomeInfo) {
+	if u == nil {
+		return
+	}
+	usage := info.Usage
+	rec := baseRecord(r, u.now())
+	rec.ModelVersion, rec.ProviderKeyID = info.ModelVersion, info.ProviderKeyID
 	rec.RecordType, rec.Source, rec.Decision, rec.Reason = "outcome", d.Source, agentgateway.EffectAllow, agentgateway.ReasonUpstreamCompleted
 	rec.PolicyID, rec.DecisionRef = d.PolicyID, d.DecisionID
 	rec.LatencyMS = &latencyMS

@@ -137,6 +137,10 @@ func testConfig(t *testing.T, pdp *fakePDP, mcpURL, openaiURL, anthropicURL, fai
 		AuthSec:  AuthSec{URL: pdp.srv.URL + "/authsec"},
 		FailMode: failMode,
 		Agents:   AgentsConfig{Keys: []AgentKey{{ID: "billing-agent", KeySHA256: HashAgentKey(testAgentKey), Labels: []string{"prod"}}}},
+		// The pre-W6 behaviour these tests exercise: locally generated agent
+		// keys presented alone, provider keys from the environment.
+		LegacyAgentKeys: true,
+		ProviderKeys:    ProviderKeysLocal,
 	}
 	if mcpURL != "" {
 		cfg.MCPServers = []MCPServer{{Name: "github", URL: mcpURL, Headers: map[string]string{"Authorization": "env:GH_TOKEN"}}}
@@ -731,7 +735,7 @@ func TestSSEParser(t *testing.T) {
 
 func TestConfigRefusesSecretsInYAMLAndBadValues(t *testing.T) {
 	base := func() *Config {
-		return &Config{AuthSec: AuthSec{URL: "https://authsec.example/authsec"},
+		return &Config{AuthSec: AuthSec{URL: "https://authsec.example/authsec"}, ProviderKeys: ProviderKeysLocal,
 			LLM: []LLMUpstream{{Provider: ProviderOpenAI, APIKeyEnv: "K"}}}
 	}
 	env := func(m map[string]string) func(string) string { return func(k string) string { return m[k] } }

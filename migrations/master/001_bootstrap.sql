@@ -16337,3 +16337,437 @@ BEGIN
     EXECUTE format('ALTER TABLE public.iga_gov_notification ADD CONSTRAINT iga_gov_notification_subject_kind_check CHECK (subject_kind IN (%s))',
         (SELECT string_agg(quote_literal(v), ', ' ORDER BY n) FROM unnest(vals) WITH ORDINALITY AS u(v, n)));
 END $$;
+
+-- 240_agent_gateway_keys.sql
+--
+-- W6 (SPEC-secops-backend-upgrade.md C6): gateway keys held by AuthSec.
+--
+-- 1. agent_gateway_provider_key: a model provider API key a workspace's
+--    gateways use upstream. The key itself is in Vault under the workspace's
+--    path (kv/data/secret/workspaces/<ws>/agent-gateway/provider-keys/<id>-<nonce>);
+--    this row holds only that path (secret_ref, '' once revoked) and a
+--    fingerprint. A gateway fetches the keys assigned to it (gateway_id, or
+--    NULL for every gateway of the workspace) with its agw_ credential and
+--    keeps them in memory only. provider_key_id names the provider's own id
+--    of the key (OpenAI key_..., Anthropic apikey_...) when known, so provider
+--    usage can be joined to what the gateway sent (reconciliation).
+-- 2. agent_gateway_agent_key: a per-agent gateway key ("agk_", shown once,
+--    stored as its sha256) bound to a workload identity (a SPIFFE id, an
+--    AuthSec workload id, or both). A gateway accepts the key only from the
+--    workload identity it is bound to. agent_id is the W7 agent and
+--    principal_user_id the human the agent acts for, when known (a held
+--    call is never approved by that human).
+--
+-- Expand only; idempotent. 001_bootstrap.sql carries the same objects.
+
+CREATE TABLE IF NOT EXISTS public.agent_gateway_provider_key (
+    id               uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id     uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    name             text        NOT NULL CHECK (btrim(name) <> '' AND length(name) <= 200),
+    -- The provider as policies name it (openai, anthropic, groq ...).
+    provider         text        NOT NULL CHECK (provider ~ '^[a-z][a-z0-9_]{0,63}$'),
+    -- NULL: every gateway of the workspace may fetch it.
+    gateway_id       uuid,
+    -- Vault path of the key; '' once revoked. Never the key.
+    secret_ref       text        NOT NULL DEFAULT '',
+    key_fingerprint  text        NOT NULL CHECK (key_fingerprint <> ''),
+    provider_key_id  text        NOT NULL DEFAULT '' CHECK (length(provider_key_id) <= 200),
+    connection_id    uuid,
+    state            text        NOT NULL DEFAULT 'active' CHECK (state IN ('active', 'revoked')),
+    created_by       uuid        NOT NULL,
+    created_at       timestamptz NOT NULL DEFAULT now(),
+    updated_at       timestamptz NOT NULL DEFAULT now(),
+    rotated_at       timestamptz,
+    revoked_at       timestamptz,
+    revoked_by       uuid,
+    last_fetched_at  timestamptz,
+    version          integer     NOT NULL DEFAULT 1,
+    CONSTRAINT agent_gateway_provider_key_pkey PRIMARY KEY (id),
+    CONSTRAINT agent_gateway_provider_key_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT agent_gateway_provider_key_gateway_fkey FOREIGN KEY (workspace_id, gateway_id)
+        REFERENCES public.agent_gateway (workspace_id, id),
+    CONSTRAINT agent_gateway_provider_key_revoked_chk CHECK ((state = 'revoked') = (revoked_at IS NOT NULL)),
+    CONSTRAINT agent_gateway_provider_key_secret_chk CHECK (state = 'revoked' OR secret_ref <> '')
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_gateway_provider_key_live_name
+    ON public.agent_gateway_provider_key (workspace_id, lower(name)) WHERE state = 'active';
+CREATE INDEX IF NOT EXISTS idx_agent_gateway_provider_key_ws
+    ON public.agent_gateway_provider_key (workspace_id, provider, state);
+
+COMMENT ON TABLE public.agent_gateway_provider_key IS
+    'Model provider keys gateways use upstream; the key is in Vault (secret_ref), never stored here or returned to the console.';
+
+CREATE TABLE IF NOT EXISTS public.agent_gateway_agent_key (
+    id                uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id      uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    name              text        NOT NULL CHECK (btrim(name) <> '' AND length(name) <= 200),
+    -- The AuthZEN subject.id the gateway decides with.
+    client_id         text        NOT NULL CHECK (btrim(client_id) <> '' AND length(client_id) <= 512),
+    key_hash          text        NOT NULL CHECK (key_hash ~ '^[0-9a-f]{64}$'),
+    key_prefix        text        NOT NULL,
+    -- The workload identity the key is bound to: a SPIFFE id, an AuthSec
+    -- workload id, or both (both must then match).
+    spiffe_id         text        NOT NULL DEFAULT '' CHECK (spiffe_id = '' OR (spiffe_id LIKE 'spiffe://%' AND length(spiffe_id) <= 512)),
+    workload_id       uuid,
+    identity_id       uuid,
+    labels            jsonb       NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(labels) = 'array'),
+    agent_id          uuid,
+    principal_user_id uuid,
+    gateway_id        uuid,
+    created_by        uuid        NOT NULL,
+    created_at        timestamptz NOT NULL DEFAULT now(),
+    updated_at        timestamptz NOT NULL DEFAULT now(),
+    rotated_at        timestamptz,
+    revoked_at        timestamptz,
+    revoked_by        uuid,
+    revoked_reason    text        NOT NULL DEFAULT '' CHECK (length(revoked_reason) <= 500),
+    version           integer     NOT NULL DEFAULT 1,
+    CONSTRAINT agent_gateway_agent_key_pkey PRIMARY KEY (id),
+    CONSTRAINT agent_gateway_agent_key_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT agent_gateway_agent_key_gateway_fkey FOREIGN KEY (workspace_id, gateway_id)
+        REFERENCES public.agent_gateway (workspace_id, id),
+    CONSTRAINT agent_gateway_agent_key_bound_chk CHECK (spiffe_id <> '' OR workload_id IS NOT NULL)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_gateway_agent_key_hash
+    ON public.agent_gateway_agent_key (key_hash);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_gateway_agent_key_live_client
+    ON public.agent_gateway_agent_key (workspace_id, client_id) WHERE revoked_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_agent_gateway_agent_key_ws
+    ON public.agent_gateway_agent_key (workspace_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_gateway_agent_key_agent
+    ON public.agent_gateway_agent_key (workspace_id, agent_id) WHERE agent_id IS NOT NULL;
+
+COMMENT ON TABLE public.agent_gateway_agent_key IS
+    'Per-agent gateway keys (agk_, sha256 only) bound to a workload identity; a gateway accepts a key only with that identity.';
+
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.agent_gateway_provider_key');
+        PERFORM public.tenancy_enable_rls('public.agent_gateway_agent_key');
+    END IF;
+END $$;
+
+-- 241_agent_gateway_calls.sql
+--
+-- W6 (SPEC-secops-backend-upgrade.md C6, P17): what the decision log keeps
+-- about a call, and held calls.
+--
+-- 1. agent_gateway_decision gains, as metadata only:
+--    run_id            the X-AuthSec-Run-Id that ties one agent run's calls
+--                      across hops;
+--    model_version     the model the provider says answered (the "model" of
+--                      the OpenAI / Anthropic response), on outcomes;
+--    provider_key_ref  the AuthSec-held provider key the gateway used;
+--    hold_id           the held call a decision "ask" opened;
+--    violations        the bounded argument paths a call broke and which
+--                      rule -- never the values.
+--    decision admits 'ask' (a call held for a person).
+-- 2. agent_gateway_hold: a call held because its arguments are outside the
+--    bounds of the policy that allowed it. It names its approver (responder
+--    resolution) and expires. held_values are the bounded fields' values,
+--    kept for the approver only and cleared when the hold ends; the decision
+--    log never has them. The approver is never the agent's own human.
+--
+-- Expand only; idempotent. 001_bootstrap.sql carries the same objects.
+
+ALTER TABLE public.agent_gateway_decision ADD COLUMN IF NOT EXISTS run_id text NOT NULL DEFAULT ''
+    CHECK (length(run_id) <= 128);
+ALTER TABLE public.agent_gateway_decision ADD COLUMN IF NOT EXISTS model_version text NOT NULL DEFAULT ''
+    CHECK (length(model_version) <= 200);
+ALTER TABLE public.agent_gateway_decision ADD COLUMN IF NOT EXISTS provider_key_ref uuid;
+ALTER TABLE public.agent_gateway_decision ADD COLUMN IF NOT EXISTS hold_id uuid;
+ALTER TABLE public.agent_gateway_decision ADD COLUMN IF NOT EXISTS violations jsonb;
+ALTER TABLE public.agent_gateway_decision DROP CONSTRAINT IF EXISTS agent_gateway_decision_decision_check;
+ALTER TABLE public.agent_gateway_decision DROP CONSTRAINT IF EXISTS agent_gateway_decision_decision_chk;
+ALTER TABLE public.agent_gateway_decision ADD CONSTRAINT agent_gateway_decision_decision_chk
+    CHECK (decision IN ('allow', 'deny', 'ask'));
+CREATE INDEX IF NOT EXISTS idx_agent_gateway_decision_run
+    ON public.agent_gateway_decision (workspace_id, run_id, decided_at) WHERE run_id <> '';
+CREATE INDEX IF NOT EXISTS idx_agent_gateway_decision_provider_key
+    ON public.agent_gateway_decision (workspace_id, provider_key_ref, decided_at) WHERE provider_key_ref IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS public.agent_gateway_hold (
+    id                 uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id       uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    gateway_id         uuid        NOT NULL,
+    subject_id         text        NOT NULL CHECK (length(subject_id) <= 512),
+    subject            jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    kind               text        NOT NULL CHECK (kind IN ('mcp_tool', 'model')),
+    resource_id        text        NOT NULL CHECK (length(resource_id) <= 1024),
+    resource           jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    policy_id          uuid,
+    args_digest        text        NOT NULL CHECK (args_digest ~ '^sha256:[0-9a-f]{64}$'),
+    run_id             text        NOT NULL DEFAULT '' CHECK (length(run_id) <= 128),
+    request_id         text        NOT NULL DEFAULT '' CHECK (length(request_id) <= 128),
+    violations         jsonb       NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(violations) = 'array'),
+    -- The bounded fields' values, for the approver; NULL once the hold ended.
+    held_values        jsonb,
+    agent_key_id       uuid,
+    agent_id           uuid,
+    principal_user_id  uuid,
+    responder_group_id uuid,
+    responder_via      text        NOT NULL DEFAULT '',
+    approver_user_id   uuid,
+    deciders           jsonb       NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(deciders) = 'array'),
+    state              text        NOT NULL DEFAULT 'pending'
+                       CHECK (state IN ('pending', 'approved', 'denied', 'expired', 'consumed')),
+    expires_at         timestamptz NOT NULL,
+    created_at         timestamptz NOT NULL DEFAULT now(),
+    decided_by         uuid,
+    decided_at         timestamptz,
+    decision_reason    text        NOT NULL DEFAULT '' CHECK (length(decision_reason) <= 2000),
+    consumed_at        timestamptz,
+    CONSTRAINT agent_gateway_hold_pkey PRIMARY KEY (id),
+    CONSTRAINT agent_gateway_hold_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT agent_gateway_hold_not_principal_chk
+        CHECK (decided_by IS NULL OR principal_user_id IS NULL OR decided_by <> principal_user_id),
+    CONSTRAINT agent_gateway_hold_decided_chk CHECK ((decided_by IS NULL) = (decided_at IS NULL)),
+    CONSTRAINT agent_gateway_hold_values_chk CHECK (held_values IS NULL OR state IN ('pending', 'approved'))
+);
+CREATE INDEX IF NOT EXISTS idx_agent_gateway_hold_ws_state
+    ON public.agent_gateway_hold (workspace_id, state, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_gateway_hold_due
+    ON public.agent_gateway_hold (expires_at) WHERE state IN ('pending', 'approved');
+
+COMMENT ON TABLE public.agent_gateway_hold IS
+    'Gateway calls held for a person (argument bounds): approver, expiry; bounded values kept for the approver only until the hold ends.';
+
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.agent_gateway_hold');
+    END IF;
+END $$;
+
+-- 242_agent_runtime_joins.sql
+--
+-- W6 (SPEC-secops-backend-upgrade.md C3-C5, P15): the rows the usage
+-- reconciliation joins.
+--
+-- 1. agent_dns_lookup: per minute, a source's lookups of a model provider
+--    host or a workspace egress host (never any other name): where from
+--    (address, interface, instance, VPC), the workload holding the address
+--    (resolved holder), the name, the first answer address, the source
+--    (route53 Resolver query logs; coredns and azure are admitted for the
+--    Kubernetes and Azure readers).
+-- 2. agent_flow_summary: per minute, a source's traffic to an address a
+--    provider or egress host resolved to (VPC / VNet flow logs): bytes out,
+--    packets, the host the address was resolved from.
+-- 3. model_provider_usage_minute: a connected organisation's usage per key,
+--    project and model at the finest resolution the provider reports
+--    (1m for OpenAI and Anthropic usage; cost is daily, 1d), with cost where
+--    the provider reports it.
+-- 4. model_provider_connection.usage_minute_cursor / cost_cursor: how far
+--    the per-minute usage and the daily cost were read.
+-- 5. agent_join_setting: per workspace, the egress hosts (beyond the model
+--    provider list) whose lookups and flows are kept, and the flow-log log
+--    groups to read per AWS connector and region.
+--
+-- Counts only: no DNS answer other than the first address of a listed
+-- host, no payload, no prompt.
+--
+-- Expand only; idempotent. 001_bootstrap.sql carries the same objects.
+
+CREATE TABLE IF NOT EXISTS public.agent_dns_lookup (
+    id                 uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id       uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    connector_id       uuid        NOT NULL,
+    source             text        NOT NULL CHECK (source IN ('route53', 'coredns', 'azure')),
+    region             text        NOT NULL DEFAULT '',
+    -- Start of the minute the lookups were made in.
+    observed_at        timestamptz NOT NULL,
+    src_ip             text        NOT NULL DEFAULT '',
+    src_eni            text        NOT NULL DEFAULT '',
+    src_instance       text        NOT NULL DEFAULT '',
+    vpc_id             text        NOT NULL DEFAULT '',
+    -- The workload holding the source (cloud_workload id), when resolved.
+    holder_workload_id uuid,
+    holder_ref         text        NOT NULL DEFAULT '' CHECK (length(holder_ref) <= 512),
+    query_name         text        NOT NULL CHECK (query_name <> '' AND length(query_name) <= 253),
+    host_kind          text        NOT NULL CHECK (host_kind IN ('provider', 'egress')),
+    -- The model provider key of the host's list entry; '' for egress hosts.
+    provider           text        NOT NULL DEFAULT '',
+    answer_ip          text        NOT NULL DEFAULT '',
+    queries            bigint      NOT NULL DEFAULT 1 CHECK (queries >= 1),
+    log_group_arn      text        NOT NULL DEFAULT '',
+    created_at         timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT agent_dns_lookup_pkey PRIMARY KEY (id),
+    CONSTRAINT agent_dns_lookup_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT agent_dns_lookup_key UNIQUE (workspace_id, connector_id, source, observed_at, src_ip, src_instance,
+                                            vpc_id, query_name, answer_ip)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_dns_lookup_ws_time
+    ON public.agent_dns_lookup (workspace_id, observed_at);
+CREATE INDEX IF NOT EXISTS idx_agent_dns_lookup_provider
+    ON public.agent_dns_lookup (workspace_id, provider, observed_at) WHERE provider <> '';
+CREATE INDEX IF NOT EXISTS idx_agent_dns_lookup_answer
+    ON public.agent_dns_lookup (workspace_id, answer_ip) WHERE answer_ip <> '';
+
+CREATE TABLE IF NOT EXISTS public.agent_flow_summary (
+    id                 uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id       uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    connector_id       uuid        NOT NULL,
+    source             text        NOT NULL CHECK (source IN ('vpc', 'vnet')),
+    region             text        NOT NULL DEFAULT '',
+    minute             timestamptz NOT NULL,
+    src_ip             text        NOT NULL DEFAULT '',
+    src_eni            text        NOT NULL DEFAULT '',
+    holder_workload_id uuid,
+    holder_ref         text        NOT NULL DEFAULT '' CHECK (length(holder_ref) <= 512),
+    dst_ip             text        NOT NULL CHECK (dst_ip <> ''),
+    dst_host           text        NOT NULL DEFAULT '',
+    provider           text        NOT NULL DEFAULT '',
+    bytes_out          bigint      NOT NULL DEFAULT 0 CHECK (bytes_out >= 0),
+    packets            bigint      NOT NULL DEFAULT 0 CHECK (packets >= 0),
+    log_group_arn      text        NOT NULL DEFAULT '',
+    created_at         timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT agent_flow_summary_pkey PRIMARY KEY (id),
+    CONSTRAINT agent_flow_summary_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT agent_flow_summary_key UNIQUE (workspace_id, connector_id, source, minute, src_ip, src_eni, dst_ip)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_flow_summary_ws_time
+    ON public.agent_flow_summary (workspace_id, minute);
+CREATE INDEX IF NOT EXISTS idx_agent_flow_summary_provider
+    ON public.agent_flow_summary (workspace_id, provider, minute) WHERE provider <> '';
+
+CREATE TABLE IF NOT EXISTS public.model_provider_usage_minute (
+    id                  uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id        uuid        NOT NULL,
+    connection_id       uuid        NOT NULL,
+    provider            text        NOT NULL CHECK (provider IN ('openai', 'anthropic')),
+    -- '' for usage or cost the provider ties to no key.
+    provider_key_id     text        NOT NULL DEFAULT '',
+    key_hint            text        NOT NULL DEFAULT '',
+    project_id          text        NOT NULL DEFAULT '',
+    model               text        NOT NULL DEFAULT '',
+    bucket_start        timestamptz NOT NULL,
+    -- 1m for usage; 1h when a provider reports only hourly; 1d for cost.
+    resolution          text        NOT NULL CHECK (resolution IN ('1m', '1h', '1d')),
+    requests            bigint,
+    input_tokens        bigint      NOT NULL DEFAULT 0,
+    cached_input_tokens bigint      NOT NULL DEFAULT 0,
+    output_tokens       bigint      NOT NULL DEFAULT 0,
+    -- USD, when the provider reports cost at this resolution (cost rows).
+    cost_usd            numeric(20, 6),
+    updated_at          timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT model_provider_usage_minute_pkey PRIMARY KEY (id),
+    CONSTRAINT model_provider_usage_minute_workspace_fkey FOREIGN KEY (workspace_id)
+        REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    CONSTRAINT model_provider_usage_minute_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT model_provider_usage_minute_connection_fkey FOREIGN KEY (workspace_id, connection_id)
+        REFERENCES public.model_provider_connection (workspace_id, id) ON DELETE CASCADE,
+    CONSTRAINT model_provider_usage_minute_bucket_key
+        UNIQUE (workspace_id, connection_id, resolution, provider_key_id, project_id, model, bucket_start),
+    CONSTRAINT model_provider_usage_minute_counts_chk
+        CHECK ((requests IS NULL OR requests >= 0) AND input_tokens >= 0 AND cached_input_tokens >= 0
+               AND output_tokens >= 0 AND (cost_usd IS NULL OR cost_usd >= 0))
+);
+CREATE INDEX IF NOT EXISTS idx_model_provider_usage_minute_bucket
+    ON public.model_provider_usage_minute (workspace_id, resolution, bucket_start);
+
+ALTER TABLE public.model_provider_connection ADD COLUMN IF NOT EXISTS usage_minute_cursor timestamptz;
+ALTER TABLE public.model_provider_connection ADD COLUMN IF NOT EXISTS cost_cursor timestamptz;
+
+-- The flow-log read keeps its cursors beside the DNS ones (stream 'flow').
+ALTER TABLE public.cloud_dns_cursor DROP CONSTRAINT IF EXISTS cloud_dns_cursor_stream_chk;
+ALTER TABLE public.cloud_dns_cursor ADD CONSTRAINT cloud_dns_cursor_stream_chk CHECK (stream IN ('dns', 'flow'));
+
+CREATE TABLE IF NOT EXISTS public.agent_join_setting (
+    workspace_id    uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    -- ["api.example.com", "*.example.net"]
+    egress_hosts    jsonb       NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(egress_hosts) = 'array'),
+    -- [{"connector_id": "...", "region": "us-east-1", "log_group": "arn:aws:logs:..."}]
+    flow_log_groups jsonb       NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(flow_log_groups) = 'array'),
+    updated_by      uuid,
+    updated_at      timestamptz NOT NULL DEFAULT now(),
+    version         integer     NOT NULL DEFAULT 1,
+    CONSTRAINT agent_join_setting_pkey PRIMARY KEY (workspace_id)
+);
+
+COMMENT ON TABLE public.agent_dns_lookup IS
+    'Per-minute lookups of model provider and egress hosts (route53 / coredns / azure), with the resolved holder; counts only.';
+COMMENT ON TABLE public.agent_flow_summary IS
+    'Per-minute flow-log traffic to addresses provider / egress hosts resolved to: bytes out, packets; counts only.';
+COMMENT ON TABLE public.model_provider_usage_minute IS
+    'Provider usage per key at the finest resolution reported (1m; cost 1d); token and request counts only.';
+
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.agent_dns_lookup');
+        PERFORM public.tenancy_enable_rls('public.agent_flow_summary');
+        PERFORM public.tenancy_enable_rls('public.model_provider_usage_minute');
+        PERFORM public.tenancy_enable_rls('public.agent_join_setting');
+    END IF;
+END $$;
+
+-- 243_usage_reconciliation.sql
+--
+-- W6 (SPEC-secops-backend-upgrade.md P15): the usage reconciliation.
+--
+-- 1. model_usage_reconciliation: one label per provider key and minute
+--    (key_ref '' when the key is unknown: estate traffic with no provider
+--    usage to tie it to):
+--      observed     the gateway's decision log has calls with the key in the minute;
+--      bypass       an estate workload looked the provider up or sent it
+--                   traffic in the minute, and the gateway saw no call;
+--      outside_use  the provider reports usage of the key in the minute and
+--                   neither the gateway nor any estate lookup or flow explains it.
+--    evidence holds references (table and id) to the rows behind the label.
+-- 2. agent_alert admits detections USAGE-02 (outside use) and USAGE-03
+--    (bypass), subject label 'provider_key', and keeps one open alert per
+--    dedupe key for them.
+--
+-- Expand only; idempotent. 001_bootstrap.sql carries the same objects.
+
+CREATE TABLE IF NOT EXISTS public.model_usage_reconciliation (
+    id                uuid        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id      uuid        NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    provider          text        NOT NULL CHECK (provider ~ '^[a-z][a-z0-9_]{0,63}$'),
+    -- The provider's key id; 'agw:<uuid>' for an AuthSec-held key not tied
+    -- to one; '' unknown.
+    key_ref           text        NOT NULL DEFAULT '' CHECK (length(key_ref) <= 200),
+    connection_id     uuid,
+    minute            timestamptz NOT NULL,
+    label             text        NOT NULL CHECK (label IN ('observed', 'bypass', 'outside_use')),
+    gateway_calls     integer     NOT NULL DEFAULT 0 CHECK (gateway_calls >= 0),
+    provider_requests bigint,
+    input_tokens      bigint      NOT NULL DEFAULT 0,
+    output_tokens     bigint      NOT NULL DEFAULT 0,
+    dns_lookups       bigint      NOT NULL DEFAULT 0,
+    flow_bytes        bigint      NOT NULL DEFAULT 0,
+    workload_ids      jsonb       NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(workload_ids) = 'array'),
+    evidence          jsonb       NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(evidence) = 'array'),
+    alert_id          uuid,
+    created_at        timestamptz NOT NULL DEFAULT now(),
+    updated_at        timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT model_usage_reconciliation_pkey PRIMARY KEY (id),
+    CONSTRAINT model_usage_reconciliation_workspace_id_key UNIQUE (workspace_id, id),
+    CONSTRAINT model_usage_reconciliation_key UNIQUE (workspace_id, provider, key_ref, minute)
+);
+CREATE INDEX IF NOT EXISTS idx_model_usage_reconciliation_ws
+    ON public.model_usage_reconciliation (workspace_id, minute DESC);
+CREATE INDEX IF NOT EXISTS idx_model_usage_reconciliation_label
+    ON public.model_usage_reconciliation (workspace_id, label, minute DESC) WHERE label <> 'observed';
+
+COMMENT ON TABLE public.model_usage_reconciliation IS
+    'Per provider key and minute: observed (gateway), bypass (estate traffic, no gateway call) or outside use (provider usage nobody explains), with evidence refs.';
+
+ALTER TABLE public.agent_alert DROP CONSTRAINT IF EXISTS agent_alert_detection_check;
+ALTER TABLE public.agent_alert DROP CONSTRAINT IF EXISTS agent_alert_detection_chk;
+ALTER TABLE public.agent_alert ADD CONSTRAINT agent_alert_detection_chk
+    CHECK (detection IN ('D1','D2','D3','D4','D5','D6','D7','D8','COV-01','USAGE-02','USAGE-03'));
+ALTER TABLE public.agent_alert DROP CONSTRAINT IF EXISTS agent_alert_subject_label_check;
+ALTER TABLE public.agent_alert DROP CONSTRAINT IF EXISTS agent_alert_subject_label_chk;
+ALTER TABLE public.agent_alert ADD CONSTRAINT agent_alert_subject_label_chk
+    CHECK (subject_label IN ('ai_workload', 'suggested_agent', 'agent', 'source', 'provider_key'));
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_alert_usage_open
+    ON public.agent_alert (workspace_id, dedupe_key) WHERE detection IN ('USAGE-02', 'USAGE-03') AND state <> 'resolved';
+
+DO $$
+BEGIN
+    IF to_regprocedure('public.tenancy_enable_rls(regclass)') IS NOT NULL THEN
+        PERFORM public.tenancy_enable_rls('public.model_usage_reconciliation');
+    END IF;
+END $$;

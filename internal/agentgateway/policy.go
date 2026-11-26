@@ -62,6 +62,9 @@ type Conditions struct {
 	// MaxCallsPerMinute (allow policies only): calls beyond it are denied
 	// rate_limited.
 	MaxCallsPerMinute int `json:"max_calls_per_minute,omitempty"`
+	// ArgBounds (allow policies on MCP tools only) bound the call's
+	// arguments; the gateway checks them (P17).
+	ArgBounds *ArgBounds `json:"arg_bounds,omitempty"`
 }
 
 // Policy is one agent_tool_policy row as evaluated.
@@ -202,6 +205,12 @@ func (p *Policy) Validate() []FieldError {
 	}
 	if c.MaxCallsPerMinute > 0 && p.Effect != EffectAllow {
 		add("conditions.max_calls_per_minute", "a rate applies to allow policies only")
+	}
+	if c.ArgBounds != nil {
+		if p.Effect != EffectAllow || p.Kind != KindMCPTool {
+			add("conditions.arg_bounds", "argument bounds apply to allow policies on MCP tools only")
+		}
+		errs = append(errs, c.ArgBounds.Validate()...)
 	}
 	if w := c.TimeWindow; w != nil {
 		for i, d := range w.Days {
@@ -367,7 +376,10 @@ type Result struct {
 	// TTLCap, when > 0, bounds how long a gateway may cache it (a time
 	// window may close).
 	TTLCap time.Duration
-	Trace  []Trace
+	// ArgBounds are the deciding allow policy's argument bounds (the
+	// gateway checks them).
+	ArgBounds *ArgBounds
+	Trace     []Trace
 }
 
 // SortPolicies orders policies as evaluation reads them: priority
@@ -449,6 +461,9 @@ func Evaluate(policies []Policy, r Request, mode string, now time.Time, rl RateL
 	decide := func(i int, allowed bool, reason string) {
 		res.Allowed, res.Reason = allowed, reason
 		res.PolicyID, res.PolicyName = policies[i].ID, policies[i].Name
+		if allowed && !policies[i].Conditions.ArgBounds.Empty() {
+			res.ArgBounds = policies[i].Conditions.ArgBounds
+		}
 		trace[i].Outcome = "decided"
 	}
 	switch {

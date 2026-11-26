@@ -171,7 +171,31 @@ var ModelOperations = map[string]bool{
 // ContextKeys are the only request context keys AuthSec keeps; anything
 // else is ignored (never stored).
 var ContextKeys = map[string]bool{
-	"args_digest": true, "request_id": true, "gateway_version": true, "stream": true,
+	"args_digest": true, "request_id": true, "gateway_version": true, "stream": true, "run_id": true,
+}
+
+// RunIDHeader carries a run id across agent hops (W6): the gateway takes
+// it from the agent (or makes one), logs it with every decision and passes
+// it on to MCP servers, so a downstream agent can pass it on again.
+const RunIDHeader = "X-AuthSec-Run-Id"
+
+// MaxRunIDLen bounds a run id.
+const MaxRunIDLen = 128
+
+// ValidRunID reports whether s is a usable run id: 1-128 characters of
+// letters, digits and ._:-
+func ValidRunID(s string) bool {
+	if s == "" || len(s) > MaxRunIDLen {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '_', r == ':', r == '-':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // Field length limits.
@@ -208,6 +232,9 @@ type Request struct {
 	RequestID      string
 	GatewayVersion string
 	Stream         bool
+	// RunID ties the calls of one agent run across hops (never in the
+	// cache key).
+	RunID string
 }
 
 // ResourceID is the canonical resource id: server/tool or provider/model.
@@ -280,6 +307,9 @@ func (r Request) ToAuthZEN() EvaluationRequest {
 	}
 	if r.Stream {
 		ctx["stream"] = true
+	}
+	if r.RunID != "" {
+		ctx["run_id"] = r.RunID
 	}
 	e := EvaluationRequest{Subject: subj, Action: act, Resource: res}
 	if len(ctx) > 0 {
@@ -453,6 +483,12 @@ func FromAuthZEN(e EvaluationRequest) (Request, error) {
 	}
 	if v, ok := ctx["stream"].(bool); ok {
 		r.Stream = v
+	}
+	if r.RunID, err = propString(ctx, "run_id"); err != nil {
+		return r, err
+	}
+	if r.RunID != "" && !ValidRunID(r.RunID) {
+		return r, invalid("context.run_id must be 1-128 characters of letters, digits and ._:-")
 	}
 	return r, nil
 }

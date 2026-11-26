@@ -37,8 +37,9 @@ type Gateway struct {
 	up       *Uploader
 	pins     *PinStore
 	upstream *http.Client
-	keys     map[string]AgentKey // by key sha256
+	keys     map[string]AgentKey // legacy local keys, by sha256
 	spiffe   map[string]SPIFFEAgent
+	pkeys    *ProviderKeyStore
 	now      func() time.Time
 }
 
@@ -82,9 +83,11 @@ func New(cfg *Config, opt Options) (*Gateway, error) {
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	}
 	g := &Gateway{cfg: cfg, pdp: pdp, up: up, pins: pins, upstream: upstream,
-		keys: map[string]AgentKey{}, spiffe: map[string]SPIFFEAgent{}, now: time.Now}
-	for _, k := range cfg.Agents.Keys {
-		g.keys[k.KeySHA256] = k
+		keys: map[string]AgentKey{}, spiffe: map[string]SPIFFEAgent{}, pkeys: newProviderKeyStore(pdp), now: time.Now}
+	if cfg.LegacyAgentKeys {
+		for _, k := range cfg.Agents.Keys {
+			g.keys[k.KeySHA256] = k
+		}
 	}
 	for _, s := range cfg.Agents.SPIFFE {
 		g.spiffe[s.ID] = s
@@ -101,8 +104,14 @@ func (g *Gateway) Uploader() *Uploader { return g.up }
 // Pins is the gateway's pin store (tests).
 func (g *Gateway) Pins() *PinStore { return g.pins }
 
+// ProviderKeys is the gateway's in-memory provider key store (tests).
+func (g *Gateway) ProviderKeys() *ProviderKeyStore { return g.pkeys }
+
 // Run starts the background loops (hints, upload) until ctx ends.
 func (g *Gateway) Run(ctx context.Context) {
+	if g.cfg.ProviderKeys == ProviderKeysAuthSec && len(g.cfg.LLM) > 0 {
+		go g.pkeys.Warm(ctx)
+	}
 	go g.pdp.RunHints(ctx, time.Duration(g.cfg.AuthSec.HintsIntervalS)*time.Second)
 	g.up.Run(ctx, time.Duration(g.cfg.Upload.IntervalMS)*time.Millisecond)
 }
@@ -193,7 +202,12 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 /* ------------------------------ agent identity ----------------------------- */
 
-var errNoAgent = errors.New("no agent credential")
+var (
+	errNoAgent = errors.New("no agent credential")
+	// errWorkloadMismatch: an AuthSec-issued key presented without the
+	// workload identity it is bound to (or with another one).
+	errWorkloadMismatch = errors.New("agent key not presented with its bound workload identity")
+)
 
 // HashAgentKey is the configured form of an agent key (sha256, hex).
 func HashAgentKey(k string) string {
@@ -240,30 +254,87 @@ func agentKeyFrom(r *http.Request) string {
 	return ""
 }
 
-// identify names the calling agent: a verified client certificate's SPIFFE
-// ID, the trusted SPIFFE header, or an agent key.
-func (g *Gateway) identify(r *http.Request) (agentgateway.Request, error) {
-	var req agentgateway.Request
+// workloadIdentity is the caller's verified workload identity: a verified
+// client certificate's SPIFFE ID, or the trusted SPIFFE header.
+func (g *Gateway) workloadIdentity(r *http.Request) string {
 	id := spiffeFromCert(r)
 	if id == "" && g.cfg.Agents.TrustSPIFFEHeader {
 		if h := strings.TrimSpace(r.Header.Get(g.cfg.Agents.SPIFFEHeader)); strings.HasPrefix(h, "spiffe://") {
 			id = h
 		}
 	}
-	if id != "" {
+	return id
+}
+
+// identify names the calling agent (W6). An AuthSec-issued agent key is
+// accepted ONLY with the workload identity it is bound to: the verified
+// SPIFFE ID must be the key's spiffe_id, and the AuthSec workload id the
+// SPIFFE ID maps to (agents.spiffe) must be the key's workload_id -- both,
+// whichever the key names. A key alone, or a workload identity alone, is
+// refused; a SPIFFE ID alone is accepted only with
+// agents.allow_spiffe_only, and a locally generated key alone only with
+// legacy_agent_keys.
+func (g *Gateway) identify(r *http.Request) (agentgateway.Request, error) {
+	var req agentgateway.Request
+	id := g.workloadIdentity(r)
+	mapped, hasMap := g.spiffe[id]
+	if k := agentKeyFrom(r); k != "" {
+		sha := HashAgentKey(k)
+		if h, ok := g.pdp.AgentKey(sha); ok {
+			if id == "" {
+				return req, errWorkloadMismatch
+			}
+			if h.SPIFFEID != "" && h.SPIFFEID != id {
+				return req, errWorkloadMismatch
+			}
+			if h.WorkloadID != "" && (!hasMap || !strings.EqualFold(mapped.WorkloadID, h.WorkloadID)) {
+				return req, errWorkloadMismatch
+			}
+			req.SubjectID, req.IdentityID, req.WorkloadID = h.ClientID, h.IdentityID, h.WorkloadID
+			if req.IdentityID == "" && hasMap {
+				req.IdentityID = mapped.IdentityID
+			}
+			if req.WorkloadID == "" && hasMap {
+				req.WorkloadID = mapped.WorkloadID
+			}
+			req.Labels = append(append([]string(nil), h.Labels...), mapped.Labels...)
+			return req, nil
+		}
+		if g.cfg.LegacyAgentKeys {
+			if a, ok := g.keys[sha]; ok {
+				req.SubjectID, req.IdentityID, req.WorkloadID, req.Labels = a.ID, a.IdentityID, a.WorkloadID, a.Labels
+				return req, nil
+			}
+		}
+		return req, errNoAgent
+	}
+	if id != "" && g.cfg.Agents.AllowSPIFFEOnly {
 		req.SubjectID = id
-		if a, ok := g.spiffe[id]; ok {
-			req.IdentityID, req.WorkloadID, req.Labels = a.IdentityID, a.WorkloadID, a.Labels
+		if hasMap {
+			req.IdentityID, req.WorkloadID, req.Labels = mapped.IdentityID, mapped.WorkloadID, mapped.Labels
 		}
 		return req, nil
 	}
-	if k := agentKeyFrom(r); k != "" {
-		if a, ok := g.keys[HashAgentKey(k)]; ok {
-			req.SubjectID, req.IdentityID, req.WorkloadID, req.Labels = a.ID, a.IdentityID, a.WorkloadID, a.Labels
-			return req, nil
-		}
-	}
 	return req, errNoAgent
+}
+
+// identifyMessage is the refusal text for an identify error.
+func identifyMessage(err error) string {
+	if errors.Is(err, errWorkloadMismatch) {
+		return "This AuthSec agent key is accepted only from the workload identity it is bound to (present both)."
+	}
+	return "An AuthSec agent key and the workload identity it is bound to are required."
+}
+
+// runID is the call's run id: the agent's X-AuthSec-Run-Id when usable,
+// else a new one. It is echoed to the agent.
+func runID(w http.ResponseWriter, r *http.Request) string {
+	id := strings.TrimSpace(r.Header.Get(agentgateway.RunIDHeader))
+	if !agentgateway.ValidRunID(id) {
+		id = "run_" + newRequestID()
+	}
+	w.Header().Set(agentgateway.RunIDHeader, id)
+	return id
 }
 
 // upstreamRequestHeaders are the agent's headers forwarded upstream; the
